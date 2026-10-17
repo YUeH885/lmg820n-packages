@@ -8,13 +8,15 @@ Supports direct native cross-building in debian:sid containers and fallback buil
 
 import argparse
 import fcntl
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
-from package_utils import digest, run_cmd
+from package_utils import digest, run_cmd, fetch, extract
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGES_DIR = ROOT / "packages"
@@ -295,12 +297,140 @@ def build_vpu_playback(runner, output_dir: Path):
     runner("ffmpeg", "ffmpeg", recipe, output_dir)
 
 
+def build_fcitx5_osk(builder_ctx, output_dir: Path, log, jobs: int):
+    recipe = PACKAGES_DIR / "fcitx5-osk"
+    manifest = json.loads((recipe / "sources.json").read_text())
+
+    work_dir = BUILD_DIR / "fcitx5-osk"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    downloads_dir = BUILD_DIR / "downloads"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Preparing fcitx5-osk sources, crates and fonts...")
+    source_dir = work_dir / "source"
+    extract(fetch(manifest["source"], downloads_dir), source_dir)
+    for patch_name in manifest["source"]["patches"]:
+        patch_file = recipe / "patches" / patch_name
+        print(f"  -> Applying patch: {patch_name}")
+        run_cmd(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(patch_file)], cwd=source_dir)
+
+    crates_dir = work_dir / "crates"
+    if crates_dir.exists():
+        shutil.rmtree(crates_dir)
+    crates_dir.mkdir(parents=True, exist_ok=True)
+    for crate in manifest["crates"]:
+        dest = crates_dir / f"{crate['name']}-{crate['version']}"
+        extract(fetch(crate, downloads_dir), dest)
+        for patch_name in crate["patches"]:
+            patch_file = recipe / "patches" / patch_name
+            print(f"  -> Applying patch: {patch_name}")
+            run_cmd(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(patch_file)], cwd=dest)
+
+    for font_resource in manifest["font"]:
+        fetch(font_resource, downloads_dir)
+
+    print(f"Building fcitx5-osk binaries (Cargo, jobs={jobs})...")
+    target_arch = "aarch64-unknown-linux-gnu"
+    target_dir = work_dir / "target"
+    linker = shutil.which("aarch64-linux-gnu-gcc") or "gcc"
+    strip_bin = shutil.which("aarch64-linux-gnu-strip") or "strip"
+
+    env = {
+        **os.environ,
+        "CARGO_TARGET_DIR": str(target_dir),
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER": linker,
+        "CC_aarch64_unknown_linux_gnu": linker,
+        "CARGO_PROFILE_RELEASE_LTO": "false",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
+        "SOURCE_DATE_EPOCH": str(manifest["source_date_epoch"]),
+    }
+
+    run_cmd(["cargo", "build", "--manifest-path", str(source_dir / "Cargo.toml"), "--workspace",
+             "--release", "--locked", "--no-default-features", "--target", target_arch,
+             "--jobs", str(jobs)], env=env)
+
+    print("Staging files with CMake...")
+    cmake_dir = work_dir / "cmake"
+    stage_dir = work_dir / "package"
+    for d in (cmake_dir, stage_dir):
+        if d.exists():
+            shutil.rmtree(d)
+
+    run_cmd(["cmake", "-S", str(source_dir), "-B", str(cmake_dir), "-DCMAKE_INSTALL_PREFIX=/usr",
+             "-DCMAKE_INSTALL_LIBDIR=lib", "-DBUILD_KWIN_PLUGIN=OFF"])
+
+    (cmake_dir / "cargo_target").mkdir(parents=True, exist_ok=True)
+    release_symlink = cmake_dir / "cargo_target/release"
+    if not release_symlink.exists():
+        release_symlink.symlink_to(target_dir / target_arch / "release", target_is_directory=True)
+    run_cmd(["cmake", "--install", str(cmake_dir)], env={**env, "DESTDIR": str(stage_dir)})
+
+    for name in ("otp", "pw"):
+        custom_action = stage_dir / "usr/share/fcitx5-osk/custom_actions" / f"{name}.toml"
+        if custom_action.exists():
+            custom_action.unlink()
+
+    binaries = ("fcitx5-osk", "fcitx5-osk-key-helper", "fcitx5-osk-kwin-launcher")
+    for name in binaries:
+        binary = stage_dir / "usr/bin" / name
+        run_cmd([strip_bin, "--strip-unneeded", str(binary)])
+
+    font_dir = stage_dir / "usr/share/fonts/truetype/fcitx5-osk"
+    license_dir = stage_dir / "usr/share/licenses/fcitx5-osk/NotoSerifNerdFont"
+    font_dir.mkdir(parents=True, exist_ok=True)
+    license_dir.mkdir(parents=True, exist_ok=True)
+    for resource in manifest["font"]:
+        fname = resource["filename"]
+        d = font_dir if fname.endswith(".ttf") else license_dir
+        shutil.copyfile(downloads_dir / fname, d / fname)
+
+    doc_dir = stage_dir / "usr/share/doc/fcitx5-osk"
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(recipe / "debian/copyright", doc_dir / "copyright")
+
+    files = sorted(path for path in stage_dir.rglob("*") if path.is_file() and not path.is_symlink())
+    installed_size = sum((path.stat().st_size + 1023) // 1024 for path in files)
+    control_dir = stage_dir / "DEBIAN"
+    control_dir.mkdir(parents=True, exist_ok=True)
+    template = (recipe / "debian/control.in").read_text()
+    (control_dir / "control").write_text(template.replace("@VERSION@", manifest["version"])
+                                         .replace("@INSTALLED_SIZE@", str(installed_size)))
+
+    if (recipe / "debian/conffiles").exists():
+        shutil.copyfile(recipe / "debian/conffiles", control_dir / "conffiles")
+    if (recipe / "debian/postinst").exists():
+        shutil.copyfile(recipe / "debian/postinst", control_dir / "postinst")
+        (control_dir / "postinst").chmod(0o755)
+
+    conffiles = set()
+    if (control_dir / "conffiles").exists():
+        conffiles = set((control_dir / "conffiles").read_text().splitlines())
+
+    (control_dir / "md5sums").write_text("".join(
+        f"{digest(path, 'md5')}  {path.relative_to(stage_dir)}\n"
+        for path in files if "/" + str(path.relative_to(stage_dir)) not in conffiles))
+
+    epoch = manifest["source_date_epoch"]
+    for path in [*stage_dir.rglob("*"), stage_dir]:
+        os.utime(path, (epoch, epoch), follow_symlinks=False)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    deb_filename = f"fcitx5-osk_{manifest['version']}_arm64.deb"
+    final_deb = output_dir / deb_filename
+    with tempfile.TemporaryDirectory(dir=output_dir, prefix=".fcitx5-osk-") as temporary:
+        built = Path(temporary) / deb_filename
+        run_cmd(["dpkg-deb", "--root-owner-group", "--build", str(stage_dir), str(built)], env=env)
+        built.replace(final_deb)
+    print(f"  Output: {final_deb}")
+
+
 PACKAGE_BUILDERS = {
     "geoclue": build_geoclue,
     "pipewire-bluetooth": build_pipewire_bluetooth,
     "sensors": build_sensors,
     "vpu-playback": build_vpu_playback,
     "gnss": None,  # handled separately
+    "fcitx5-osk": None,  # handled separately
 }
 
 
@@ -365,14 +495,15 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX)
 
         builder_ctx = None
+        needs_builder = any(t != "fcitx5-osk" for t in targets)
         if is_native_sid_environment():
             print("Running in native Debian sid environment. Using direct cross-build pipeline.")
-        else:
+        elif needs_builder:
             print("Not in native Debian sid root. Preparing multiarch chroot builder...")
             from debian_cross import prepare_builder
             builder_ctx = prepare_builder(log)
 
-        runner = make_builder_runner(builder_ctx, log, args.jobs)
+        runner = make_builder_runner(builder_ctx, log, args.jobs) if needs_builder else None
 
         for target in targets:
             print(f"\n==========================================")
@@ -381,6 +512,8 @@ def main():
             pkg_output = output_dir / target
             if target == "gnss":
                 build_gnss(builder_ctx, pkg_output, log, args.jobs)
+            elif target == "fcitx5-osk":
+                build_fcitx5_osk(builder_ctx, pkg_output, log, args.jobs)
             else:
                 builder_fn = PACKAGE_BUILDERS[target]
                 builder_fn(runner, pkg_output)

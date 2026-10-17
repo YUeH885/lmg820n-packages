@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import gzip
+import lzma
 
 from package_utils import digest, run_cmd
 
@@ -84,13 +85,16 @@ def create_apt_repository(debs_dir: Path, repo_dir: Path, codename: str = "sid")
 
     packages_content = "".join(packages_entries).encode("utf-8")
 
-    # Write Packages & Packages.gz
+    # Write Packages, Packages.gz & Packages.xz
     packages_file = dists_dir / "Packages"
     packages_gz = dists_dir / "Packages.gz"
+    packages_xz = dists_dir / "Packages.xz"
 
     packages_file.write_bytes(packages_content)
     with gzip.open(packages_gz, "wb") as gz:
         gz.write(packages_content)
+    with lzma.open(packages_xz, "wb") as xz:
+        xz.write(packages_content)
 
     # Generate Release file
     release_dir = repo_dir / f"dists/{codename}"
@@ -101,6 +105,8 @@ def create_apt_repository(debs_dir: Path, repo_dir: Path, codename: str = "sid")
     p_sha256 = digest(packages_file, "sha256")
     gz_size = packages_gz.stat().st_size
     gz_sha256 = digest(packages_gz, "sha256")
+    xz_size = packages_xz.stat().st_size
+    xz_sha256 = digest(packages_xz, "sha256")
 
     release_content = (
         f"Origin: LM-G820N Linux Project\n"
@@ -114,6 +120,7 @@ def create_apt_repository(debs_dir: Path, repo_dir: Path, codename: str = "sid")
         f"SHA256:\n"
         f" {p_sha256} {p_size} main/binary-arm64/Packages\n"
         f" {gz_sha256} {gz_size} main/binary-arm64/Packages.gz\n"
+        f" {xz_sha256} {xz_size} main/binary-arm64/Packages.xz\n"
     )
     release_file.write_text(release_content)
 

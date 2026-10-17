@@ -51,6 +51,9 @@ jobs:
             awscli \
             python3 \
             gzip \
+            cargo \
+            rustc \
+            cmake \
             git
 
       - name: Build Packages (arm64)
@@ -84,6 +87,14 @@ jobs:
             echo "R2 credentials not configured. Skipping S3 sync."
             exit 0
           fi
+          # Sync pool/ (.deb packages) with long cache TTL
           aws s3 sync repo/ "s3://${R2_BUCKET_NAME}/" \
             --endpoint-url "${R2_ENDPOINT_URL}" \
-            --delete
+            --delete \
+            --exclude "dists/*" \
+            --cache-control "public, max-age=31536000, immutable"
+          # Sync dists/ (metadata Release, Packages.gz, Packages.xz) with no-cache
+          aws s3 sync repo/dists/ "s3://${R2_BUCKET_NAME}/dists/" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --delete \
+            --cache-control "no-cache, no-store, must-revalidate"
