@@ -1,0 +1,89 @@
+diff --git a/fcitx5-osk/src/app/wayland/output.rs b/fcitx5-osk/src/app/wayland/output.rs
+index 7d6d721..5a20e50 100644
+--- a/fcitx5-osk/src/app/wayland/output.rs
++++ b/fcitx5-osk/src/app/wayland/output.rs
+@@ -111,6 +111,19 @@ pub struct OutputContext {
+ }
+ 
+ impl OutputContext {
++    pub fn supports_input_panel(&self) -> bool {
++        let state = self
++            .connection
++            .state()
++            .expect("Output connection is initialized");
++        let globals = state.global_list().expect("Output registry is initialized");
++        globals.contents().with_list(|globals| {
++            globals
++                .iter()
++                .any(|global| global.interface == "zwp_input_panel_v1")
++        })
++    }
++
+     pub fn new(connection: WaylandConnection) -> Self {
+         let (tx, rx) = mpsc::unbounded();
+         Self {
+diff --git a/fcitx5-osk/src/window/wayland.rs b/fcitx5-osk/src/window/wayland.rs
+index 372ed8b..6bddd3e 100644
+--- a/fcitx5-osk/src/window/wayland.rs
++++ b/fcitx5-osk/src/window/wayland.rs
+@@ -137,10 +137,9 @@ impl WaylandWindowManager {
+ 
+         self.settings.insert(id, settings);
+ 
+-        let task = if self.mode == WindowManagerMode::KwinLockScreen && placement == Placement::Dock
+-        {
++        let task = if self.uses_input_panel() && placement == Placement::Dock {
+             tracing::debug!("Open window[{id}] as input panel surface");
+-            // create input panel surface, so that it can be shown by kwin in lock screen
++            // The input-panel role lets KWin expose visibility and handle navigation dismissal.
+             Task::done(WaylandMessage::NewInputPanel {
+                 settings: NewInputPanelSettings {
+                     size,
+@@ -200,6 +199,10 @@ impl WaylandWindowManager {
+     fn movable_screen_size(&self) -> Size {
+         movable_screen_size(&self.screen_size, &self.exclusive_zone)
+     }
++
++    fn uses_input_panel(&self) -> bool {
++        self.mode == WindowManagerMode::KwinLockScreen || self.output_context.supports_input_panel()
++    }
+ }
+ 
+ impl WindowManager for WaylandWindowManager {
+@@ -262,12 +265,14 @@ impl WindowManager for WaylandWindowManager {
+             } else if old_size.map(|s| s.height) != Some(size.height)
+                 && settings.placement == Placement::Dock
+             {
+-                tracing::debug!("changing exclusive zone to: {}", size.height);
+                 self.exclusive_zone = Some(size.height as u32);
+-                task = task.chain(Task::done(Self::Message::ExclusiveZoneChange {
+-                    id,
+-                    zone_size: size.height as i32,
+-                }));
++                if !self.uses_input_panel() {
++                    tracing::debug!("changing exclusive zone to: {}", size.height);
++                    task = task.chain(Task::done(Self::Message::ExclusiveZoneChange {
++                        id,
++                        zone_size: size.height as i32,
++                    }));
++                }
+             }
+             return task;
+         }
+@@ -340,12 +345,15 @@ impl WindowManager for WaylandWindowManager {
+     fn sync_output(&mut self) -> Vec<SyncOutputResponse> {
+         let preferred_output_name = self.preferred_output_name.as_deref();
+         let output = self.output_context.select_output(preferred_output_name);
++        let uses_input_panel = output.is_some() && self.uses_input_panel();
+         let mut res = vec![];
+         match (output, &mut self.selected_output) {
+             (Some(mut output), Some(selected_output)) => {
+                 if output.output != selected_output.output {
+                     res.push(SyncOutputResponse::OutputChanged);
+-                } else if let Some(exclusive_zone) = self.exclusive_zone {
++                } else if let Some(exclusive_zone) = self.exclusive_zone
++                    && !uses_input_panel
++                {
+                     if output.logical_width == selected_output.logical_width
+                         && output.logical_height + exclusive_zone == selected_output.logical_height
+                     {

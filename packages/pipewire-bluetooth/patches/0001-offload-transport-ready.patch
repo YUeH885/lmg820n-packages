@@ -1,0 +1,59 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] bluez5: report when acquired offload transports are ready
+
+Expose the connected state separately from the offload acquisition request.
+This lets the session manager prepare an external PCM after the controller
+has configured the synchronous audio connection.
+
+--- a/spa/plugins/bluez5/bluez5-device.c
++++ b/spa/plugins/bluez5/bluez5-device.c
+@@ -430,10 +430,24 @@
+ 	emit_info(impl, false);
+ }
+ 
++static void offload_state_changed(void *userdata,
++		enum spa_bt_transport_state old, enum spa_bt_transport_state state)
++{
++	struct node *node = userdata;
++	struct impl *impl = node->impl;
++
++	if (!node->offload_acquired || old == state)
++		return;
++	impl->info.change_mask |= SPA_DEVICE_CHANGE_MASK_PARAMS;
++	impl->params[IDX_Props].flags ^= SPA_PARAM_INFO_SERIAL;
++	emit_info(impl, false);
++}
++
+ static const struct spa_bt_transport_events transport_events = {
+ 	SPA_VERSION_BT_DEVICE_EVENTS,
+ 	.destroy = transport_destroy,
+ 	.volume_changed = volume_changed,
++	.state_changed = offload_state_changed,
+ };
+ 
+ static int node_offload_set_active(struct node *node, bool active)
+@@ -2727,6 +2741,15 @@
+ 	struct props *p = &this->props;
+ 	struct spa_pod_frame f[2];
+ 	struct spa_pod *param;
++	bool offload_ready = false;
++	unsigned int i;
++
++	for (i = 0; i < SPA_N_ELEMENTS(this->nodes); i++) {
++		struct node *node = &this->nodes[i];
++		if (node->offload_acquired && node->transport &&
++				node->transport->state == SPA_BT_TRANSPORT_STATE_ACTIVE)
++			offload_ready = true;
++	}
+ 
+ 	spa_pod_builder_push_object(b, &f[0], SPA_TYPE_OBJECT_Props, id);
+ 	spa_pod_builder_add(b,
+@@ -2740,6 +2763,8 @@
+ 	spa_pod_builder_bool(b, this->bt_dev->disable_dummy_call);
+ 	spa_pod_builder_string(b, "bluez5.autoswitch-routes");
+ 	spa_pod_builder_bool(b, this->autoswitch_routes);
++	spa_pod_builder_string(b, "bluez5.hw-offload-ready");
++	spa_pod_builder_bool(b, offload_ready);
+ 	spa_pod_builder_pop(b, &f[1]);
+ 
+ 	param = spa_pod_builder_pop(b, &f[0]);

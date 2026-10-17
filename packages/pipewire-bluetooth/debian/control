@@ -1,0 +1,14 @@
+Source: pipewire
+Section: sound
+Priority: optional
+Maintainer: LMG820N Linux Maintainers <root@localhost>
+Build-Depends: debhelper-compat (= 13), meson, ninja-build, pkgconf, libdbus-1-dev, libbluetooth-dev, libglib2.0-dev, libsbc-dev
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+
+Package: libspa-0.2-bluetooth-lmg820n
+Architecture: arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, libspa-0.2-bluetooth (>= ${source:Upstream-Version})
+Description: PipeWire Bluetooth transport readiness for the LM-G820N
+ Provides a separate Bluetooth SPA plugin with SCO transport readiness
+ notifications for the board-specific WirePlumber audio routing.

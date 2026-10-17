@@ -1,0 +1,24 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1568,6 +1568,21 @@
+         }
+     }
+ 
++    /// Resize a surface and schedule a redraw for client-sized input panels.
++    pub fn resize_window(&mut self, id: id::Id, size: (u32, u32)) {
++        if let Some(unit) = self.get_mut_unit_with_id(id) {
++            if matches!(unit.shell, Shell::InputPanel(_)) {
++                // Input panels have no configure event; the buffer defines their size.
++                if unit.size != size {
++                    unit.size = size;
++                    unit.request_refresh(RefreshRequest::NextFrame);
++                }
++            } else {
++                unit.set_size(size);
++            }
++        }
++    }
++
+     pub fn request_close(&mut self, id: id::Id) {
+         self.get_mut_unit_with_id(id)
+             .map(WindowStateUnit::request_close);

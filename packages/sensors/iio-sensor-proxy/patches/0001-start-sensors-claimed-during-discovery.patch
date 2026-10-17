@@ -1,0 +1,102 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] start sensors claimed during initial discovery
+
+SSC discovery runs a nested main loop. Clients can claim a sensor while
+its driver is still being discovered or opened. Allocate per-type state
+before exporting D-Bus, start existing claims when the initial device is
+opened, and use the same start path for hotplug. Only poll opened devices.
+
+--- a/src/iio-sensor-proxy.c
++++ b/src/iio-sensor-proxy.c
+@@ -522,7 +522,7 @@
+ 							   NULL);
+ 		g_hash_table_insert (ht, g_strdup (sender), GUINT_TO_POINTER (watch_id));
+ 
+-		if (driver_type_exists (data, driver_type)) {
++		if (DEVICE_FOR_TYPE(driver_type) != NULL) {
+ 			SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver_type);
+ 
+ 			/* No other clients for this sensor? Start it */
+@@ -742,10 +742,23 @@
+ 	/* Initialize DBus clients hash table before DBus is fully exposed */
+ 	data->client = g_udev_client_new (subsystems);
+ 
+-	for (guint i = 0; i < NUM_SENSOR_TYPES; i++)
++	for (guint i = 0; i < NUM_SENSOR_TYPES; i++) {
+ 		data->clients[i] = create_clients_hash_table ();
++		data->sensor_startup_dbus_invocations_delayed[i] = g_ptr_array_new ();
++	}
+ 
+ 	data->connection = g_object_ref (connection);
++}
++
++static gboolean
++start_claimed_sensor (SensorData *data, DriverType type)
++{
++	if (g_hash_table_size (data->clients[type]) == 0)
++		return FALSE;
++
++	data->sensor_startup_dbus_event_delayed[type] = TRUE;
++	driver_set_polling (DEVICE_FOR_TYPE(type), TRUE);
++	return TRUE;
+ }
+ 
+ static void
+@@ -764,8 +777,6 @@
+ 
+ 	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
+ 		SensorDevice *sensor_device;
+-
+-		data->sensor_startup_dbus_invocations_delayed[i] = g_ptr_array_new ();
+ 
+ 		if (!driver_type_exists (data, i))
+ 			continue;
+@@ -779,6 +790,7 @@
+ 		}
+ 
+ 		DEVICE_FOR_TYPE(i) = sensor_device;
++		start_claimed_sensor (data, i);
+ 	}
+ 
+ 	if (!any_sensors_left (data))
+@@ -1093,28 +1105,13 @@
+ 					driver_type_to_callback_func (driver->type), data);
+ 
+ 				if (sensor_device) {
+-					GHashTable *ht;
+-
+ 					UDEV_DEVICE_FOR_TYPE(driver->type) = g_object_ref (device);
+ 					DEVICE_FOR_TYPE(driver->type) = sensor_device;
+ 					DRIVER_FOR_TYPE(driver->type) = (SensorDriver *) driver;
+ 
+ 					g_assert (data->sensor_startup_dbus_event_delayed[driver->type] == FALSE);
+-
+-					ht = data->clients[driver->type];
+-
+-					if (g_hash_table_size (ht) > 0) {
+-						SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver->type);
+-
+-						/* Sensor just appeared but it's already claimed by some clients. Wait
+-						 * with calling send_driver_changed_dbus_event() until the first measurement
+-						 * appears, so that the clients have a valid measurement to work with. */
+-						data->sensor_startup_dbus_event_delayed[driver->type] = TRUE;
+-
+-						driver_set_polling (sensor_device, TRUE);
+-					} else {
++					if (!start_claimed_sensor (data, driver->type))
+ 						send_driver_changed_dbus_event (data, driver->type);
+-					}
+ 				}
+ 				break;
+ 			}
+--- a/src/iio-sensor-proxy.c
++++ b/src/iio-sensor-proxy.c
+@@ -423,7 +423,7 @@
+ 
+ 	g_hash_table_remove (ht, sender);
+ 
+-	if (driver_type_exists (data, driver_type) &&
++	if (DEVICE_FOR_TYPE(driver_type) != NULL &&
+ 	    g_hash_table_size (ht) == 0) {
+ 		SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver_type);
+ 		driver_set_polling (sensor_device, FALSE);

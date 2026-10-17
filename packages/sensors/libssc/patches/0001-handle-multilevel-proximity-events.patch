@@ -1,0 +1,152 @@
+--- a/src/libssc-sensor-proximity.c
++++ b/src/libssc-sensor-proximity.c
+@@ -25,6 +25,8 @@
+ 
+ #define SSC_SENSOR_PROXIMITY_NEAR	1
+ #define SSC_SENSOR_PROXIMITY_FAR	0
++#define SSC_SENSOR_PROXIMITY_FAR2	2
++#define SSC_SENSOR_PROXIMITY_NEAR2	3
+ 
+ enum {
+ 	SIGNAL_MEASUREMENT,
+@@ -49,6 +51,7 @@
+ static void
+ signal_context_free (SignalContext *ctx)
+ {
++	g_object_unref (ctx->sensor);
+ 	g_slice_free (SignalContext, ctx);
+ }
+ 
+@@ -89,13 +92,17 @@
+ 
+ 			switch (msg->near) {
+ 				case SSC_SENSOR_PROXIMITY_NEAR:
++				case SSC_SENSOR_PROXIMITY_NEAR2:
+ 					near = true;
+ 					break;
+ 				case SSC_SENSOR_PROXIMITY_FAR:
++				case SSC_SENSOR_PROXIMITY_FAR2:
+ 					near = false;
+ 					break;
+ 				default:
+-					g_assert_not_reached ();
++					g_warning ("Unknown proximity state: %d", msg->near);
++					ssc_proximity_response__free_unpacked (msg, NULL);
++					return;
+ 			}
+ 
+ 			ssc_proximity_response__free_unpacked (msg, NULL);
+@@ -109,7 +116,7 @@
+ 				return;
+ 			}
+ 
+-			if (msg->data->len != sizeof(ProximityDataDavinci)) {
++			if (msg->n_data != 1 || msg->data->len != sizeof(ProximityDataDavinci)) {
+ 				/* Not observed and unlikely to ever happen due to reserved fields in the data struct */
+ 				ssc_proximity_response_davinci__free_unpacked (msg, NULL);
+ 				return;
+@@ -117,15 +124,24 @@
+ 
+ 			memcpy(&data, msg->data->data, sizeof(ProximityDataDavinci));
+ 
++			if (data.near != 0 && data.near != 1 && data.near != 2 && data.near != 3) {
++				g_warning ("Unknown Xiaomi Davinci proximity state: %g", data.near);
++				ssc_proximity_response_davinci__free_unpacked (msg, NULL);
++				return;
++			}
++
+ 			switch ((int)data.near) {
+ 				case SSC_SENSOR_PROXIMITY_NEAR:
++				case SSC_SENSOR_PROXIMITY_NEAR2:
+ 					near = true;
+ 					break;
+ 				case SSC_SENSOR_PROXIMITY_FAR:
++				case SSC_SENSOR_PROXIMITY_FAR2:
+ 					near = false;
+ 					break;
+ 				default:
+-					g_assert_not_reached ();
++					ssc_proximity_response_davinci__free_unpacked (msg, NULL);
++					return;
+ 			}
+ 
+ 			ssc_proximity_response_davinci__free_unpacked (msg, NULL);
+@@ -141,7 +157,7 @@
+ 
+ 			/* Emit signal in main context instead of thread's context */
+ 			ctx = g_slice_new0 (SignalContext);
+-			ctx->sensor = sensor;
++			ctx->sensor = g_object_ref (sensor);
+ 			ctx->near = near;
+ 			g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 		}
+--- a/mocking/ssc_server/data/sensor-proximity.json
++++ b/mocking/ssc_server/data/sensor-proximity.json
+@@ -5,11 +5,26 @@
+ 		"uid_low": "0x0000000000000001"
+ 	},
+ 	"attributes": {
+-		"name": { "id": 0, "value": "proximity-mock" },
+-		"vendor": { "id": 1, "value": "libssc" },
+-		"available": { "id": 3, "value": true },
+-		"sample_rate": { "id": 6, "value": 5.0 },
+-		"stream_type": { "id": 16, "value": 1 }
++		"name": {
++			"id": 0,
++			"value": "proximity-mock"
++		},
++		"vendor": {
++			"id": 1,
++			"value": "libssc"
++		},
++		"available": {
++			"id": 3,
++			"value": true
++		},
++		"sample_rate": {
++			"id": 6,
++			"value": 5.0
++		},
++		"stream_type": {
++			"id": 16,
++			"value": 1
++		}
+ 	},
+ 	"measurements": [
+ 		{
+@@ -26,7 +41,7 @@
+ 		},
+ 		{
+ 			"id": 769,
+-			"near": 0,
++			"near": 2,
+ 			"distance": 17,
+ 			"accuracy": 3
+ 		},
+@@ -38,7 +53,7 @@
+ 		},
+ 		{
+ 			"id": 769,
+-			"near": 1,
++			"near": 3,
+ 			"distance": 0,
+ 			"accuracy": 3
+ 		},
+@@ -56,7 +71,7 @@
+ 		},
+ 		{
+ 			"id": 769,
+-			"near": 0,
++			"near": 2,
+ 			"distance": 20,
+ 			"accuracy": 2
+ 		},
+@@ -74,7 +89,7 @@
+ 		},
+ 		{
+ 			"id": 769,
+-			"near": 1,
++			"near": 3,
+ 			"distance": 1,
+ 			"accuracy": 3
+ 		},

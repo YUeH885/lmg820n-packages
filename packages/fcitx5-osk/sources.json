@@ -1,0 +1,55 @@
+{
+  "version": "0.2.1-0lmg820n8",
+  "source_date_epoch": 1786084872,
+  "source": {
+    "filename": "fcitx5-osk-0.2.1.tar.gz",
+    "revision": "76a33b65b1c72519788c09cfb9f94c1df0f61949",
+    "url": "https://codeload.github.com/fortime/fcitx5-osk/tar.gz/76a33b65b1c72519788c09cfb9f94c1df0f61949",
+    "sha256": "8501c5fdc1c3ff7e8197c53437351284bd85335b4f69aacaddf7181157298b91",
+    "patches": [
+      "0001-native-input-panel.patch",
+      "0002-sync-kwin-visibility.patch",
+      "0003-window-lifecycle.patch",
+      "0004-patched-layershell-dependencies.patch"
+    ]
+  },
+  "crates": [
+    {
+      "name": "layershellev",
+      "version": "0.16.0",
+      "filename": "layershellev-0.16.0.crate",
+      "url": "https://crates.io/api/v1/crates/layershellev/0.16.0/download",
+      "sha256": "66e9699736661513c75de0cbc887aa4656823b8c22c4ac4a955cd2ddea63e1b1",
+      "patches": [
+        "layershellev-input-panel-resize.patch"
+      ]
+    },
+    {
+      "name": "iced_layershell",
+      "version": "0.16.0",
+      "filename": "iced_layershell-0.16.0.crate",
+      "url": "https://crates.io/api/v1/crates/iced_layershell/0.16.0/download",
+      "sha256": "22a8e513ce86c82210538861618b3e948bad9b82abc0d7e127f061371c989269",
+      "patches": [
+        "iced_layershell-input-panel-resize.patch"
+      ]
+    }
+  ],
+  "font": [
+    {
+      "filename": "NotoSerifNerdFont-Regular.ttf",
+      "url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.4.0/patched-fonts/Noto/Serif/NotoSerifNerdFont-Regular.ttf",
+      "sha256": "5b39ad296c59dac8caa4414f84dc014946847f6cd59c44c031adde287f2e6b22"
+    },
+    {
+      "filename": "LICENSE_OFL.txt",
+      "url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.4.0/patched-fonts/Noto/Serif/LICENSE_OFL.txt",
+      "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+    },
+    {
+      "filename": "OFL.txt",
+      "url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.4.0/patched-fonts/Noto/Serif/OFL.txt",
+      "sha256": "f980083077881cf69be49d860e64a9ada3f0e97407f52058fa8f6fe599ab6a23"
+    }
+  ]
+}

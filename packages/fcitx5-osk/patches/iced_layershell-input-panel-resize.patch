@@ -1,0 +1,12 @@
+--- a/src/multi_window.rs
++++ b/src/multi_window.rs
+@@ -722,7 +722,8 @@
+             }
+             LayershellCustomAction::SizeChange((width, height)) => {
+                 ref_layer_shell_window!(ev, iced_id, layer_shell_id, layer_shell_window);
+-                layer_shell_window.set_size((width, height));
++                let id = layer_shell_window.id();
++                ev.resize_window(id, (width, height));
+             }
+             LayershellCustomAction::ExclusiveZoneChange(zone_size) => {
+                 ref_layer_shell_window!(ev, iced_id, layer_shell_id, layer_shell_window);

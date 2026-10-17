@@ -1,0 +1,747 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] sensors: apply live gyro and magnetic calibration
+
+Subscribe to gyro_cal and mag_cal before enabling the physical streams.
+Apply sns_cal_event (1022) in sensor units using CM * (S * SF - B).
+Keep factory compensation in the DSP and wait for usable dynamic
+calibration before emitting measurements. Disable physical streams before
+closing calibration so the firmware persists its final estimates.
+
+--- a/data/meson.build
++++ b/data/meson.build
+@@ -20,6 +20,7 @@
+ 
+ msgs = [
+   'common',
++  'calibration',
+   'sensor-suid',
+   'sensor-proximity',
+   'sensor-light',
+--- /dev/null
++++ b/data/ssc-calibration.proto
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++syntax = "proto2";
++
++/* Wire format of Qualcomm sns_cal_event (message 1022). */
++message SscCalibrationEvent {
++    repeated float bias = 1;
++    repeated float scale_factor = 2;
++    repeated float comp_matrix = 3;
++    required int32 status = 4;
++    optional fixed32 cal_id = 5;
++}
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -46,6 +46,7 @@
+   'libssc-common.c',
+   'libssc-client.c',
+   'libssc-sensor.c',
++  'libssc-calibration.c',
+   'libssc-sensor-proximity.c',
+   'libssc-sensor-light.c',
+   'libssc-sensor-accelerometer.c',
+--- /dev/null
++++ b/src/libssc-calibration-private.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef LIBSSC_CALIBRATION_PRIVATE_H
++#define LIBSSC_CALIBRATION_PRIVATE_H
++
++#include "libssc-sensor.h"
++
++#define SSC_MSG_REPORT_CALIBRATION 1022
++
++typedef struct {
++    SSCSensor *sensor;
++    GObject *client;
++    gulong report_id;
++    guint64 uid_high, uid_low;
++    GMutex lock;
++    gboolean ready;
++    gfloat bias[3], scale[3], matrix[9];
++} SSCVectorCalibration;
++
++void ssc_calibration_init(SSCVectorCalibration *cal);
++void ssc_calibration_disconnect(SSCVectorCalibration *cal);
++void ssc_calibration_clear(SSCVectorCalibration *cal);
++gboolean ssc_calibration_update(SSCVectorCalibration *cal, GArray *bytes);
++gboolean ssc_calibration_apply(SSCVectorCalibration *cal, gfloat *x, gfloat *y, gfloat *z);
++void ssc_calibration_open(SSCVectorCalibration *cal, SSCSensor *owner,
++                         const gchar *type, GCancellable *cancellable,
++                         GAsyncReadyCallback callback, gpointer data);
++void ssc_calibration_close(SSCVectorCalibration *cal, SSCSensor *owner,
++                          GCancellable *cancellable,
++                          GAsyncReadyCallback callback, gpointer data);
++gboolean ssc_calibration_finish(GAsyncResult *result, GError **error);
++
++#endif
+--- /dev/null
++++ b/src/libssc-calibration.c
+@@ -0,0 +1,188 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include <math.h>
++#include <string.h>
++#include "libssc-calibration-private.h"
++#include "ssc-calibration.pb-c.h"
++
++void ssc_calibration_init(SSCVectorCalibration *cal)
++{
++    g_mutex_init(&cal->lock);
++}
++
++void ssc_calibration_disconnect(SSCVectorCalibration *cal)
++{
++    if (cal->report_id)
++        g_clear_signal_handler(&cal->report_id, cal->client);
++    g_clear_object(&cal->client);
++    g_clear_object(&cal->sensor);
++    g_mutex_lock(&cal->lock);
++    cal->ready = FALSE;
++    g_mutex_unlock(&cal->lock);
++}
++
++void ssc_calibration_clear(SSCVectorCalibration *cal)
++{
++    ssc_calibration_disconnect(cal);
++    g_mutex_clear(&cal->lock);
++}
++
++gboolean ssc_calibration_update(SSCVectorCalibration *cal, GArray *bytes)
++{
++    SscCalibrationEvent *msg = ssc_calibration_event__unpack(NULL, bytes->len,
++                                                          (const guint8 *)bytes->data);
++    gfloat bias[3] = {0}, scale[3] = {1, 1, 1};
++    gfloat matrix[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
++    gboolean valid = FALSE;
++
++    if (!msg)
++        goto invalid;
++    if ((msg->n_bias && msg->n_bias != 3) ||
++        (msg->n_scale_factor && msg->n_scale_factor != 3) ||
++        (msg->n_comp_matrix && msg->n_comp_matrix != 9) ||
++        msg->status < 0 || msg->status > 3)
++        goto invalid;
++    if (msg->n_bias)
++        memcpy(bias, msg->bias, sizeof(bias));
++    if (msg->n_scale_factor)
++        memcpy(scale, msg->scale_factor, sizeof(scale));
++    if (msg->n_comp_matrix)
++        memcpy(matrix, msg->comp_matrix, sizeof(matrix));
++    for (guint i = 0; i < 3; i++)
++        if (!isfinite(bias[i]) || !isfinite(scale[i]))
++            goto invalid;
++    for (guint i = 0; i < 9; i++)
++        if (!isfinite(matrix[i]))
++            goto invalid;
++    valid = TRUE;
++    g_mutex_lock(&cal->lock);
++    memcpy(cal->bias, bias, sizeof(bias));
++    memcpy(cal->scale, scale, sizeof(scale));
++    memcpy(cal->matrix, matrix, sizeof(matrix));
++    cal->ready = msg->status != 0;
++    g_mutex_unlock(&cal->lock);
++    goto out;
++
++invalid:
++    g_mutex_lock(&cal->lock);
++    cal->ready = FALSE;
++    g_mutex_unlock(&cal->lock);
++    g_warning("Invalid vector calibration event");
++out:
++    if (msg)
++        ssc_calibration_event__free_unpacked(msg, NULL);
++    return valid;
++}
++
++gboolean ssc_calibration_apply(SSCVectorCalibration *cal, gfloat *x, gfloat *y, gfloat *z)
++{
++    gfloat raw[3] = {*x, *y, *z}, corrected[3] = {0};
++
++    g_mutex_lock(&cal->lock);
++    if (!cal->ready) {
++        g_mutex_unlock(&cal->lock);
++        return FALSE;
++    }
++    for (guint i = 0; i < 3; i++)
++        raw[i] = raw[i] * cal->scale[i] - cal->bias[i];
++    for (guint i = 0; i < 3; i++)
++        for (guint j = 0; j < 3; j++)
++            corrected[i] += cal->matrix[3 * i + j] * raw[j];
++    g_mutex_unlock(&cal->lock);
++    *x = corrected[0];
++    *y = corrected[1];
++    *z = corrected[2];
++    return TRUE;
++}
++
++static void calibration_report(GObject *client, guint32 id, guint64 high,
++                               guint64 low, GArray *bytes, gpointer data)
++{
++    SSCVectorCalibration *cal = data;
++
++    if (id == SSC_MSG_REPORT_CALIBRATION && high == cal->uid_high && low == cal->uid_low)
++        ssc_calibration_update(cal, bytes);
++}
++
++static void calibration_open_ready(GObject *source, GAsyncResult *result, gpointer data)
++{
++    GTask *task = G_TASK(data);
++    SSCVectorCalibration *cal = g_task_get_task_data(task);
++    GError *error = NULL;
++
++    if (!ssc_sensor_open_finish(SSC_SENSOR(source), result, &error)) {
++        ssc_calibration_disconnect(cal);
++        g_task_return_error(task, error);
++    } else {
++        g_task_return_boolean(task, TRUE);
++    }
++    g_object_unref(task);
++}
++
++static void calibration_discovered(GObject *source, GAsyncResult *result, gpointer data)
++{
++    GTask *task = G_TASK(data);
++    SSCVectorCalibration *cal = g_task_get_task_data(task);
++    GError *error = NULL;
++
++    cal->sensor = ssc_sensor_new_finish(result, &error);
++    if (!cal->sensor) {
++        g_task_return_error(task, error);
++        g_object_unref(task);
++        return;
++    }
++    g_object_get(cal->sensor, SSC_SENSOR_CLIENT, &cal->client,
++                 SSC_SENSOR_UID_HIGH, &cal->uid_high, SSC_SENSOR_UID_LOW, &cal->uid_low, NULL);
++    cal->report_id = g_signal_connect(cal->client, "report", G_CALLBACK(calibration_report), cal);
++    ssc_sensor_open(cal->sensor, g_task_get_cancellable(task), calibration_open_ready, task);
++}
++
++void ssc_calibration_open(SSCVectorCalibration *cal, SSCSensor *owner,
++                         const gchar *type, GCancellable *cancellable,
++                         GAsyncReadyCallback callback, gpointer data)
++{
++    GTask *task = g_task_new(owner, cancellable, callback, data);
++
++    if (cal->sensor) {
++        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_PENDING,
++                               "Calibration sensor is already open");
++        g_object_unref(task);
++        return;
++    }
++    g_task_set_task_data(task, cal, NULL);
++    ssc_sensor_new((gchar *)type, cancellable, calibration_discovered, task);
++}
++
++static void calibration_close_ready(GObject *source, GAsyncResult *result, gpointer data)
++{
++    GTask *task = G_TASK(data);
++    SSCVectorCalibration *cal = g_task_get_task_data(task);
++    GError *error = NULL;
++    gboolean success = ssc_sensor_close_finish(SSC_SENSOR(source), result, &error);
++
++    ssc_calibration_disconnect(cal);
++    if (success)
++        g_task_return_boolean(task, TRUE);
++    else
++        g_task_return_error(task, error);
++    g_object_unref(task);
++}
++
++void ssc_calibration_close(SSCVectorCalibration *cal, SSCSensor *owner,
++                          GCancellable *cancellable,
++                          GAsyncReadyCallback callback, gpointer data)
++{
++    GTask *task = g_task_new(owner, cancellable, callback, data);
++
++    if (!cal->sensor) {
++        g_task_return_boolean(task, TRUE);
++        g_object_unref(task);
++        return;
++    }
++    g_task_set_task_data(task, cal, NULL);
++    ssc_sensor_close(cal->sensor, cancellable, calibration_close_ready, task);
++}
++
++gboolean ssc_calibration_finish(GAsyncResult *result, GError **error)
++{
++    return g_task_propagate_boolean(G_TASK(result), error);
++}
+--- a/src/libssc-sensor.c
++++ b/src/libssc-sensor.c
+@@ -18,6 +18,7 @@
+ 
+ #include "libssc-client-private.h"
+ #include "libssc-common-private.h"
++#include "libssc-calibration-private.h"
+ #include "ssc-common.pb-c.h"
+ #include "ssc-sensor-suid.pb-c.h"
+ #include "libssc-sensor.h"
+@@ -490,7 +491,7 @@
+ 	 * Apply this for any sensor to cover new sensors in the future as well.
+ 	 * Either a configuration update or measurement will complete the task and disconnect the listener.
+ 	 */
+-	} else if (uid_high == priv->uid_high && uid_low == priv->uid_low && (msg_id == SSC_MSG_REPORT_MEASUREMENT || msg_id == SSC_MSG_REPORT_MEASUREMENT_PROXIMITY)) {
++	} else if (uid_high == priv->uid_high && uid_low == priv->uid_low && (msg_id == SSC_MSG_REPORT_MEASUREMENT || msg_id == SSC_MSG_REPORT_MEASUREMENT_PROXIMITY || msg_id == SSC_MSG_REPORT_CALIBRATION)) {
+ 		g_debug ("Measurement received for '%s' sensor (%" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT "), assuming enabled", priv->data_type, priv->uid_high, priv->uid_low);
+ 
+ 		if (ctx->task) {
+--- a/src/libssc-sensor-gyroscope.c
++++ b/src/libssc-sensor-gyroscope.c
+@@ -18,6 +18,7 @@
+ 
+ #include "libssc-client-private.h"
+ #include "libssc-common-private.h"
++#include "libssc-calibration-private.h"
+ #include "ssc-common.pb-c.h"
+ #include "ssc-sensor-gyroscope.pb-c.h"
+ #include "libssc-sensor-gyroscope.h"
+@@ -29,7 +30,8 @@
+ static guint signals[N_SIGNALS];
+ 
+ typedef struct _SSCSensorGyroscopePrivate {
+-	guint report_id;
++	gulong report_id;
++	SSCVectorCalibration calibration;
+ } SSCSensorGyroscopePrivate;
+ 
+ G_DEFINE_TYPE_WITH_CODE (SSCSensorGyroscope, ssc_sensor_gyroscope, SSC_TYPE_SENSOR,
+@@ -71,6 +73,7 @@
+ 	gfloat x;
+ 	gfloat y;
+ 	gfloat z;
++	SSCSensorGyroscopePrivate *priv = ssc_sensor_gyroscope_get_instance_private(sensor);
+ 
+ 	g_object_get (sensor,
+ 		      SSC_SENSOR_UID_HIGH, &sensor_uid_high,
+@@ -89,6 +92,11 @@
+ 			x = msg->velocity[0];
+ 			y = msg->velocity[1];
+ 			z = msg->velocity[2];
++
++			if (!ssc_calibration_apply(&priv->calibration, &x, &y, &z)) {
++				ssc_gyroscope_response__free_unpacked(msg, NULL);
++				return;
++			}
+ 
+ 			/* Emit signal in main context instead of thread's context */
+ 			ctx = g_slice_new0 (SignalContext);
+@@ -106,19 +114,35 @@
+ /*****************************************************************************/
+ 
+ static void
+-gyroscope_close_ready (SSCSensor *sensor, GAsyncResult *result, gpointer user_data)
+-{
+-	GTask *task = G_TASK (user_data);
+-	g_autoptr (GError) error = NULL;
+-
+-	if (!SSC_SENSOR_CLASS (ssc_sensor_gyroscope_parent_class)->close_finish (sensor, result, &error)) {
+-		g_task_return_boolean (task, FALSE);
+-		g_object_unref (task);
+-		return;
+-	}
+-
+-	g_task_return_boolean (task, TRUE);
+-	g_object_unref (task);
++gyroscope_calibration_closed(GObject *source, GAsyncResult *result, gpointer data)
++{
++	GTask *task = G_TASK(data);
++	GError *first_error = g_task_get_task_data(task);
++	GError *error = NULL;
++
++	ssc_calibration_finish(result, &error);
++	if (first_error) {
++		g_clear_error(&error);
++		g_task_return_error(task, g_error_copy(first_error));
++	} else if (error) {
++		g_task_return_error(task, error);
++	} else {
++		g_task_return_boolean(task, TRUE);
++	}
++	g_object_unref(task);
++}
++
++static void
++gyroscope_close_ready(SSCSensor *sensor, GAsyncResult *result, gpointer data)
++{
++	GTask *task = G_TASK(data);
++	SSCSensorGyroscopePrivate *priv = ssc_sensor_gyroscope_get_instance_private(SSC_SENSOR_GYROSCOPE(sensor));
++	GError *error = NULL;
++
++	if (!SSC_SENSOR_CLASS(ssc_sensor_gyroscope_parent_class)->close_finish(sensor, result, &error))
++		g_task_set_task_data(task, error, (GDestroyNotify)g_error_free);
++	ssc_calibration_close(&priv->calibration, sensor, g_task_get_cancellable(task),
++	                      gyroscope_calibration_closed, task);
+ }
+ 
+ gboolean
+@@ -131,7 +155,7 @@
+ ssc_sensor_gyroscope_close (SSCSensorGyroscope *self, GCancellable *cancellable, GAsyncReadyCallback callback, gpointer user_data)
+ {
+ 	GTask *task = NULL;
+-	SSCClient *client = NULL;
++	g_autoptr(SSCClient) client = NULL;
+ 	SSCSensorGyroscopePrivate *priv = NULL;
+ 
+ 	g_assert (SSC_SENSOR_CLASS (ssc_sensor_gyroscope_parent_class)->close &&
+@@ -145,8 +169,7 @@
+ 		      SSC_SENSOR_CLIENT, &client,
+ 		      NULL);
+ 
+-	if (priv->report_id)
+-		g_signal_handler_disconnect (client, priv->report_id);
++	g_clear_signal_handler(&priv->report_id, client);
+ 
+ 	/* Close sensor */
+ 	SSC_SENSOR_CLASS (ssc_sensor_gyroscope_parent_class)->close (SSC_SENSOR (self), cancellable, (GAsyncReadyCallback)gyroscope_close_ready, task);
+@@ -176,8 +199,14 @@
+ 	g_autoptr (GError) error = NULL;
+ 
+ 	if (!SSC_SENSOR_CLASS (ssc_sensor_gyroscope_parent_class)->open_finish (sensor, result, &error)) {
+-		g_task_return_boolean (task, FALSE);
+-		g_object_unref (task);
++		SSCSensorGyroscopePrivate *priv = ssc_sensor_gyroscope_get_instance_private(SSC_SENSOR_GYROSCOPE(sensor));
++		g_autoptr(SSCClient) client = NULL;
++
++		g_object_get(sensor, SSC_SENSOR_CLIENT, &client, NULL);
++		g_clear_signal_handler(&priv->report_id, client);
++		g_task_set_task_data(task, g_steal_pointer(&error), (GDestroyNotify)g_error_free);
++		ssc_calibration_close(&priv->calibration, sensor, g_task_get_cancellable(task),
++		                      gyroscope_calibration_closed, task);
+ 		return;
+ 	}
+ 
+@@ -191,31 +220,35 @@
+ 	return g_task_propagate_boolean (G_TASK (result), error);
+ }
+ 
++static void
++gyroscope_calibration_opened(GObject *source, GAsyncResult *result, gpointer data)
++{
++	GTask *task = G_TASK(data);
++	SSCSensorGyroscope *self = g_task_get_source_object(task);
++	SSCSensorGyroscopePrivate *priv = ssc_sensor_gyroscope_get_instance_private(self);
++	g_autoptr(SSCClient) client = NULL;
++	GError *error = NULL;
++
++	if (!ssc_calibration_finish(result, &error)) {
++		g_task_return_error(task, error);
++		g_object_unref(task);
++		return;
++	}
++	g_object_get(self, SSC_SENSOR_CLIENT, &client, NULL);
++	priv->report_id = g_signal_connect(client, "report", G_CALLBACK(report_received), self);
++	SSC_SENSOR_CLASS(ssc_sensor_gyroscope_parent_class)->open(SSC_SENSOR(self),
++		g_task_get_cancellable(task), (GAsyncReadyCallback)gyroscope_open_ready, task);
++}
++
+ void
+-ssc_sensor_gyroscope_open (SSCSensorGyroscope *self, GCancellable *cancellable, GAsyncReadyCallback callback, gpointer user_data)
+-{
+-	SSCClient *client = NULL;
+-	SSCSensorGyroscopePrivate *priv = NULL;
+-	GTask *task = NULL;
+-
+-	g_assert (SSC_SENSOR_CLASS (ssc_sensor_gyroscope_parent_class)->open &&
+-		  SSC_SENSOR_CLASS (ssc_sensor_gyroscope_parent_class)->open_finish);
+-
+-	priv = ssc_sensor_gyroscope_get_instance_private (SSC_SENSOR_GYROSCOPE (self));
+-
+-	task = g_task_new (self, cancellable, callback, user_data);
+-
+-	/* Start listening for reports before opening sensor so we don't miss the first measurement */
+-	g_object_get (SSC_SENSOR (self),
+-		      SSC_SENSOR_CLIENT, &client,
+-		      NULL);
+-	priv->report_id = g_signal_connect (client,
+-					    "report",
+-					    G_CALLBACK (report_received),
+-					    self);
+-
+-	/* Open sensor */
+-	SSC_SENSOR_CLASS (ssc_sensor_gyroscope_parent_class)->open (SSC_SENSOR (self), cancellable, (GAsyncReadyCallback)gyroscope_open_ready, task);
++ssc_sensor_gyroscope_open(SSCSensorGyroscope *self, GCancellable *cancellable,
++                       GAsyncReadyCallback callback, gpointer data)
++{
++	GTask *task = g_task_new(self, cancellable, callback, data);
++	SSCSensorGyroscopePrivate *priv = ssc_sensor_gyroscope_get_instance_private(self);
++
++	ssc_calibration_open(&priv->calibration, SSC_SENSOR(self), "gyro_cal",
++	                     cancellable, gyroscope_calibration_opened, task);
+ }
+ 
+ gboolean
+@@ -236,8 +269,32 @@
+ /*****************************************************************************/
+ 
+ static void
++ssc_sensor_gyroscope_dispose(GObject *object)
++{
++	SSCSensorGyroscopePrivate *priv = ssc_sensor_gyroscope_get_instance_private(SSC_SENSOR_GYROSCOPE(object));
++	g_autoptr(SSCClient) client = NULL;
++
++	g_object_get(object, SSC_SENSOR_CLIENT, &client, NULL);
++	if (priv->report_id)
++		g_clear_signal_handler(&priv->report_id, client);
++	ssc_calibration_disconnect(&priv->calibration);
++	G_OBJECT_CLASS(ssc_sensor_gyroscope_parent_class)->dispose(object);
++}
++
++static void
++ssc_sensor_gyroscope_finalize(GObject *object)
++{
++	SSCSensorGyroscopePrivate *priv = ssc_sensor_gyroscope_get_instance_private(SSC_SENSOR_GYROSCOPE(object));
++
++	ssc_calibration_clear(&priv->calibration);
++	G_OBJECT_CLASS(ssc_sensor_gyroscope_parent_class)->finalize(object);
++}
++
++static void
+ ssc_sensor_gyroscope_class_init (SSCSensorGyroscopeClass *klass)
+ {
++	G_OBJECT_CLASS(klass)->dispose = ssc_sensor_gyroscope_dispose;
++	G_OBJECT_CLASS(klass)->finalize = ssc_sensor_gyroscope_finalize;
+ 	signals[SIGNAL_MEASUREMENT] = g_signal_new ("measurement",
+ 		G_TYPE_FROM_CLASS (klass),
+ 		G_SIGNAL_RUN_FIRST,
+@@ -249,6 +306,8 @@
+ static void
+ ssc_sensor_gyroscope_init (SSCSensorGyroscope *self)
+ {
++	SSCSensorGyroscopePrivate *priv = ssc_sensor_gyroscope_get_instance_private(self);
++	ssc_calibration_init(&priv->calibration);
+ }
+ 
+ SSCSensorGyroscope *
+--- a/src/libssc-sensor-magnetometer.c
++++ b/src/libssc-sensor-magnetometer.c
+@@ -18,6 +18,7 @@
+ 
+ #include "libssc-client-private.h"
+ #include "libssc-common-private.h"
++#include "libssc-calibration-private.h"
+ #include "ssc-common.pb-c.h"
+ #include "ssc-sensor-magnetometer.pb-c.h"
+ #include "libssc-sensor-magnetometer.h"
+@@ -29,7 +30,8 @@
+ static guint signals[N_SIGNALS];
+ 
+ typedef struct _SSCSensorMagnetometerPrivate {
+-	guint report_id;
++	gulong report_id;
++	SSCVectorCalibration calibration;
+ } SSCSensorMagnetometerPrivate;
+ 
+ G_DEFINE_TYPE_WITH_CODE (SSCSensorMagnetometer, ssc_sensor_magnetometer, SSC_TYPE_SENSOR,
+@@ -71,6 +73,7 @@
+ 	gfloat x;
+ 	gfloat y;
+ 	gfloat z;
++	SSCSensorMagnetometerPrivate *priv = ssc_sensor_magnetometer_get_instance_private(sensor);
+ 
+ 	g_object_get (sensor,
+ 		      SSC_SENSOR_UID_HIGH, &sensor_uid_high,
+@@ -85,10 +88,15 @@
+ 			return;
+ 		}
+ 
+-		if (msg->n_magnetic_field >= 3) {
++		if (msg->n_magnetic_field >= 3 && msg->accuracy != SSC_ACCURACY_UNRELIABLE) {
+ 			x = msg->magnetic_field[0];
+ 			y = msg->magnetic_field[1];
+ 			z = msg->magnetic_field[2];
++
++			if (!ssc_calibration_apply(&priv->calibration, &x, &y, &z)) {
++				ssc_magnetometer_response__free_unpacked(msg, NULL);
++				return;
++			}
+ 
+ 			/* Emit signal in main context instead of thread's context */
+ 			ctx = g_slice_new0 (SignalContext);
+@@ -106,19 +114,35 @@
+ /*****************************************************************************/
+ 
+ static void
+-magnetometer_close_ready (SSCSensor *sensor, GAsyncResult *result, gpointer user_data)
+-{
+-	GTask *task = G_TASK (user_data);
+-	g_autoptr (GError) error = NULL;
+-
+-	if (!SSC_SENSOR_CLASS (ssc_sensor_magnetometer_parent_class)->close_finish (sensor, result, &error)) {
+-		g_task_return_boolean (task, FALSE);
+-		g_object_unref (task);
+-		return;
+-	}
+-
+-	g_task_return_boolean (task, TRUE);
+-	g_object_unref (task);
++magnetometer_calibration_closed(GObject *source, GAsyncResult *result, gpointer data)
++{
++	GTask *task = G_TASK(data);
++	GError *first_error = g_task_get_task_data(task);
++	GError *error = NULL;
++
++	ssc_calibration_finish(result, &error);
++	if (first_error) {
++		g_clear_error(&error);
++		g_task_return_error(task, g_error_copy(first_error));
++	} else if (error) {
++		g_task_return_error(task, error);
++	} else {
++		g_task_return_boolean(task, TRUE);
++	}
++	g_object_unref(task);
++}
++
++static void
++magnetometer_close_ready(SSCSensor *sensor, GAsyncResult *result, gpointer data)
++{
++	GTask *task = G_TASK(data);
++	SSCSensorMagnetometerPrivate *priv = ssc_sensor_magnetometer_get_instance_private(SSC_SENSOR_MAGNETOMETER(sensor));
++	GError *error = NULL;
++
++	if (!SSC_SENSOR_CLASS(ssc_sensor_magnetometer_parent_class)->close_finish(sensor, result, &error))
++		g_task_set_task_data(task, error, (GDestroyNotify)g_error_free);
++	ssc_calibration_close(&priv->calibration, sensor, g_task_get_cancellable(task),
++	                      magnetometer_calibration_closed, task);
+ }
+ 
+ gboolean
+@@ -131,7 +155,7 @@
+ ssc_sensor_magnetometer_close (SSCSensorMagnetometer *self, GCancellable *cancellable, GAsyncReadyCallback callback, gpointer user_data)
+ {
+ 	GTask *task = NULL;
+-	SSCClient *client = NULL;
++	g_autoptr(SSCClient) client = NULL;
+ 	SSCSensorMagnetometerPrivate *priv = NULL;
+ 
+ 	g_assert (SSC_SENSOR_CLASS (ssc_sensor_magnetometer_parent_class)->close &&
+@@ -145,8 +169,7 @@
+ 		      SSC_SENSOR_CLIENT, &client,
+ 		      NULL);
+ 
+-	if (priv->report_id)
+-		g_signal_handler_disconnect (client, priv->report_id);
++	g_clear_signal_handler(&priv->report_id, client);
+ 
+ 	/* Close sensor */
+ 	SSC_SENSOR_CLASS (ssc_sensor_magnetometer_parent_class)->close (SSC_SENSOR (self), cancellable, (GAsyncReadyCallback)magnetometer_close_ready, task);
+@@ -176,8 +199,14 @@
+ 	g_autoptr (GError) error = NULL;
+ 
+ 	if (!SSC_SENSOR_CLASS (ssc_sensor_magnetometer_parent_class)->open_finish (sensor, result, &error)) {
+-		g_task_return_boolean (task, FALSE);
+-		g_object_unref (task);
++		SSCSensorMagnetometerPrivate *priv = ssc_sensor_magnetometer_get_instance_private(SSC_SENSOR_MAGNETOMETER(sensor));
++		g_autoptr(SSCClient) client = NULL;
++
++		g_object_get(sensor, SSC_SENSOR_CLIENT, &client, NULL);
++		g_clear_signal_handler(&priv->report_id, client);
++		g_task_set_task_data(task, g_steal_pointer(&error), (GDestroyNotify)g_error_free);
++		ssc_calibration_close(&priv->calibration, sensor, g_task_get_cancellable(task),
++		                      magnetometer_calibration_closed, task);
+ 		return;
+ 	}
+ 
+@@ -191,31 +220,35 @@
+ 	return g_task_propagate_boolean (G_TASK (result), error);
+ }
+ 
++static void
++magnetometer_calibration_opened(GObject *source, GAsyncResult *result, gpointer data)
++{
++	GTask *task = G_TASK(data);
++	SSCSensorMagnetometer *self = g_task_get_source_object(task);
++	SSCSensorMagnetometerPrivate *priv = ssc_sensor_magnetometer_get_instance_private(self);
++	g_autoptr(SSCClient) client = NULL;
++	GError *error = NULL;
++
++	if (!ssc_calibration_finish(result, &error)) {
++		g_task_return_error(task, error);
++		g_object_unref(task);
++		return;
++	}
++	g_object_get(self, SSC_SENSOR_CLIENT, &client, NULL);
++	priv->report_id = g_signal_connect(client, "report", G_CALLBACK(report_received), self);
++	SSC_SENSOR_CLASS(ssc_sensor_magnetometer_parent_class)->open(SSC_SENSOR(self),
++		g_task_get_cancellable(task), (GAsyncReadyCallback)magnetometer_open_ready, task);
++}
++
+ void
+-ssc_sensor_magnetometer_open (SSCSensorMagnetometer *self, GCancellable *cancellable, GAsyncReadyCallback callback, gpointer user_data)
+-{
+-	SSCSensorMagnetometerPrivate *priv = NULL;
+-	SSCClient *client = NULL;
+-	GTask *task = NULL;
+-
+-	g_assert (SSC_SENSOR_CLASS (ssc_sensor_magnetometer_parent_class)->open &&
+-		  SSC_SENSOR_CLASS (ssc_sensor_magnetometer_parent_class)->open_finish);
+-
+-	priv = ssc_sensor_magnetometer_get_instance_private (SSC_SENSOR_MAGNETOMETER (self));
+-
+-	task = g_task_new (self, cancellable, callback, user_data);
+-
+-	/* Start listening for reports before opening sensor so we don't miss the first measurement */
+-	g_object_get (SSC_SENSOR (self),
+-		      SSC_SENSOR_CLIENT, &client,
+-		      NULL);
+-	priv->report_id = g_signal_connect (client,
+-			"report",
+-			G_CALLBACK (report_received),
+-			self);
+-
+-	/* Open sensor */
+-	SSC_SENSOR_CLASS (ssc_sensor_magnetometer_parent_class)->open (SSC_SENSOR (self), cancellable, (GAsyncReadyCallback)magnetometer_open_ready, task);
++ssc_sensor_magnetometer_open(SSCSensorMagnetometer *self, GCancellable *cancellable,
++                       GAsyncReadyCallback callback, gpointer data)
++{
++	GTask *task = g_task_new(self, cancellable, callback, data);
++	SSCSensorMagnetometerPrivate *priv = ssc_sensor_magnetometer_get_instance_private(self);
++
++	ssc_calibration_open(&priv->calibration, SSC_SENSOR(self), "mag_cal",
++	                     cancellable, magnetometer_calibration_opened, task);
+ }
+ 
+ gboolean
+@@ -236,8 +269,32 @@
+ /*****************************************************************************/
+ 
+ static void
++ssc_sensor_magnetometer_dispose(GObject *object)
++{
++	SSCSensorMagnetometerPrivate *priv = ssc_sensor_magnetometer_get_instance_private(SSC_SENSOR_MAGNETOMETER(object));
++	g_autoptr(SSCClient) client = NULL;
++
++	g_object_get(object, SSC_SENSOR_CLIENT, &client, NULL);
++	if (priv->report_id)
++		g_clear_signal_handler(&priv->report_id, client);
++	ssc_calibration_disconnect(&priv->calibration);
++	G_OBJECT_CLASS(ssc_sensor_magnetometer_parent_class)->dispose(object);
++}
++
++static void
++ssc_sensor_magnetometer_finalize(GObject *object)
++{
++	SSCSensorMagnetometerPrivate *priv = ssc_sensor_magnetometer_get_instance_private(SSC_SENSOR_MAGNETOMETER(object));
++
++	ssc_calibration_clear(&priv->calibration);
++	G_OBJECT_CLASS(ssc_sensor_magnetometer_parent_class)->finalize(object);
++}
++
++static void
+ ssc_sensor_magnetometer_class_init (SSCSensorMagnetometerClass *klass)
+ {
++	G_OBJECT_CLASS(klass)->dispose = ssc_sensor_magnetometer_dispose;
++	G_OBJECT_CLASS(klass)->finalize = ssc_sensor_magnetometer_finalize;
+ 	signals[SIGNAL_MEASUREMENT] = g_signal_new ("measurement",
+ 		G_TYPE_FROM_CLASS (klass),
+ 		G_SIGNAL_RUN_FIRST,
+@@ -249,6 +306,8 @@
+ static void
+ ssc_sensor_magnetometer_init (SSCSensorMagnetometer *self)
+ {
++	SSCSensorMagnetometerPrivate *priv = ssc_sensor_magnetometer_get_instance_private(self);
++	ssc_calibration_init(&priv->calibration);
+ }
+ 
+ SSCSensorMagnetometer *

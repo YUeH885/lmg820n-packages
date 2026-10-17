@@ -1,0 +1,102 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] sensors: keep objects alive until queued reports are delivered
+
+The report callbacks enqueue signal delivery in the main context. Hold
+an object reference for each queued report so closing a client cannot
+free the sensor before the signal runs. Release it with the signal context.
+
+--- a/src/libssc-sensor-accelerometer.c
++++ b/src/libssc-sensor-accelerometer.c
+@@ -45,6 +45,7 @@
+ static void
+ signal_context_free (SignalContext *ctx)
+ {
++	g_object_unref (ctx->sensor);
+ 	g_slice_free (SignalContext, ctx);
+ }
+ 
+@@ -93,7 +94,7 @@
+ 
+ 			/* Emit signal in main context instead of thread's context */
+ 			ctx = g_slice_new0 (SignalContext);
+-			ctx->sensor = sensor;
++			ctx->sensor = g_object_ref (sensor);
+ 
+ 			/* Apply mount matrix specified in https://www.kernel.org/doc/Documentation/devicetree/bindings/iio/mount-matrix.txt */
+ 			ctx->x = mount_matrix[0][0] * x + mount_matrix[0][1] * y + mount_matrix[0][2] * z;
+--- a/src/libssc-sensor-light.c
++++ b/src/libssc-sensor-light.c
+@@ -43,6 +43,7 @@
+ static void
+ signal_context_free (SignalContext *ctx)
+ {
++	g_object_unref (ctx->sensor);
+ 	g_slice_free (SignalContext, ctx);
+ }
+ 
+@@ -87,7 +88,7 @@
+ 			/* Emit signal in main context instead of thread's context if intensity is positive */
+ 			if (intensity >= 0.0) {
+ 				ctx = g_slice_new0 (SignalContext);
+-				ctx->sensor = sensor;
++				ctx->sensor = g_object_ref (sensor);
+ 				ctx->intensity = intensity;
+ 				g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 			}
+--- a/src/libssc-sensor-compass.c
++++ b/src/libssc-sensor-compass.c
+@@ -43,6 +43,7 @@
+ static void
+ signal_context_free (SignalContext *ctx)
+ {
++	g_object_unref (ctx->sensor);
+ 	g_slice_free (SignalContext, ctx);
+ }
+ 
+@@ -125,7 +126,7 @@
+ 
+ 			/* Emit signal in main context instead of thread's context */
+ 			ctx = g_slice_new0 (SignalContext);
+-			ctx->sensor = sensor;
++			ctx->sensor = g_object_ref (sensor);
+ 			ctx->azimuth = azimuth;
+ 			g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 		}
+--- a/src/libssc-sensor-magnetometer.c
++++ b/src/libssc-sensor-magnetometer.c
+@@ -45,6 +45,7 @@
+ static void
+ signal_context_free (SignalContext *ctx)
+ {
++	g_object_unref (ctx->sensor);
+ 	g_slice_free (SignalContext, ctx);
+ }
+ 
+@@ -91,7 +92,7 @@
+ 
+ 			/* Emit signal in main context instead of thread's context */
+ 			ctx = g_slice_new0 (SignalContext);
+-			ctx->sensor = sensor;
++			ctx->sensor = g_object_ref (sensor);
+ 			ctx->x = x;
+ 			ctx->y = y;
+ 			ctx->z = z;
+--- a/src/libssc-sensor-gyroscope.c
++++ b/src/libssc-sensor-gyroscope.c
+@@ -45,6 +45,7 @@
+ static void
+ signal_context_free (SignalContext *ctx)
+ {
++	g_object_unref (ctx->sensor);
+ 	g_slice_free (SignalContext, ctx);
+ }
+ 
+@@ -91,7 +92,7 @@
+ 
+ 			/* Emit signal in main context instead of thread's context */
+ 			ctx = g_slice_new0 (SignalContext);
+-			ctx->sensor = sensor;
++			ctx->sensor = g_object_ref (sensor);
+ 			ctx->x = x;
+ 			ctx->y = y;
+ 			ctx->z = z;

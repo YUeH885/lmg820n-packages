@@ -1,0 +1,158 @@
+diff --git a/fcitx5-osk/src/state/window.rs b/fcitx5-osk/src/state/window.rs
+index 7631fe1..967b4b2 100644
+--- a/fcitx5-osk/src/state/window.rs
++++ b/fcitx5-osk/src/state/window.rs
+@@ -27,6 +27,7 @@ pub enum CloseOpSource {
+     Fcitx5,
+     UserAction,
+     DbusController,
++    Reconfigure,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -135,11 +136,15 @@ impl<WM> WindowState<WM>
+ where
+     WM: WindowManager,
+ {
+-    fn set_opened(&mut self, wm: &mut WM, portrait: bool) {
++    fn set_opened(&mut self, wm: &mut WM, portrait: bool) -> bool {
+         let Some(id) = self.id else {
+             tracing::error!("Window[{}] is closed, can't set_opened", self.name);
+-            return;
++            return false;
+         };
++        // A close request may arrive before the asynchronous open notification.
++        if self.closing() {
++            return false;
++        }
+         if let InnerWindowState::Init = self.state {
+             self.state = InnerWindowState::Opened;
+             if Some(Placement::Float) == wm.placement(id) {
+@@ -156,7 +161,7 @@ where
+                     portrait
+                 );
+             }
+-            return;
++            return true;
+         }
+         tracing::error!(
+             "Window[{}/{}] is in a wrong state: {:?}, can't update to {:?}",
+@@ -164,7 +169,8 @@ where
+             id,
+             self.state,
+             InnerWindowState::Opened
+-        )
++        );
++        false
+     }
+ 
+     fn open(
+@@ -597,6 +603,11 @@ where
+         self.unset_to_be_opened(WindowMask::Keyboard);
+         let mut task = Task::done(Message::from(ImEvent::SyncImList).into())
+             .chain(Task::done(Message::from(ImEvent::SyncCurrentIm).into()));
++        if self.indicator_display() != IndicatorDisplay::AlwaysOn
++            && self.indicator_window_state.id().is_some()
++        {
++            task = task.chain(self.close_indicator());
++        }
+         if self.keyboard_window_state.id().is_none() {
+             let portrait = self.is_portrait();
+             task = task.chain(Task::done(WM::Message::from(
+@@ -629,10 +640,7 @@ where
+             // window is not opened, mark it to_be_opened
+             self.set_to_be_opened(WindowMask::Keyboard, false);
+         } else if self.keyboard_window_state.closing() {
+-            // don't chain fetch_screen_info, otherwise, to_be_opened will be consumed before the
+-            // keyboard is closed.
+-            //self.to_be_opened_flag |= WindowMask::Keyboard as u16;
+-            // TODO I have forgotten why this case is needed
++            self.set_to_be_opened(WindowMask::Keyboard, true);
+         } else {
+             // manually increase close_req_token
+             self.keyboard_window_state.inc_close_req_token();
+@@ -641,12 +649,17 @@ where
+     }
+ 
+     pub fn close_keyboard(&mut self, source: CloseOpSource) -> Task<WM::Message> {
++        if source != CloseOpSource::Reconfigure {
++            self.unset_to_be_opened(WindowMask::Keyboard);
++        }
+         match source {
+             CloseOpSource::Fcitx5 => self
+                 .keyboard_window_state
+                 .close_with_delay(self.hide_delay, source)
+                 .map_task(),
+-            CloseOpSource::UserAction | CloseOpSource::DbusController => {
++            CloseOpSource::UserAction
++            | CloseOpSource::DbusController
++            | CloseOpSource::Reconfigure => {
+                 let task = self.keyboard_window_state.close(&mut self.wm, source);
+                 // If Keyboard is reopening, don't open indicator
+                 if ((self.indicator_display() == IndicatorDisplay::Auto
+@@ -739,7 +752,8 @@ where
+     pub fn reopen_keyboard_if_opened(&mut self) -> Option<Task<WM::Message>> {
+         if self.keyboard_window_state.id().is_some() {
+             self.set_to_be_opened(WindowMask::Keyboard, true);
+-            Some(self.close_keyboard(CloseOpSource::UserAction))
++            // Replacing a surface keeps the input session active.
++            Some(self.close_keyboard(CloseOpSource::Reconfigure))
+         } else {
+             None
+         }
+@@ -910,20 +924,27 @@ where
+                 let mut task = self.wm.opened(id, size);
+                 match self.window_type(id) {
+                     WindowType::Keyboard => {
+-                        self.keyboard_window_state
+-                            .set_opened(&mut self.wm, portrait);
++                        if !self
++                            .keyboard_window_state
++                            .set_opened(&mut self.wm, portrait)
++                        {
++                            return task;
++                        }
++                        let expected_size = self.keyboard_window_size().to_iced_size();
++                        // Layout updates can arrive while the surface is still being created.
++                        if (size.width as u32, size.height as u32)
++                            != (expected_size.width as u32, expected_size.height as u32)
++                        {
++                            task = task.chain(
++                                self.keyboard_window_state
++                                    .resize(&mut self.wm, expected_size),
++                            );
++                        }
+                         task = task.chain(self.fcitx5_show().map_task());
+-                        match self.indicator_display() {
+-                            IndicatorDisplay::Auto | IndicatorDisplay::AlwaysOff => {
+-                                if self.indicator_window_state.id().is_some() {
+-                                    task = task.chain(self.close_indicator())
+-                                }
+-                            }
+-                            IndicatorDisplay::AlwaysOn => {
+-                                if self.indicator_window_state.id().is_none() {
+-                                    task = task.chain(self.open_indicator())
+-                                }
+-                            }
++                        if self.indicator_display() == IndicatorDisplay::AlwaysOn
++                            && self.indicator_window_state.id().is_none()
++                        {
++                            task = task.chain(self.open_indicator());
+                         }
+                         // The indicator might need to move up after a docked keyboard is opened
+                         if let Some(t) = self
+@@ -934,8 +955,12 @@ where
+                         }
+                     }
+                     WindowType::Indicator => {
+-                        self.indicator_window_state
+-                            .set_opened(&mut self.wm, portrait);
++                        if !self
++                            .indicator_window_state
++                            .set_opened(&mut self.wm, portrait)
++                        {
++                            return task;
++                        }
+                         if self.indicator_display() == IndicatorDisplay::Auto {
+                             task = task.chain(self.close_keyboard(CloseOpSource::UserAction));
+                         }

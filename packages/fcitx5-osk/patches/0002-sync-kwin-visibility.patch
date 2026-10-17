@@ -1,0 +1,31 @@
+--- a/fcitx5-osk-kwin-launcher/src/main.rs
++++ b/fcitx5-osk-kwin-launcher/src/main.rs
+@@ -293,17 +293,18 @@
+             .virtual_keyboard()
+             .receive_active_changed()
+             .await?;
+-        while stream.next().await.is_some() {
++        loop {
+             let active = kwin_services.virtual_keyboard().active().await?;
+-            let tablet_mode = kwin_services.tablet_mode().tablet_mode().await?;
+-            // check tablet mode, show only if it is in tablet mode.
+-            tracing::debug!("kwin virtual keyboard active: {active}, tablet mode: {tablet_mode}");
+-            if active
+-                && tablet_mode
+-                && let Err(e) = fcitx5_osk_services.controller().show().await
+-            {
+-                // allow error
+-                tracing::error!("Unable to call `show` of fcitx5 osk: {e:#?}");
++            tracing::debug!("kwin virtual keyboard active: {active}");
++            if active {
++                if let Err(e) = fcitx5_osk_services.controller().show().await {
++                    tracing::error!("Unable to call `show` of fcitx5 osk: {e:#?}");
++                }
++            } else if let Err(e) = fcitx5_osk_services.controller().hide().await {
++                tracing::error!("Unable to call `hide` of fcitx5 osk: {e:#?}");
++            }
++            if stream.next().await.is_none() {
++                break;
+             }
+         }
+     }

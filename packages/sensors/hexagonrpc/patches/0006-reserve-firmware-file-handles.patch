@@ -1,0 +1,97 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] apps_std: reserve firmware stdio handles
+
+Translate RPC FILE handles into the Qualcomm range starting at 100.
+Returning handle 2 makes the sensor firmware skip fwrite and fclose,
+then atomically replace its bias registry with an empty file.
+Directory handles remain opaque tokens.
+
+--- a/hexagonrpcd/apps_std.h
++++ b/hexagonrpcd/apps_std.h
+@@ -25,6 +25,8 @@
+ #include "hexagonfs.h"
+ #include "listener.h"
+ 
++#define APPS_STD_FILE_BASE 100
++
+ struct fastrpc_interface *fastrpc_apps_std_init(struct hexagonfs_dirent *root);
+ void fastrpc_apps_std_deinit(struct fastrpc_interface *iface);
+ 
+--- a/hexagonrpcd/apps_std.c
++++ b/hexagonrpcd/apps_std.c
+@@ -28,6 +28,7 @@
+ #include <unistd.h>
+ 
+ #include "aee_error.h"
++#include "apps_std.h"
+ #include "interfaces/apps_std.def"
+ #include "hexagonfs.h"
+ #include "iobuffer.h"
+@@ -46,6 +47,13 @@
+ 	SEEK_END,
+ };
+ 
++static int apps_std_file_index(uint32_t file)
++{
++	if (file < APPS_STD_FILE_BASE || file >= APPS_STD_FILE_BASE + HEXAGONFS_MAX_FD)
++		return -EBADF;
++	return file - APPS_STD_FILE_BASE;
++}
++
+ static uint32_t apps_std_fflush(void *data,
+ 				const struct fastrpc_io_buffer *inbufs,
+ 				struct fastrpc_io_buffer *outbufs)
+@@ -53,7 +61,7 @@
+ 	struct apps_std_ctx *ctx = data;
+ 	const uint32_t *fd = inbufs[0].p;
+ 
+-	return hexagonfs_flush(ctx->fds, *fd) ? AEE_EFAILED : 0;
++	return hexagonfs_flush(ctx->fds, apps_std_file_index(*fd)) ? AEE_EFAILED : 0;
+ }
+ 
+ static uint32_t apps_std_fwrite(void *data,
+@@ -63,7 +71,7 @@
+ 	struct apps_std_ctx *ctx = data;
+ 	const uint32_t *fd = inbufs[0].p;
+ 	uint32_t *out = outbufs[0].p;
+-	ssize_t ret = hexagonfs_write(ctx->fds, *fd, inbufs[1].s, inbufs[1].p);
++	ssize_t ret = hexagonfs_write(ctx->fds, apps_std_file_index(*fd), inbufs[1].s, inbufs[1].p);
+ 
+ 	if (ret < 0) {
+ 		fprintf(stderr, "Could not write file: %s\n", strerror(-ret));
+@@ -82,7 +90,7 @@
+ 	const uint32_t *first_in = inbufs[0].p;
+ 	int ret;
+ 
+-	ret = hexagonfs_close(ctx->fds, *first_in);
++	ret = hexagonfs_close(ctx->fds, apps_std_file_index(*first_in));
+ 	if (ret) {
+ 		fprintf(stderr, "Could not close: %s\n", strerror(-ret));
+ 		return AEE_EFAILED;
+@@ -110,7 +118,7 @@
+ 	} *first_out = outbufs[0].p;
+ 	ssize_t ret;
+ 
+-	ret = hexagonfs_read(ctx->fds, first_in->fd,
++	ret = hexagonfs_read(ctx->fds, apps_std_file_index(first_in->fd),
+ 			     first_in->buf_size, outbufs[1].p);
+ 	if (ret < 0) {
+ 		fprintf(stderr, "Could not read file: %s\n", strerror(-ret));
+@@ -144,7 +152,7 @@
+ 
+ 	whence = apps_std_whence_table[first_in->whence];
+ 
+-	ret = hexagonfs_lseek(ctx->fds, first_in->fd, first_in->pos, whence);
++	ret = hexagonfs_lseek(ctx->fds, apps_std_file_index(first_in->fd), (int32_t)first_in->pos, whence);
+ 	if (ret) {
+ 		fprintf(stderr, "Could not seek stream: %s\n", strerror(-ret));
+ 		return AEE_EFAILED;
+@@ -222,7 +230,7 @@
+ 					  fd);
+ #endif
+ 
+-	*out = fd;
++	*out = APPS_STD_FILE_BASE + fd;
+ 
+ 	return 0;
+ }

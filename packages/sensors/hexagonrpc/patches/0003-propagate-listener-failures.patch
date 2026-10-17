@@ -1,0 +1,67 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] rpcd: return listener failures to the service manager
+
+The daemon currently reports success after a failed listener, leaving
+Restart=on-failure unable to restore the reverse RPC service. Propagate
+the listener result through main so the service manager sees a failure.
+
+--- a/hexagonrpcd/rpcd.c
++++ b/hexagonrpcd/rpcd.c
+@@ -250,7 +250,7 @@
+ 	return 0;
+ }
+ 
+-static void *start_reverse_tunnel(int fd, const char *device_dir, const char *dsp)
++static int start_reverse_tunnel(int fd, const char *device_dir, const char *dsp)
+ {
+ 	struct fastrpc_interface **ifaces;
+ 	struct hexagonfs_dirent *root_dir;
+@@ -259,7 +259,7 @@
+ 
+ 	ifaces = malloc(sizeof(struct fastrpc_interface) * n_ifaces);
+ 	if (ifaces == NULL)
+-		return NULL;
++		return 1;
+ 
+ 	root_dir = construct_root_dir(device_dir, dsp);
+ 
+@@ -278,18 +278,18 @@
+ 	if (ret)
+ 		goto err;
+ 
+-	run_fastrpc_listener(fd, n_ifaces, ifaces);
++	ret = run_fastrpc_listener(fd, n_ifaces, ifaces);
+ 
+ 	fastrpc_localctl_deinit(ifaces[REMOTECTL_HANDLE]);
+ 
+ 	free(ifaces);
+ 
+-	return NULL;
++	return ret;
+ 
+ err:
+ 	free(ifaces);
+ 
+-	return NULL;
++	return ret;
+ }
+ 
+ static char *read_sysfs_file(const char *path, struct stat *file_stat)
+@@ -496,7 +496,7 @@
+ 	if (ret)
+ 		goto err_close_dev;
+ 
+-	start_reverse_tunnel(fd, device_dir, dsp);
++	ret = start_reverse_tunnel(fd, device_dir, dsp);
+ 
+ 	terminate_clients(n_progs, pids);
+ 
+@@ -504,7 +504,7 @@
+ 	free(pids);
+ 	free(progs);
+ 
+-	return 0;
++	return ret ? EXIT_FAILURE : EXIT_SUCCESS;
+ 
+ err_close_dev:
+ 	close(fd);

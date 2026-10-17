@@ -1,0 +1,104 @@
+Description: Build the GeoClue service and desktop authorization agent
+ Only the runtime package is installed into the device rootfs. Limit the
+ local cross-build to that package and its existing desktop agent.
+Author: yuzu <yuzu23234@gmail.com>
+
+--- a/debian/control
++++ b/debian/control
+@@ -8 +7,0 @@
+-               dh-sequence-gir,
+@@ -10,2 +8,0 @@
+-               gir1.2-gio-2.0-dev,
+-               gir1.2-gobject-2.0-dev,
+@@ -20,3 +17 @@
+-               pkgconf,
+-               valac
+-Build-Depends-Indep: gtk-doc-tools <!nodoc>, libglib2.0-doc <!nodoc>
++               pkgconf
+@@ -43,71 +37,0 @@
+-
+-Package: geoclue-2-demo
+-Architecture: any
+-Depends: geoclue-2.0 (= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends}
+-Description: geoinformation service (demonstration programs)
+- GeoClue is a D-Bus geoinformation service. The goal of the Geoclue project
+- is to make creating location-aware applications as simple as possible.
+- .
+- This package contains the demonstration programs.
+-
+-Package: geoclue-doc
+-Architecture: all
+-Section: doc
+-Depends: ${misc:Depends}
+-Build-Profiles: <!nodoc>
+-Multi-Arch: foreign
+-Description: geoinformation service (D-Bus API documentation)
+- GeoClue is a D-Bus geoinformation service. The goal of the Geoclue project
+- is to make creating location-aware applications as simple as possible.
+- .
+- This package contains the D-Bus API documentation.
+-
+-Package: libgeoclue-2-0
+-Architecture: any
+-Section: libs
+-Depends: ${misc:Depends}, ${shlibs:Depends}
+-Multi-Arch: same
+-Description: convenience library to interact with geoinformation service
+- GeoClue is a D-Bus geoinformation service. The goal of the Geoclue project
+- is to make creating location-aware applications as simple as possible.
+- .
+- This package contains the shared library.
+-
+-Package: libgeoclue-2-dev
+-Architecture: any
+-Section: libdevel
+-Depends: libgeoclue-2-0 (= ${binary:Version}),
+-         libglib2.0-dev (>= 2.44.0),
+-         ${gir:Depends},
+-         ${misc:Depends}
+-Suggests: libgeoclue-doc
+-Multi-Arch: same
+-Provides: ${gir:Provides}
+-Description: convenience library to interact with geoinformation service (devel files)
+- GeoClue is a D-Bus geoinformation service. The goal of the Geoclue project
+- is to make creating location-aware applications as simple as possible.
+- .
+- This package contains header and development files.
+-
+-Package: gir1.2-geoclue-2.0
+-Section: introspection
+-Architecture: any
+-Depends: ${gir:Depends}, ${misc:Depends}
+-Multi-Arch: same
+-Description: convenience library to interact with geoinformation service (introspection)
+- GeoClue is a D-Bus geoinformation service. The goal of the Geoclue project
+- is to make creating location-aware applications as simple as possible.
+- .
+- This package contains the introspection data.
+-
+-Package: libgeoclue-doc
+-Architecture: all
+-Section: doc
+-Depends: ${misc:Depends}
+-Build-Profiles: <!nodoc>
+-Multi-Arch: foreign
+-Description: convenience library to interact with geoinformation service (API documentation)
+- GeoClue is a D-Bus geoinformation service. The goal of the Geoclue project
+- is to make creating location-aware applications as simple as possible.
+- .
+- This package contains the library API documentation.
+--- a/debian/rules
++++ b/debian/rules
+@@ -15 +15,4 @@
+-		-Dgtk-doc=$(if $(filter %-doc,$(shell dh_listpackages)),true,false) \
++		-Dlibgeoclue=false \
++		-Dintrospection=false \
++		-Dvapi=false \
++		-Dgtk-doc=false \
+@@ -26,0 +30,6 @@
++
++override_dh_auto_install:
++	dh_auto_install --destdir=debian/tmp
++
++override_dh_missing:
++	dh_missing --list-missing

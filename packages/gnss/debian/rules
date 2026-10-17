@@ -1,0 +1,24 @@
+#!/usr/bin/make -f
+include /usr/share/dpkg/architecture.mk
+
+%:
+	dh $@ --buildsystem=meson
+
+override_dh_auto_configure:
+ifeq ($(DEB_BUILD_ARCH),$(DEB_HOST_ARCH))
+	dh_auto_configure
+else
+	dh_auto_configure -- --cross-file=$(CURDIR)/debian/arm64-cross.ini
+endif
+
+override_dh_auto_test:
+ifeq ($(DEB_BUILD_ARCH),$(DEB_HOST_ARCH))
+	dh_auto_test
+else
+	meson test -C obj-$(DEB_HOST_GNU_TYPE) --print-errorlogs
+endif
+
+override_dh_installsystemd:
+	dh_installsystemd lmg820n-gnssd.service
+	dh_installsystemd --no-enable --no-start --no-stop-on-upgrade lmg820n-gnss-timing.service
+	dh_installsystemd --no-stop-on-upgrade --no-restart-after-upgrade lmg820n-gnss-diag.service

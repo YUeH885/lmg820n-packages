@@ -1,0 +1,29 @@
+Source: lmg820n-gnssd
+Section: utils
+Priority: optional
+Maintainer: yuzu <yuzu23234@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ meson,
+ ninja-build,
+ pkg-config,
+ libglib2.0-dev,
+ libqmi-glib-dev,
+ libqrtr-glib-dev,
+ libsystemd-dev,
+ qemu-user <cross>
+Standards-Version: 4.6.2
+
+Package: lmg820n-gnssd
+Architecture: arm64
+Depends:
+ curl,
+ ca-certificates,
+ chrony (>= 4.9),
+ systemd,
+ python3,
+ ${shlibs:Depends},
+ ${misc:Depends}
+Description: LM-G820N GNSS location daemon
+ lmg820n-gnssd manages the Qualcomm MPSS QMI LOC service and provides
+ NMEA 0183 output to GeoClue via a local Unix domain socket.

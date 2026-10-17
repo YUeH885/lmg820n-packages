@@ -1,0 +1,24 @@
+Description: Require agent authorization for unlisted native applications
+ Native applications have no Flatpak identity. Their missing identity must
+ not imply authorization to consume location data.
+Author: yuzu <yuzu23234@gmail.com>
+Forwarded: no
+
+--- a/src/gclue-service-client.c
++++ b/src/gclue-service-client.c
+@@ -443 +442,0 @@
+-        gboolean system_app;
+@@ -465,11 +464,8 @@
+         app_perm = gclue_config_get_app_perm (config,
+                                               data->desktop_id,
+                                               priv->client_info);
+-        system_app = (gclue_client_info_get_xdg_id (priv->client_info) == NULL);
+-
+-        if (app_perm == GCLUE_APP_PERM_ALLOWED || system_app) {
+-                /* Since we have no reliable way to identify system apps, no
+-                 * need for auth for them. */
++
++        if (app_perm == GCLUE_APP_PERM_ALLOWED) {
+                 complete_start (data);
+                 return;
+         }

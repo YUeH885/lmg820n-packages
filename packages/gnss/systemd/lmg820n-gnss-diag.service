@@ -1,0 +1,15 @@
+[Unit]
+Description=LM-G820N GNSS DRSync Configuration
+After=local-fs.target
+Before=lmg820n-remoteproc-boot.service
+
+[Service]
+Type=notify
+User=_gnss
+Group=_gnss
+ExecStart=/usr/libexec/lmg820n-gnss-diag
+TimeoutStartSec=15s
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target lmg820n-remoteproc-boot.service

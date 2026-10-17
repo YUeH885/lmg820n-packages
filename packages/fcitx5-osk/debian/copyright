@@ -1,0 +1,18 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Fcitx5 OSK
+Source: https://github.com/fortime/fcitx5-osk
+
+Files: *
+Copyright: Fcitx5 OSK contributors
+License: GPL-3
+ The complete upstream license is installed in
+ /usr/share/licenses/fcitx5-osk/LICENSE.
+ On Debian systems, the GPL version 3 is also available in
+ /usr/share/common-licenses/GPL-3.
+
+Files: NotoSerifNerdFont-Regular.ttf
+Copyright: 2022 The Noto Project Authors
+License: OFL-1.1
+ The complete font licenses and notices are installed in
+ /usr/share/licenses/fcitx5-osk/NotoSerifNerdFont/OFL.txt and
+ /usr/share/licenses/fcitx5-osk/NotoSerifNerdFont/LICENSE_OFL.txt.

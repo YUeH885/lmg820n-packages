@@ -1,0 +1,34 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] cli: list gyroscope support and print angular velocity units
+
+--- a/src/libssc-cli.c
++++ b/src/libssc-cli.c
+@@ -150,7 +150,7 @@
+ 
+ static void gyroscope_measurement (SSCSensorGyroscope *sensor, gfloat velocity_x, gfloat velocity_y, gfloat velocity_z, gpointer user_data)
+ {
+-	g_printf ("Gyroscope sensor measurement: X=%f Y=%f Z=%f m/s\n", velocity_x, velocity_y, velocity_z);
++	g_printf ("Gyroscope sensor measurement: X=%f Y=%f Z=%f rad/s\n", velocity_x, velocity_y, velocity_z);
+ 	fflush(stdout);
+ }
+ 
+@@ -168,7 +168,7 @@
+ 	const GOptionEntry options[] = {
+ 		{ "version", 0, 0, G_OPTION_ARG_NONE, &print_version, "Print version information and exit.", NULL },
+ 		{ "debug", 'v', 0, G_OPTION_ARG_NONE, &debug, "Enable debug logs.", NULL },
+-		{ "sensor", 0, 0, G_OPTION_ARG_STRING, &sensor_str, "Enable a sensor. Supported sensors: 'proximity', 'light', 'accelerometer', 'magnetometer', 'compass'", NULL },
++		{ "sensor", 0, 0, G_OPTION_ARG_STRING, &sensor_str, "Enable a sensor. Supported sensors: 'proximity', 'light', 'accelerometer', 'magnetometer', 'compass', 'gyroscope'", NULL },
+ 		{ "timeout", 0, 0, G_OPTION_ARG_INT64, &timeout, "Number of seconds before this will timeout [default 10]", NULL },
+ 		{ NULL, 0, 0, G_OPTION_ARG_NONE, NULL, NULL, NULL }
+ 	};
+--- a/data/ssc-sensor-gyroscope.proto
++++ b/data/ssc-sensor-gyroscope.proto
+@@ -19,7 +19,7 @@
+ 
+ /*
+  * Gyroscope Sensor specific response data.
+- * @velocity: velocity per axis in m/s: X-axis [0], Y-axis [1], Z-axis [2].
++ * @velocity: angular velocity per axis in rad/s: X-axis [0], Y-axis [1], Z-axis [2].
+  * @accuracy: how reliable the value is [0, 3]. Higher is more accurate, 0 is unreliable.
+  */
+ message SscGyroscopeResponse {

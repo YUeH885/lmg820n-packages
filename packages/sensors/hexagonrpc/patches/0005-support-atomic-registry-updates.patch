@@ -1,0 +1,185 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] apps_std: support extended methods and atomic registry rename
+
+The firmware commits registry updates with frename, using method 31
+to carry the extended method ID. Decode this ID before dispatch and
+implement rename only between writable mapped directories. Sync the
+directories after renaming to preserve calibration updates across boot.
+
+--- a/hexagonrpcd/listener.c
++++ b/hexagonrpcd/listener.c
+@@ -267,6 +267,15 @@
+ 		return 1;
+ 	}
+ 
++	/* Method 31 carries the full method ID in the first input word. */
++	if (method == 31) {
++		if (!REMOTE_SCALARS_INBUFS(sc) || decoded[0].s < sizeof(method)) {
++			*result = AEE_EBADPARM;
++			return 1;
++		}
++		memcpy(&method, decoded[0].p, sizeof(method));
++	}
++
+ 	if (method >= ifaces[handle]->n_procs) {
+ 		fprintf(stderr, "Unsupported method: %u (%08x)\n", method, sc);
+ 		*result = AEE_EUNSUPPORTED;
+--- a/hexagonrpcd/interfaces/apps_std.def
++++ b/hexagonrpcd/interfaces/apps_std.def
+@@ -35,5 +35,6 @@
+ HEXAGONRPC_DEFINE_REMOTE_METHOD(27, apps_std_closedir, 2, 0, 0, 0)
+ HEXAGONRPC_DEFINE_REMOTE_METHOD(28, apps_std_readdir, 2, 0, 66, 0)
+ HEXAGONRPC_DEFINE_REMOTE_METHOD(31, apps_std_stat, 1, 1, 24, 0)
++HEXAGONRPC_DEFINE_REMOTE_METHOD(33, apps_std_frename, 1, 2, 0, 0)
+ 
+ #endif /* INTERFACE_APPS_STD_DEF */
+--- a/hexagonrpcd/hexagonfs.h
++++ b/hexagonrpcd/hexagonfs.h
+@@ -43,6 +43,8 @@
+ 	ssize_t (*read)(struct hexagonfs_fd *fd, size_t size, void *ptr);
+ 	ssize_t (*write)(struct hexagonfs_fd *fd, size_t size, const void *ptr);
+ 	int (*flush)(struct hexagonfs_fd *fd);
++	int (*rename)(struct hexagonfs_fd *source, const char *old_name,
++		      struct hexagonfs_fd *dest, const char *new_name);
+ 	int (*stat)(struct hexagonfs_fd *fd, struct stat *stats);
+ 	int (*seek)(struct hexagonfs_fd *fd, off_t off, int whence);
+ };
+@@ -86,5 +88,7 @@
+ 
+ ssize_t hexagonfs_write(struct hexagonfs_fd **fds, int fileno, size_t size, const void *ptr);
+ int hexagonfs_flush(struct hexagonfs_fd **fds, int fileno);
++int hexagonfs_rename(struct hexagonfs_fd **fds, int rootfd,
++		     const char *old_name, const char *new_name);
+ 
+ #endif
+--- a/hexagonrpcd/hexagonfs.c
++++ b/hexagonrpcd/hexagonfs.c
+@@ -301,3 +301,56 @@
+ 		return 0;
+ 	return fds[fileno]->ops->flush(fds[fileno]);
+ }
++
++static int open_parent(struct hexagonfs_fd **fds, int rootfd,
++                       char *path, const char **name)
++{
++	char *slash = strrchr(path, '/');
++
++	if (!slash) {
++		*name = path;
++		path = ".";
++	} else {
++		*name = slash + 1;
++		*slash = 0;
++		if (!*path)
++			path = "/";
++	}
++	if (!**name || !strcmp(*name, ".") || !strcmp(*name, ".."))
++		return -EINVAL;
++	return hexagonfs_openat(fds, rootfd, rootfd, path);
++}
++
++int hexagonfs_rename(struct hexagonfs_fd **fds, int rootfd,
++                    const char *old_name, const char *new_name)
++{
++	char *old_path = strdup(old_name), *new_path = strdup(new_name);
++	const char *old_leaf, *new_leaf;
++	int old_fd, new_fd, ret = -ENOMEM;
++
++	if (!old_path || !new_path)
++		goto free_paths;
++	old_fd = open_parent(fds, rootfd, old_path, &old_leaf);
++	if (old_fd < 0) {
++		ret = old_fd;
++		goto free_paths;
++	}
++	new_fd = open_parent(fds, rootfd, new_path, &new_leaf);
++	if (new_fd < 0) {
++		ret = new_fd;
++		goto close_old;
++	}
++	if (!fds[old_fd]->ops->rename || !fds[new_fd]->ops->rename)
++		ret = -EROFS;
++	else if (fds[old_fd]->ops != fds[new_fd]->ops)
++		ret = -EXDEV;
++	else
++		ret = fds[old_fd]->ops->rename(fds[old_fd], old_leaf, fds[new_fd], new_leaf);
++	hexagonfs_close(fds, new_fd);
++close_old:
++	hexagonfs_close(fds, old_fd);
++free_paths:
++	free(old_path);
++	free(new_path);
++	return ret;
++}
+--- a/hexagonrpcd/hexagonfs_mapped.c
++++ b/hexagonrpcd/hexagonfs_mapped.c
+@@ -21,5 +21,6 @@
+  */
+ 
++#include <stdio.h>
+ #include <dirent.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -385,6 +386,18 @@
+ 	return fsync(ctx->fd) ? -errno : 0;
+ }
+ 
++static int mapped_rename(struct hexagonfs_fd *source, const char *old_name,
++                         struct hexagonfs_fd *dest, const char *new_name)
++{
++	struct mapped_ctx *from = source->data, *to = dest->data;
++
++	if (renameat(from->fd, old_name, to->fd, new_name) < 0)
++		return -errno;
++	if (fsync(from->fd) < 0 || fsync(to->fd) < 0)
++		return -errno;
++	return 0;
++}
++
+ struct hexagonfs_file_ops hexagonfs_writable_ops = {
+ 	.close = mapped_close,
+ 	.from_dirent = writable_from_dirent,
+@@ -392,6 +405,7 @@
+ 	.read = mapped_read,
+ 	.write = mapped_write,
+ 	.flush = mapped_flush,
++	.rename = mapped_rename,
+ 	.readdir = mapped_readdir,
+ 	.seek = mapped_seek,
+ 	.stat = mapped_stat,
+--- a/hexagonrpcd/apps_std.c
++++ b/hexagonrpcd/apps_std.c
+@@ -424,6 +424,25 @@
+ 	free(iface);
+ }
+ 
++static uint32_t apps_std_frename(void *data,
++                                 const struct fastrpc_io_buffer *inbufs,
++                                 struct fastrpc_io_buffer *outbufs)
++{
++	struct apps_std_ctx *ctx = data;
++	int ret;
++
++	if (!inbufs[1].s || !inbufs[2].s ||
++	    ((const char *)inbufs[1].p)[inbufs[1].s - 1] ||
++	    ((const char *)inbufs[2].p)[inbufs[2].s - 1])
++		return AEE_EBADPARM;
++	ret = hexagonfs_rename(ctx->fds, ctx->rootfd, inbufs[1].p, inbufs[2].p);
++	if (ret) {
++		fprintf(stderr, "Could not rename file: %s\n", strerror(-ret));
++		return AEE_EFAILED;
++	}
++	return 0;
++}
++
+ static const struct fastrpc_function_impl apps_std_procs[] = {
+ 	[2] = { .def = &apps_std_fflush_def, .impl = apps_std_fflush },
+ 	[3] = { .def = &apps_std_fclose_def, .impl = apps_std_fclose },
+@@ -435,6 +454,7 @@
+ 	[27] = { .def = &apps_std_closedir_def, .impl = apps_std_closedir },
+ 	[28] = { .def = &apps_std_readdir_def, .impl = apps_std_readdir },
+ 	[31] = { .def = &apps_std_stat_def, .impl = apps_std_stat },
++	[33] = { .def = &apps_std_frename_def, .impl = apps_std_frename },
+ };
+ 
+ const struct fastrpc_interface apps_std_interface = {

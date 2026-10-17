@@ -1,0 +1,6 @@
+build/
+repo/
+__pycache__/
+*.pyc
+.bootstrap-*
+.cross-build-*

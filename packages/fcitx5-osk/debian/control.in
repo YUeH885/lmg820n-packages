@@ -1,0 +1,12 @@
+Package: fcitx5-osk
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: arm64
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: yuzu <yuzu23234@gmail.com>
+Depends: fontconfig, fcitx5 (>= 5.1.22), libc6, libgcc-s1, libxkbcommon0, libwayland-client0, libegl1, libvulkan1, libxcb1, libxcursor1, libxi6, libxrandr2
+Homepage: https://github.com/fortime/fcitx5-osk
+Description: On-screen keyboard for Fcitx 5 and KWin Wayland
+ Includes native input-panel integration, the KWin launcher and modifier-key
+ helper. Optional HTTP custom actions are disabled.

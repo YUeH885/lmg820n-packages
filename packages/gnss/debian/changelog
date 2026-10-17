@@ -1,0 +1,83 @@
+lmg820n-gnssd (0.1.11-1) unstable; urgency=medium
+
+  * Retry the NMEA mask set/verify cycle while the firmware initializes it,
+    instead of failing the first cold-boot readback.
+
+ -- yuzu <yuzu23234@gmail.com>  Wed, 14 Oct 2026 20:20:00 +0800
+
+lmg820n-gnssd (0.1.10-1) unstable; urgency=medium
+
+  * Track GNSS according to location and timing subscriptions.
+  * Add an opt-in timing companion with PPS source selection and cleanup.
+  * Notify socket readiness and coordinate timing with service restarts.
+
+ -- yuzu <yuzu23234@gmail.com>  Mon, 12 Oct 2026 17:54:33 +0800
+
+lmg820n-gnssd (0.1.9-1) unstable; urgency=medium
+
+  * Keep MPSS DIAG endpoints registered and acknowledge startup features.
+  * Configure one-second DRSync pulses through the runtime GPS command.
+  * Use hardware PPS for clock synchronisation with RMC UTC second labels.
+
+ -- yuzu <yuzu23234@gmail.com>  Sun, 11 Oct 2026 22:43:00 +0800
+
+lmg820n-gnssd (0.1.8-1) unstable; urgency=medium
+
+  * Validate GNSS clock data and leap-second certainty before feeding Chrony.
+  * Confirm measurement configuration through response and indication status.
+  * Restore timing sessions after daemon failures and restrict refclock writers.
+
+ -- yuzu <yuzu23234@gmail.com>  Sun, 11 Oct 2026 18:42:04 +0800
+
+lmg820n-gnssd (0.1.7-1) unstable; urgency=medium
+
+  * Enable BeiDou and QZSS satellite-list NMEA output and verify its mask.
+  * Decode satellite systems and processing states using LOC wire values.
+
+ -- yuzu <yuzu23234@gmail.com>  Sun, 11 Oct 2026 12:15:05 +0800
+
+lmg820n-gnssd (0.1.6-1) unstable; urgency=medium
+
+  * Serialize UTC assistance and XTRA operations for the modem firmware.
+  * Preserve assistance requests while another operation is in flight.
+
+ -- yuzu <yuzu23234@gmail.com>  Sun, 11 Oct 2026 11:20:00 +0800
+
+lmg820n-gnssd (0.1.5-1) unstable; urgency=medium
+
+  * Preserve numeric satellite system and status values in diagnostic logs.
+
+ -- yuzu <yuzu23234@gmail.com>  Sun, 11 Oct 2026 11:10:00 +0800
+
+lmg820n-gnssd (0.1.4-1) unstable; urgency=medium
+
+  * Reuse accepted UTC assistance across sessions on the same connection.
+  * Keep explicit modem requests able to refresh UTC assistance.
+
+ -- yuzu <yuzu23234@gmail.com>  Sun, 11 Oct 2026 10:45:00 +0800
+
+lmg820n-gnssd (0.1.3-1) unstable; urgency=medium
+
+  * Wait for engine readiness before injecting UTC assistance.
+  * Skip assistance when a completed Start immediately requires Stop.
+
+ -- yuzu <yuzu23234@gmail.com>  Sun, 11 Oct 2026 10:40:00 +0800
+
+lmg820n-gnssd (0.1.2-1) unstable; urgency=medium
+
+  * Initialize UTC assistance once per connection and handle modem requests.
+
+ -- yuzu <yuzu23234@gmail.com>  Sun, 11 Oct 2026 10:30:00 +0800
+
+lmg820n-gnssd (0.1.1-1) unstable; urgency=medium
+
+  * Fix LOC lifecycle, assistance acknowledgements and socket buffering.
+  * Package the systemd unit and runtime dependencies.
+
+ -- yuzu <yuzu23234@gmail.com>  Sun, 11 Oct 2026 12:00:00 +0800
+
+lmg820n-gnssd (0.1.0-1) unstable; urgency=medium
+
+  * Initial release of LM-G820N GNSS location service.
+
+ -- yuzu <yuzu23234@gmail.com>  Sun, 11 Oct 2026 05:00:00 +0800

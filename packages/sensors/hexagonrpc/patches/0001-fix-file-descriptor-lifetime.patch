@@ -1,0 +1,316 @@
+--- a/hexagonrpcd/hexagonfs.c
++++ b/hexagonrpcd/hexagonfs.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include <errno.h>
++#include <fcntl.h>
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdio.h>
+@@ -62,55 +63,39 @@
+ 	return segment;
+ }
+ 
+-static struct hexagonfs_fd *pop_dir(struct hexagonfs_fd *dir,
+-				    struct hexagonfs_fd *root)
+-{
+-	struct hexagonfs_fd *up;
+-
+-	if (dir != root && dir->up != NULL) {
+-		up = dir->up;
+-
+-		if (!dir->is_assigned) {
+-			dir->ops->close(dir->data);
+-			free(dir);
+-		}
+-	} else {
+-		up = dir;
+-	}
+-
+-	return up;
+-}
+-
+-static int allocate_file_number(struct hexagonfs_fd **fds,
+-				struct hexagonfs_fd *fd)
+-{
+-	size_t i;
+-
+-	for (i = 0; i < HEXAGONFS_MAX_FD; i++) {
+-		if (fds[i] == NULL) {
+-			fd->is_assigned = true;
++static struct hexagonfs_fd *get_fd(struct hexagonfs_fd *fd)
++{
++	fd->refs++;
++	return fd;
++}
++
++static void put_fd(struct hexagonfs_fd *fd)
++{
++	while (fd && --fd->refs == 0) {
++		struct hexagonfs_fd *parent = fd->up;
++
++		fd->ops->close(fd->data);
++		free(fd);
++		fd = parent;
++	}
++}
++
++static bool valid_fd(struct hexagonfs_fd **fds, int number)
++{
++	return number >= 0 && number < HEXAGONFS_MAX_FD && fds[number];
++}
++
++static int allocate_file_number(struct hexagonfs_fd **fds, struct hexagonfs_fd *fd)
++{
++	for (int i = 0; i < HEXAGONFS_MAX_FD; i++) {
++		if (!fds[i]) {
+ 			fds[i] = fd;
+ 			return i;
+ 		}
+ 	}
+-
+ 	return -EMFILE;
+ }
+ 
+-static void destroy_file_descriptor(struct hexagonfs_fd *fd)
+-{
+-	struct hexagonfs_fd *curr = fd;
+-	struct hexagonfs_fd *next;
+-
+-	while (curr != NULL && !curr->is_assigned) {
+-		next = curr->up;
+-		curr->ops->close(curr->data);
+-		free(curr);
+-
+-		curr = next;
+-	}
+-}
+-
+ int hexagonfs_open_root(struct hexagonfs_fd **fds, struct hexagonfs_dirent *root)
+ {
+ 	struct hexagonfs_fd *fd;
+@@ -120,13 +105,15 @@
+ 	if (fd == NULL)
+ 		return -ENOMEM;
+ 
+-	fd->is_assigned = false;
++	fd->refs = 1;
+ 	fd->up = NULL;
+ 	fd->ops = root->ops;
+ 
+ 	ret = root->ops->from_dirent(root->u.ptr, true, &fd->data);
+-	if (ret)
+-		goto err;
++	if (ret) {
++		free(fd);
++		return ret;
++	}
+ 
+ 	ret = allocate_file_number(fds, fd);
+ 	if (ret < 0)
+@@ -135,11 +122,12 @@
+ 	return ret;
+ 
+ err:
+-	destroy_file_descriptor(fd);
+-	return ret;
+-}
+-
+-int hexagonfs_openat(struct hexagonfs_fd **fds, int rootfd, int dirfd, const char *name)
++	put_fd(fd);
++	return ret;
++}
++
++int hexagonfs_openat_flags(struct hexagonfs_fd **fds, int rootfd, int dirfd,
++			 const char *name, int flags)
+ {
+ 	struct hexagonfs_fd *fd;
+ 	const char *curr = name;
+@@ -155,7 +143,10 @@
+ 			curr++;
+ 	}
+ 
+-	fd = fds[selected];
++	if (!valid_fd(fds, rootfd) || !valid_fd(fds, selected))
++		return -EBADF;
++
++	fd = get_fd(fds[selected]);
+ 
+ 	while (*curr != '\0' && !ret) {
+ 		segment = copy_segment_and_advance(curr, &expect_dir, &curr);
+@@ -167,9 +158,20 @@
+ 		if (!strcmp(segment, ".")) {
+ 			goto next;
+ 		} else if (!strcmp(segment, "..")) {
+-			fd = pop_dir(fd, fds[rootfd]);
++			if (fd != fds[rootfd] && fd->up) {
++				struct hexagonfs_fd *parent = get_fd(fd->up);
++
++				put_fd(fd);
++				fd = parent;
++			}
+ 		} else {
+-			ret = fd->ops->openat(fd, segment, expect_dir, &fd);
++			struct hexagonfs_fd *child;
++
++			ret = fd->ops->openat(fd, segment, expect_dir,
++					      *curr ? O_RDONLY : flags, &child);
++			/* The child takes ownership of the traversal reference. */
++			if (!ret)
++				fd = child;
+ 		}
+ 
+ 	next:
+@@ -180,15 +182,20 @@
+ 		goto err;
+ 
+ 	ret = allocate_file_number(fds, fd);
+-	if (ret)
++	if (ret < 0)
+ 		goto err;
+ 
+ 	return ret;
+ 
+ err:
+-	destroy_file_descriptor(fd);
+-
+-	return ret;
++	put_fd(fd);
++
++	return ret;
++}
++
++int hexagonfs_openat(struct hexagonfs_fd **fds, int rootfd, int dirfd, const char *name)
++{
++	return hexagonfs_openat_flags(fds, rootfd, dirfd, name, O_RDONLY);
+ }
+ 
+ int hexagonfs_close(struct hexagonfs_fd **fds, int fileno)
+@@ -202,8 +209,7 @@
+ 	if (fd == NULL || fd->ops == NULL)
+ 		return -EBADF;
+ 
+-	fd->is_assigned = false;
+-	destroy_file_descriptor(fd);
++	put_fd(fd);
+ 
+ 	fds[fileno] = NULL;
+ 
+--- a/hexagonrpcd/hexagonfs.h
++++ b/hexagonrpcd/hexagonfs.h
+@@ -37,6 +37,7 @@
+ 	int (*openat)(struct hexagonfs_fd *dir,
+ 		      const char *segment,
+ 		      bool expect_dir,
++		      int open_flags,
+ 		      struct hexagonfs_fd **out);
+ 	int (*readdir)(struct hexagonfs_fd *fd, size_t size, char *out);
+ 	ssize_t (*read)(struct hexagonfs_fd *fd, size_t size, void *ptr);
+@@ -56,7 +57,7 @@
+ };
+ 
+ struct hexagonfs_fd {
+-	bool is_assigned;
++	unsigned int refs;
+ 	struct hexagonfs_fd *up;
+ 	void *data;
+ 
+@@ -71,6 +72,8 @@
+ 
+ int hexagonfs_open_root(struct hexagonfs_fd **fds, struct hexagonfs_dirent *root);
+ int hexagonfs_openat(struct hexagonfs_fd **fds, int rootfd, int dirfd, const char *name);
++int hexagonfs_openat_flags(struct hexagonfs_fd **fds, int rootfd, int dirfd,
++			 const char *name, int flags);
+ int hexagonfs_close(struct hexagonfs_fd **fds, int fileno);
+ 
+ int hexagonfs_fstat(struct hexagonfs_fd **fds, int fileno, struct stat *stats);
+--- a/hexagonrpcd/hexagonfs_mapped.c
++++ b/hexagonrpcd/hexagonfs_mapped.c
+@@ -81,6 +81,7 @@
+ static int mapped_openat(struct hexagonfs_fd *dir,
+ 			 const char *segment,
+ 			 bool expect_dir,
++			 int open_flags,
+ 			 struct hexagonfs_fd **out)
+ {
+ 	struct mapped_ctx *dir_ctx = dir->data;
+@@ -110,7 +111,7 @@
+ 
+ 	ctx->dir = NULL;
+ 
+-	fd->is_assigned = false;
++	fd->refs = 1;
+ 	fd->up = dir;
+ 	fd->ops = &hexagonfs_mapped_ops;
+ 	fd->data = ctx;
+@@ -236,10 +237,11 @@
+ static int mapped_or_empty_openat(struct hexagonfs_fd *dir,
+ 				  const char *segment,
+ 				  bool expect_dir,
++				  int open_flags,
+ 				  struct hexagonfs_fd **out)
+ {
+ 	if (dir->data)
+-		return mapped_openat(dir, segment, expect_dir, out);
++		return mapped_openat(dir, segment, expect_dir, open_flags, out);
+ 	else
+ 		return -ENOENT;
+ }
+--- a/hexagonrpcd/hexagonfs_plat_subtype_name.c
++++ b/hexagonrpcd/hexagonfs_plat_subtype_name.c
+@@ -68,6 +68,7 @@
+ static int plat_subtype_name_openat(struct hexagonfs_fd *dir,
+ 			const char *segment,
+ 			bool expect_dir,
++			int open_flags,
+ 			struct hexagonfs_fd **out)
+ {
+ 	return -ENOTDIR;
+--- a/hexagonrpcd/hexagonfs_virt_dir.c
++++ b/hexagonrpcd/hexagonfs_virt_dir.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include <errno.h>
++#include <fcntl.h>
+ #include <stdbool.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -63,12 +64,16 @@
+ static int virt_dir_openat(struct hexagonfs_fd *dir,
+ 			   const char *segment,
+ 			   bool expect_dir,
++			   int open_flags,
+ 			   struct hexagonfs_fd **out)
+ {
+ 	const struct hexagonfs_dirent *const **dirlist = dir->data;
+ 	const struct hexagonfs_dirent *ent;
+ 	struct hexagonfs_fd *fd;
+ 	int ret;
++
++	if (open_flags != O_RDONLY)
++		return -EROFS;
+ 
+ 	ent = walk_dir(*dirlist, segment);
+ 	if (ent == NULL)
+@@ -78,7 +83,7 @@
+ 	if (fd == NULL)
+ 		return -ENOMEM;
+ 
+-	fd->is_assigned = false;
++	fd->refs = 1;
+ 	fd->up = dir;
+ 	fd->ops = ent->ops;
+ 
+--- a/tests/test_hexagonfs.c
++++ b/tests/test_hexagonfs.c
+@@ -30,7 +30,7 @@
+ static int test_mapped_seq_read(const char *path)
+ {
+ 	struct hexagonfs_fd file = {
+-		.is_assigned = true,
++		.refs = 1,
+ 		.up = NULL,
+ 		.ops = &hexagonfs_mapped_ops,
+ 	};

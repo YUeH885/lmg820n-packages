@@ -1,0 +1,30 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] sensors: discard explicitly unreliable gyro and compass reports
+
+Gyroscope startup samples, including full-scale transients, carry
+accuracy 0. Rotation vector events also signal unreliable heading with
+this status. The measurement signals do not expose accuracy, so do not
+forward these samples as usable data.
+
+--- a/src/libssc-sensor-gyroscope.c
++++ b/src/libssc-sensor-gyroscope.c
+@@ -85,7 +85,7 @@
+ 			return;
+ 		}
+ 
+-		if (msg->n_velocity >= 3) {
++		if (msg->n_velocity >= 3 && msg->accuracy != SSC_ACCURACY_UNRELIABLE) {
+ 			x = msg->velocity[0];
+ 			y = msg->velocity[1];
+ 			z = msg->velocity[2];
+--- a/src/libssc-sensor-compass.c
++++ b/src/libssc-sensor-compass.c
+@@ -117,7 +117,7 @@
+ 			return;
+ 		}
+ 
+-		if (msg->n_rotation >= 4) {
++		if (msg->n_rotation >= 4 && msg->accuracy != SSC_ACCURACY_UNRELIABLE) {
+ 			x = msg->rotation[0];
+ 			y = msg->rotation[1];
+ 			z = msg->rotation[2];

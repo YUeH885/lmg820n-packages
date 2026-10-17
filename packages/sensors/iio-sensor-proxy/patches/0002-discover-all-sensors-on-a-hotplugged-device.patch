@@ -1,0 +1,18 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] discover every sensor type provided by a hotplugged device
+
+A FastRPC node exposes several SSC sensor types. Stopping after the first
+matching driver loses the remaining types when the node appears during
+initial asynchronous discovery. Process each unregistered type in the
+same device event.
+
+--- a/src/iio-sensor-proxy.c
++++ b/src/iio-sensor-proxy.c
+@@ -1113,7 +1113,6 @@
+ 					if (!start_claimed_sensor (data, driver->type))
+ 						send_driver_changed_dbus_event (data, driver->type);
+ 				}
+-				break;
+ 			}
+ 		}
+ 	}

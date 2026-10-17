@@ -1,0 +1,23 @@
+[Unit]
+Description=LM-G820N GNSS PPS Timing Companion
+After=lmg820n-gnssd.service chrony.service
+Wants=lmg820n-gnssd.service chrony.service
+PartOf=lmg820n-gnssd.service chrony.service
+
+[Service]
+Type=notify
+User=_gnss
+Group=geoclue
+SupplementaryGroups=_gnss
+ExecStart=/usr/bin/lmg820n-gnss-timing
+ExecStartPost=+/usr/bin/chronyc selectopts PPS -noselect
+ExecStartPost=+/usr/bin/chronyc reselect
+ExecStopPost=+/usr/bin/chronyc selectopts PPS +noselect
+ExecStopPost=+/usr/bin/chronyc reselect
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=15s
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target

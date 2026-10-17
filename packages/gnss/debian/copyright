@@ -1,0 +1,7 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: lmg820n-gnssd
+Source: https://github.com/yuzu/lmg820n-linux
+
+Files: *
+Copyright: 2026 yuzu <yuzu23234@gmail.com>
+License: GPL-2.0-or-later

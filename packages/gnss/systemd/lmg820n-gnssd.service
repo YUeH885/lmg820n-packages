@@ -1,0 +1,25 @@
+[Unit]
+Description=LM-G820N GNSS Location Daemon
+After=lmg820n-remoteproc-boot.service rmtfs.service tqftpserv.service chrony.service
+Wants=lmg820n-remoteproc-boot.service rmtfs.service tqftpserv.service chrony.service
+Before=geoclue.service
+
+[Service]
+Type=notify
+User=_gnss
+Group=geoclue
+SupplementaryGroups=_gnss
+RuntimeDirectory=lmg820n-gnss
+RuntimeDirectoryMode=0750
+StateDirectory=lmg820n-gnss
+StateDirectoryMode=0750
+Environment=LMG820N_GNSSD_ARGS=
+EnvironmentFile=-/etc/default/lmg820n-gnssd
+ExecStart=/usr/bin/lmg820n-gnssd $LMG820N_GNSSD_ARGS
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+TimeoutStartSec=15s
+
+[Install]
+WantedBy=multi-user.target
