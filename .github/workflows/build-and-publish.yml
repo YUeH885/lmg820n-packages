@@ -1,0 +1,89 @@
+name: Build and Publish Packages
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'packages/**'
+      - 'tools/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+  schedule:
+    # 每天 04:00 UTC (12:00 CST) 自动检测 Debian sid 滚动更新并构建
+    - cron: '0 4 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:sid
+      options: --privileged
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Configure Debian sid sources & build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          # Enable deb-src in sid repository
+          sed -i 's/Types: deb/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+          if [ -f /etc/apt/sources.list ]; then
+            grep -q "deb-src" /etc/apt/sources.list || sed -i 'p;s/^deb /deb-src /' /etc/apt/sources.list
+          fi
+          apt-get update
+          # Install native toolchain and tools
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            debhelper \
+            devscripts \
+            equivs \
+            meson \
+            ninja-build \
+            pkgconf \
+            dpkg-dev \
+            patch \
+            quilt \
+            ca-certificates \
+            awscli \
+            python3 \
+            gzip \
+            git
+
+      - name: Build Packages (arm64)
+        run: |
+          python3 tools/build-packages.py --all
+
+      - name: Verify Package Artifacts
+        run: |
+          python3 tools/build-packages.py --verify
+
+      - name: Generate Debian APT Repository
+        run: |
+          python3 tools/make_repo.py --input build/dist --output repo
+
+      - name: Upload APT Repository Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: lmg820n-apt-repo
+          path: repo/
+          retention-days: 14
+
+      - name: Sync to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL || vars.R2_ENDPOINT_URL }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || vars.R2_BUCKET_NAME }}
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "R2 credentials not configured. Skipping S3 sync."
+            exit 0
+          fi
+          aws s3 sync repo/ "s3://${R2_BUCKET_NAME}/" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --delete
