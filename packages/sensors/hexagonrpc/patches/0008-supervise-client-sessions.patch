@@ -1,0 +1,277 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] rpcd: initialize and supervise finite client sessions
+
+--- a/hexagonrpcd/rpcd.c
++++ b/hexagonrpcd/rpcd.c
+@@ -31,8 +31,10 @@
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/prctl.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
++#include <sys/wait.h>
+ 
+ #include "aee_error.h"
+ #include "apps_mem.h"
+@@ -235,6 +237,16 @@
+ 	return ret;
+ }
+ 
++static int watch_session_parent(pid_t parent)
++{
++	/* Session children share the parent's FastRPC descriptor. */
++	if (prctl(PR_SET_PDEATHSIG, SIGKILL)) {
++		perror("Could not watch session parent");
++		return 1;
++	}
++	return getppid() != parent;
++}
++
+ static int terminate_clients(size_t n_pids, const pid_t *pids)
+ {
+ 	size_t i;
+@@ -242,6 +254,10 @@
+ 	for (i = 0; i < n_pids; i++) {
+ 		kill(pids[i], SIGTERM);
+ 	}
++	for (i = 0; i < n_pids; i++) {
++		while (waitpid(pids[i], NULL, 0) == -1 && errno == EINTR)
++			;
++	}
+ 
+ 	return 0;
+ }
+@@ -249,6 +265,7 @@
+ static int start_clients(size_t n_progs, const char **progs, pid_t *pids)
+ {
+ 	size_t i;
++	pid_t parent = getpid();
+ 
+ 	for (i = 0; i < n_progs; i++) {
+ 		pids[i] = fork();
+@@ -259,6 +276,8 @@
+ 		}
+ 
+ 		if (pids[i] == 0) {
++			if (watch_session_parent(parent))
++				_exit(EXIT_FAILURE);
+ 			execl("/usr/bin/env", "/usr/bin/env", progs[i], (const char *) NULL);
+ 			exit(1);
+ 		}
+@@ -267,14 +286,15 @@
+ 	return 0;
+ }
+ 
+-static int start_reverse_tunnel(int fd, const char *device_dir, const char *dsp)
++static int start_reverse_tunnel(int fd, const char *device_dir, const char *dsp,
++				int ready_fd)
+ {
+ 	struct fastrpc_interface **ifaces;
+ 	struct hexagonfs_dirent *root_dir;
+ 	size_t n_ifaces = 3;
+ 	int ret;
+ 
+-	ifaces = malloc(sizeof(struct fastrpc_interface) * n_ifaces);
++	ifaces = malloc(sizeof(*ifaces) * n_ifaces);
+ 	if (ifaces == NULL)
+ 		return 1;
+ 
+@@ -293,20 +313,119 @@
+ 
+ 	ret = register_fastrpc_listener(fd);
+ 	if (ret)
+-		goto err;
++		goto out;
++	ret = init_fastrpc_listener(fd);
++	if (ret)
++		goto out;
++	if (ready_fd >= 0) {
++		char ready = 1;
++
++		do {
++			ret = write(ready_fd, &ready, sizeof(ready));
++		} while (ret == -1 && errno == EINTR);
++		close(ready_fd);
++		if (ret != 1) {
++			perror("Could not signal listener readiness");
++			ret = 1;
++			goto out;
++		}
++	}
+ 
+ 	ret = run_fastrpc_listener(fd, n_ifaces, ifaces);
+ 
++out:
+ 	fastrpc_localctl_deinit(ifaces[REMOTECTL_HANDLE]);
+ 
+ 	free(ifaces);
+ 
+ 	return ret;
++}
+ 
+-err:
+-	free(ifaces);
++static int run_clients_with_listener(int fd, const char *device_dir, const char *dsp,
++				    size_t n_progs, const char **progs, pid_t *pids)
++{
++	size_t remaining = n_progs;
++	int result = 0, status;
++	int ready_pipe[2];
++	char ready;
++	ssize_t received;
++	pid_t listener, pid;
++	pid_t parent = getpid();
++
++	fflush(NULL);
++	if (pipe(ready_pipe)) {
++		perror("Could not create listener readiness pipe");
++		return 1;
++	}
+ 
+-	return ret;
++	listener = fork();
++	if (listener == -1) {
++		perror("Could not fork listener");
++		close(ready_pipe[0]);
++		close(ready_pipe[1]);
++		return 1;
++	}
++	if (listener == 0) {
++		close(ready_pipe[0]);
++		if (watch_session_parent(parent))
++			_exit(EXIT_FAILURE);
++		exit(start_reverse_tunnel(fd, device_dir, dsp, ready_pipe[1]) ? EXIT_FAILURE : EXIT_SUCCESS);
++	}
++	close(ready_pipe[1]);
++	do {
++		received = read(ready_pipe[0], &ready, sizeof(ready));
++	} while (received == -1 && errno == EINTR);
++	close(ready_pipe[0]);
++	if (received != 1) {
++		fprintf(stderr, "FastRPC listener failed to initialize\n");
++		result = 1;
++		goto stop_listener;
++	}
++	if (start_clients(n_progs, progs, pids)) {
++		result = 1;
++		goto stop_listener;
++	}
++
++	while (remaining) {
++		pid = waitpid(-1, &status, 0);
++		if (pid == -1) {
++			if (errno == EINTR)
++				continue;
++			perror("Could not wait for client");
++			result = 1;
++			break;
++		}
++		if (pid == listener) {
++			fprintf(stderr, "FastRPC listener exited before its clients\n");
++			listener = -1;
++			result = 1;
++			break;
++		}
++		for (size_t i = 0; i < n_progs; i++) {
++			if (pids[i] != pid)
++				continue;
++			pids[i] = 0;
++			remaining--;
++			if (!WIFEXITED(status) || WEXITSTATUS(status))
++				result = 1;
++			break;
++		}
++	}
++
++	for (size_t i = 0; i < n_progs; i++) {
++		if (pids[i] > 0) {
++			kill(pids[i], SIGTERM);
++			while (waitpid(pids[i], NULL, 0) == -1 && errno == EINTR)
++				;
++		}
++	}
++stop_listener:
++	if (listener > 0) {
++		kill(listener, SIGTERM);
++		while (waitpid(listener, NULL, 0) == -1 && errno == EINTR)
++			;
++	}
++	return result;
+ }
+ 
+ static char *read_sysfs_file(const char *path, struct stat *file_stat)
+@@ -518,13 +637,10 @@
+ 		goto err_close_dev;
+ 	}
+ 
+-	ret = start_clients(n_progs, progs, pids);
+-	if (ret)
+-		goto err_close_dev;
+-
+-	ret = start_reverse_tunnel(fd, device_dir, dsp);
+-
+-	terminate_clients(n_progs, pids);
++	if (n_progs)
++		ret = run_clients_with_listener(fd, device_dir, dsp, n_progs, progs, pids);
++	else
++		ret = start_reverse_tunnel(fd, device_dir, dsp, -1);
+ 
+ 	close(fd);
+ 	free(pids);
+--- a/hexagonrpcd/listener.c
++++ b/hexagonrpcd/listener.c
+@@ -32,9 +32,13 @@
+ #include "iobuffer.h"
+ #include "listener.h"
+ 
+-static int adsp_listener_init2(int fd)
++int init_fastrpc_listener(int fd)
+ {
+-	return fastrpc2(&adsp_listener_init2_def, fd, ADSP_LISTENER_HANDLE);
++	int ret = fastrpc2(&adsp_listener_init2_def, fd, ADSP_LISTENER_HANDLE);
++
++	if (ret)
++		fprintf(stderr, "Could not initialize the listener: 0x%08x\n", (unsigned int)ret);
++	return ret;
+ }
+ 
+ static int adsp_listener_next2(int fd,
+@@ -331,13 +335,7 @@
+ 	uint32_t rctx = 0;
+ 	uint32_t sc = REMOTE_SCALARS_MAKE(0, 0, 0);
+ 	uint32_t n_outbufs = 0;
+-	int ret;
+-
+-	ret = adsp_listener_init2(fd);
+-	if (ret) {
+-		fprintf(stderr, "Could not initialize the listener: %u\n", ret);
+-		return ret;
+-	}
++	int ret = 0;
+ 
+ 	while (!ret) {
+ 		ret = return_for_next_invoke(fd,
+--- a/hexagonrpcd/listener.h
++++ b/hexagonrpcd/listener.h
+@@ -47,6 +47,7 @@
+ extern const struct fastrpc_interface apps_mem_interface;
+ extern const struct fastrpc_interface apps_std_interface;
+ 
++int init_fastrpc_listener(int fd);
+ int run_fastrpc_listener(int fd,
+ 			 size_t n_ifaces,
+ 			 struct fastrpc_interface **ifaces);
+--- a/hexagonrpcd/hexagonrpcd.1
++++ b/hexagonrpcd/hexagonrpcd.1
+@@ -18,7 +18,9 @@
+ FastRPC device node to attach to
+ .TP
+ \fB\-p \fIPROGRAM\fP
+-Run client program with shared file descriptor
++Run client program with shared file descriptor. The listener exits after all
++clients finish. A client or listener failure produces a nonzero exit status.
++Client and listener processes are killed when the session parent exits.
+ .TP
+ \fB\-R \fIDIR\fP
+ Root directory of served files (default: /usr/share/qcom/)

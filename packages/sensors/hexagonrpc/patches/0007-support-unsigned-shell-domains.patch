@@ -1,0 +1,132 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] rpcd: support unsigned shell protection domains
+
+--- a/hexagonrpcd/rpcd.c
++++ b/hexagonrpcd/rpcd.c
+@@ -140,18 +140,20 @@
+ 	       "\t-f DEVICE\tFastRPC device node to attach to\n"
+ 	       "\t-p PROGRAM\tRun client program with shared file descriptor\n"
+ 	       "\t-R DIR\t\tRoot directory of served files (default: /usr/share/qcom/)\n"
+-	       "\t-s\t\tAttach to sensorspd\n");
++	       "\t-s\t\tAttach to sensorspd\n"
++	       "\t-u\t\tCreate an unsigned shell pd (requires -c)\n");
+ }
+ 
+-static int create_shell_pd(int fd, const char *create_shell)
++static int create_shell_pd(int fd, const char *create_shell, bool unsigned_pd)
+ {
+ 	char *buf;
+ 	int shellfd, ret;
+ 	struct stat stats;
+ 	struct fastrpc_alloc_dma_buf dmabuf;
+ 	long page_size;
++	off_t copied = 0;
+ 	struct fastrpc_init_create init = {
+-		.attrs = 0,
++		.attrs = unsigned_pd ? FASTRPC_MODE_UNSIGNED_MODULE : 0,
+ 		.siglen = 0,
+ 	};
+ 
+@@ -180,7 +182,21 @@
+ 		goto err_close_dmabuf;
+ 	}
+ 
+-	read(shellfd, buf, stats.st_size);
++	while (copied < stats.st_size) {
++		ssize_t count = read(shellfd, buf + copied, stats.st_size - copied);
++
++		if (count > 0) {
++			copied += count;
++			continue;
++		}
++		if (count < 0 && errno == EINTR)
++			continue;
++		if (count == 0)
++			errno = EIO;
++		fprintf(stderr, "Could not read shell %s: %s\n", create_shell, strerror(errno));
++		ret = -1;
++		goto err_unmap;
++	}
+ 
+ 	init.file = (__u64) buf;
+ 	init.filefd = dmabuf.fd;
+@@ -188,6 +204,7 @@
+ 
+ 	ret = ioctl(fd, FASTRPC_IOCTL_INIT_CREATE, &init);
+ 
++err_unmap:
+ 	munmap(buf, dmabuf.size);
+ err_close_dmabuf:
+ 	close(dmabuf.fd);
+@@ -418,6 +435,7 @@
+ 	size_t n_progs = 0;
+ 	int fd, ret, opt;
+ 	bool attach_sns = false;
++	bool unsigned_pd = false;
+ 
+ 	progs = malloc(sizeof(const char *) * argc);
+ 	if (progs == NULL) {
+@@ -435,7 +453,7 @@
+ 	if (guessed_device_dir != NULL)
+ 		device_dir = guessed_device_dir;
+ 
+-	while ((opt = getopt(argc, argv, "c:d:f:p:R:s")) != -1) {
++	while ((opt = getopt(argc, argv, "c:d:f:p:R:su")) != -1) {
+ 		switch (opt) {
+ 			case 'c':
+ 				create_shell = optarg;
+@@ -456,18 +474,23 @@
+ 			case 's':
+ 				attach_sns = true;
+ 				break;
++			case 'u':
++				unsigned_pd = true;
++				break;
+ 			default:
+ 				print_usage(argv[0]);
+ 				goto err_free_pids;
+ 		}
+ 	}
+ 
+-	if (!fastrpc_node) {
++	if (!fastrpc_node || (unsigned_pd && !create_shell) || (attach_sns && create_shell)) {
+ 		print_usage(argv[0]);
+ 		goto err_free_pids;
+ 	}
+ 
+-	printf("Starting %s (%s) on %s\n", argv[0], attach_sns? "INIT_ATTACH_SNS": "INIT_ATTACH", fastrpc_node);
++	printf("Starting %s (%s) on %s\n", argv[0],
++	       attach_sns ? "INIT_ATTACH_SNS" : create_shell ? "INIT_CREATE" : "INIT_ATTACH",
++	       fastrpc_node);
+ 
+ 	fd = open(fastrpc_node, O_RDWR);
+ 	if (fd < 0) {
+@@ -478,11 +501,14 @@
+ 	if (attach_sns)
+ 		ret = ioctl(fd, FASTRPC_IOCTL_INIT_ATTACH_SNS, NULL);
+ 	else if (create_shell != NULL)
+-		ret = create_shell_pd(fd, create_shell);
++		ret = create_shell_pd(fd, create_shell, unsigned_pd);
+ 	else
+ 		ret = ioctl(fd, FASTRPC_IOCTL_INIT_ATTACH, NULL);
+ 	if (ret) {
+-		fprintf(stderr, "Could not attach to FastRPC node: %s\n", strerror(errno));
++		if (ret == -1)
++			fprintf(stderr, "Could not attach to FastRPC node: %s\n", strerror(errno));
++		else
++			fprintf(stderr, "Could not attach to FastRPC node: DSP error 0x%08x\n", (unsigned int)ret);
+ 		goto err_close_dev;
+ 	}
+ 
+--- a/hexagonrpcd/hexagonrpcd.1
++++ b/hexagonrpcd/hexagonrpcd.1
+@@ -25,6 +25,9 @@
+ .TP
+ \fB\-s\fP
+ Attach to sensorspd
++.TP
++\fB\-u\fP
++Create an unsigned shell pd (requires -c)
+ .PP
+ .SH NOTES
+ 

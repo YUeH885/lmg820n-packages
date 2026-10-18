@@ -1,0 +1,18 @@
+From: yuzu <yuzu23234@gmail.com>
+Subject: [PATCH] apps_mem: preserve 64-bit DSP heap addresses
+
+The stock SM8150 ARM64 library returns the complete remote_mmap64 result
+through apps_mem_request_map64. Preserve its upper bits in the 64-bit
+output instead of truncating the address to 32 bits.
+
+--- a/hexagonrpcd/apps_mem.c
++++ b/hexagonrpcd/apps_mem.c
+@@ -90,7 +90,7 @@
+ #endif
+ 
+ 	first_out->vapps = 0;
+-	first_out->vadsp = mmap.vaddrout & 0xFFFFFFFF;
++	first_out->vadsp = mmap.vaddrout;
+ 	return 0;
+ }
+ 

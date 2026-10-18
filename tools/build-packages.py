@@ -38,6 +38,12 @@ def apply_patches(source_dir: Path, patches_dir: Path):
         run_cmd(["patch", "--batch", "-p1", "-i", str(patch)], cwd=source_dir)
 
 
+def local_package_version(source_version: str, patches_dir: Path):
+    revision_file = patches_dir.parent / "revision"
+    revision = int(revision_file.read_text()) if revision_file.exists() else 1
+    return f"{source_version}+lmg820n{revision}"
+
+
 def build_debian_derived_native(package_name: str, source_pkg_name: str,
                                 recipe_dir: Path, output_dir: Path, jobs: int,
                                 patch_subdir: str = "patches", custom_debian: Path = None):
@@ -74,7 +80,7 @@ def build_debian_derived_native(package_name: str, source_pkg_name: str,
             else:
                 shutil.copy2(item, target)
 
-    local_version = f"{version_out}+lmg820n1"
+    local_version = local_package_version(version_out, patches_dir)
     print(f"Setting local package version: {local_version}")
     env = {
         **os.environ,
@@ -144,6 +150,7 @@ def build_debian_derived_chroot(builder, package_name: str, source_pkg_name: str
         raise RuntimeError(f"Could not find unpacked source directory for {source_pkg_name} in {builder_fs_dest}")
     src_dir = subdirs[0]
     src_dir_in_builder = f"{dest_in_builder}/{src_dir.name}"
+    run_cmd(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", str(src_dir)])
 
     version_out = subprocess.check_output(
         ["dpkg-parsechangelog", "-S", "Version"], cwd=src_dir, text=True
@@ -163,7 +170,7 @@ def build_debian_derived_chroot(builder, package_name: str, source_pkg_name: str
             else:
                 shutil.copy2(item, target)
 
-    local_version = f"{version_out}+lmg820n1"
+    local_version = local_package_version(version_out, patches_dir)
     print(f"Setting local package version: {local_version}")
     in_builder(builder, src_dir_in_builder, [
         "dch", "-b", "-v", local_version, "Automated build with LM-G820N patches for Debian sid"
@@ -188,12 +195,13 @@ def build_debian_derived_chroot(builder, package_name: str, source_pkg_name: str
         print(f"  Output: {target}")
 
 
-def build_gnss(builder_ctx, output_dir: Path, log, jobs: int):
-    recipe = PACKAGES_DIR / "gnss"
+def build_local_package(builder_ctx, output_dir: Path, log, jobs: int, component: str,
+                        source_package: str):
+    recipe = PACKAGES_DIR / component
     is_native = builder_ctx is None
 
     if is_native:
-        work_dir = BUILD_DIR / "gnss-build"
+        work_dir = BUILD_DIR / f"{component}-build"
         if work_dir.exists():
             shutil.rmtree(work_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -203,7 +211,7 @@ def build_gnss(builder_ctx, output_dir: Path, log, jobs: int):
         current_arch = subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()
         is_arm64_host = (current_arch == "arm64")
 
-        print(f"Installing build dependencies and compiling lmg820n-gnssd ({current_arch} -> arm64)...")
+        print(f"Installing build dependencies and compiling {source_package} ({current_arch} -> arm64)...")
         if is_arm64_host:
             run_cmd([
                 "mk-build-deps", "--build-dep", "--install", "--remove",
@@ -229,15 +237,15 @@ def build_gnss(builder_ctx, output_dir: Path, log, jobs: int):
             print(f"  Output: {target}")
     else:
         from debian_cross import in_builder
-        dest_in_builder = "/build/lmg820n-gnssd"
-        builder_fs_dest = builder_ctx / "build" / "lmg820n-gnssd"
+        dest_in_builder = f"/build/{source_package}"
+        builder_fs_dest = builder_ctx / "build" / source_package
 
         run_cmd(["sudo", "rm", "-rf", "--", str(builder_fs_dest)])
         run_cmd(["sudo", "mkdir", "-p", str(builder_fs_dest)])
         run_cmd(["sudo", "cp", "-a", str(recipe), str(builder_fs_dest / "source")])
 
         cwd = f"{dest_in_builder}/source"
-        print("Installing build dependencies and building lmg820n-gnssd (chroot)...")
+        print(f"Installing build dependencies and building {source_package} (chroot)...")
         in_builder(builder_ctx, cwd, ["apt-get", "update"], log)
         in_builder(builder_ctx, cwd, [
             "mk-build-deps", "--host-arch=arm64", "--build-arch=amd64",
@@ -511,7 +519,7 @@ def main():
             print(f"==========================================")
             pkg_output = output_dir / target
             if target == "gnss":
-                build_gnss(builder_ctx, pkg_output, log, args.jobs)
+                build_local_package(builder_ctx, pkg_output, log, args.jobs, "gnss", "lmg820n-gnssd")
             elif target == "fcitx5-osk":
                 build_fcitx5_osk(builder_ctx, pkg_output, log, args.jobs)
             else:

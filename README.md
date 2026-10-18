@@ -41,6 +41,8 @@ python3 tools/build-packages.py --verify
 python3 tools/make_repo.py --input build/dist --output repo
 ```
 
+Debian 衍生包的本地修订号由补丁目录同级的 `revision` 文件声明，默认值为 `1`；发布配方更新时递增该值。
+
 ## 持续集成配置
 
 GitHub Actions 工作流（`.github/workflows/build-and-publish.yml`）在原生 ARM64（`ubuntu-24.04-arm`）环境中的 `debian:sid` 容器执行构建，并在构建完成后同步至对象存储。
