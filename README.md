@@ -12,6 +12,7 @@
 | `libssc` | Debian sid `libssc` | 传感器子系统 (SSC) 通信库 |
 | `iio-sensor-proxy` | Debian sid `iio-sensor-proxy` | 传感器热插拔与发现补丁 |
 | `ffmpeg` / `libavcodec` | Debian sid `ffmpeg` | V4L2 状态机补丁与 DRM-PRIME 零拷贝支持 |
+| `libcamera` | Debian sid `libcamera` | S5K3M5 属性、sensor helper、Software ISP 控制关联与模式时序 |
 | `lmg820n-gnssd` | 本地源码 | SM8150 GNSS 硬件定位守护进程与授时服务 |
 | `fcitx5-osk` | 上游源码 | Wayland 移动触摸虚拟键盘与快捷键服务 |
 

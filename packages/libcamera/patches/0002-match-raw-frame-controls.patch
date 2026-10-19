@@ -1,0 +1,55 @@
+Description: Associate Software ISP controls with the captured sensor frame
+ Application requests and free-running RAW buffers have separate sequence
+ numbers. Save the controls for the RAW frame before GPU processing so
+ skipped frames and asynchronous statistics use the matching sensor state.
+Forwarded: no
+
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index e26f438..0d2d03d 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -196,6 +196,7 @@ struct SimpleFrameInfo {
+ 
+ 	uint32_t frame;
+ 	Request *request;
++	ControlList sensorControls;
+ 	bool metadataRequired;
+ 	bool metadataProcessed;
+ };
+@@ -957,7 +958,14 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 
+ 		if (converter_)
+ 			converter_->queueBuffers(buffer, conversionQueue_.front().outputs);
+-		else
++		else {
++			SimpleFrameInfo *info = frameInfo_.find(request->sequence());
++			ASSERT(info);
++			info->sensorControls = delayedCtrls_->get(buffer->metadata().sequence);
++			LOG(SimplePipeline, Debug)
++				<< "Request " << request->sequence()
++				<< " uses sensor frame " << buffer->metadata().sequence;
++
+ 			/*
+ 			 * request->sequence() cannot be retrieved from `buffer' inside
+ 			 * queueBuffers because unique_ptr's make buffer->request() invalid
+@@ -965,6 +973,7 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 			 */
+ 			swIsp_->queueBuffers(request->sequence(), buffer,
+ 					     conversionQueue_.front().outputs);
++		}
+ 
+ 		conversionQueue_.pop();
+ 		return;
+@@ -1026,8 +1035,11 @@ void SimpleCameraData::conversionOutputDone(FrameBuffer *buffer)
+ 
+ void SimpleCameraData::ispStatsReady(uint32_t frame, uint32_t bufferId)
+ {
++	SimpleFrameInfo *info = frameInfo_.find(frame);
++	ASSERT(info);
++
+ 	swIsp_->processStats(frame, bufferId,
+-			     delayedCtrls_->get(frame));
++			     info->sensorControls);
+ }
+ 
+ void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata)

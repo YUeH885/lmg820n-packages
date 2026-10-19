@@ -1,0 +1,54 @@
+Description: Recover sensor frame numbers after V4L2 sequence normalization
+ V4L2VideoDevice subtracts the first captured frame number from buffer
+ metadata. Restore that offset when looking up controls against SOF events,
+ including streams that skip frames before the first captured buffer.
+Forwarded: no
+
+diff --git a/include/libcamera/internal/v4l2_videodevice.h b/include/libcamera/internal/v4l2_videodevice.h
+index 10367e4..032940d 100644
+--- a/include/libcamera/internal/v4l2_videodevice.h
++++ b/include/libcamera/internal/v4l2_videodevice.h
+@@ -223,6 +223,7 @@ public:
+ 
+ 	int streamOn();
+ 	int streamOff();
++	unsigned int sequenceOffset() const { return firstFrame_.value(); }
+ 
+ 	void setDequeueTimeout(utils::Duration timeout);
+ 	Signal<> dequeueTimeout;
+diff --git a/src/libcamera/v4l2_videodevice.cpp b/src/libcamera/v4l2_videodevice.cpp
+index ca87598..0c25d27 100644
+--- a/src/libcamera/v4l2_videodevice.cpp
++++ b/src/libcamera/v4l2_videodevice.cpp
+@@ -1983,6 +1983,14 @@ FrameBuffer *V4L2VideoDevice::dequeueBuffer()
+  * \brief A Signal emitted when a framebuffer completes
+  */
+ 
++/**
++ * \fn unsigned int V4L2VideoDevice::sequenceOffset() const
++ * \brief Return the offset subtracted from captured buffer sequence numbers
++ *
++ * The offset is available after the first buffer has been dequeued and remains
++ * valid until the stream is stopped. Adding it to a buffer's metadata sequence
++ * recovers the kernel sequence used by frame-start events.
++ */
+ /**
+  * \brief Start the video stream
+  * \return 0 on success or a negative error code otherwise
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -961,10 +961,12 @@
+ 		else {
+ 			SimpleFrameInfo *info = frameInfo_.find(request->sequence());
+ 			ASSERT(info);
+-			info->sensorControls = delayedCtrls_->get(buffer->metadata().sequence);
++			uint32_t sensorSequence = buffer->metadata().sequence + video_->sequenceOffset();
++			info->sensorControls = delayedCtrls_->get(sensorSequence);
+ 			LOG(SimplePipeline, Debug)
+ 				<< "Request " << request->sequence()
+-				<< " uses sensor frame " << buffer->metadata().sequence;
++				<< " uses sensor frame " << sensorSequence
++				<< " (sequence offset " << video_->sequenceOffset() << ")";
+ 
+ 			/*
+ 			 * request->sequence() cannot be retrieved from `buffer' inside

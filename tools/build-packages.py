@@ -305,6 +305,11 @@ def build_vpu_playback(runner, output_dir: Path):
     runner("ffmpeg", "ffmpeg", recipe, output_dir)
 
 
+def build_libcamera(runner, output_dir: Path):
+    recipe = PACKAGES_DIR / "libcamera"
+    runner("libcamera", "libcamera", recipe, output_dir)
+
+
 def build_fcitx5_osk(builder_ctx, output_dir: Path, log, jobs: int):
     recipe = PACKAGES_DIR / "fcitx5-osk"
     manifest = json.loads((recipe / "sources.json").read_text())
@@ -437,6 +442,7 @@ PACKAGE_BUILDERS = {
     "pipewire-bluetooth": build_pipewire_bluetooth,
     "sensors": build_sensors,
     "vpu-playback": build_vpu_playback,
+    "libcamera": build_libcamera,
     "gnss": None,  # handled separately
     "fcitx5-osk": None,  # handled separately
 }

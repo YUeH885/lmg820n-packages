@@ -1,0 +1,99 @@
+Description: Refresh Software ISP sensor timing for each configuration
+ Pass sensor information to IPA configure after the selected format has
+ been applied. Exposure metadata then uses the current mode's line length
+ and pixel rate, including after full-resolution/binning mode changes.
+Forwarded: no
+
+diff --git a/include/libcamera/ipa/soft.mojom b/include/libcamera/ipa/soft.mojom
+index 77328c5..ecc7e0d 100644
+--- a/include/libcamera/ipa/soft.mojom
++++ b/include/libcamera/ipa/soft.mojom
+@@ -9,6 +9,7 @@ module ipa.soft;
+ import "include/libcamera/ipa/core.mojom";
+ 
+ struct IPAConfigInfo {
++	libcamera.IPACameraSensorInfo sensorInfo;
+ 	libcamera.ControlInfoMap sensorControls;
+ };
+ 
+@@ -16,7 +17,6 @@ interface IPASoftInterface {
+ 	init(libcamera.IPASettings settings,
+ 	     libcamera.SharedFD fdStats,
+ 	     libcamera.SharedFD fdParams,
+-	     libcamera.IPACameraSensorInfo sensorInfo,
+ 	     libcamera.ControlInfoMap sensorControls)
+ 		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled);
+ 	start() => (int32 ret);
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 629e1a3..87b446e 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -54,7 +54,6 @@ public:
+ 	int init(const IPASettings &settings,
+ 		 const SharedFD &fdStats,
+ 		 const SharedFD &fdParams,
+-		 const IPACameraSensorInfo &sensorInfo,
+ 		 const ControlInfoMap &sensorControls,
+ 		 ControlInfoMap *ipaControls,
+ 		 bool *ccmEnabled) override;
+@@ -94,7 +93,6 @@ IPASoftSimple::~IPASoftSimple()
+ int IPASoftSimple::init(const IPASettings &settings,
+ 			const SharedFD &fdStats,
+ 			const SharedFD &fdParams,
+-			const IPACameraSensorInfo &sensorInfo,
+ 			const ControlInfoMap &sensorControls,
+ 			ControlInfoMap *ipaControls,
+ 			bool *ccmEnabled)
+@@ -106,8 +104,6 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 			<< settings.sensorModel;
+ 	}
+ 
+-	context_.sensorInfo = sensorInfo;
+-
+ 	/* Load the tuning data file */
+ 	File file(settings.configurationFile);
+ 	if (!file.open(File::OpenModeFlag::ReadOnly)) {
+@@ -201,6 +197,7 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 
+ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ {
++	context_.sensorInfo = configInfo.sensorInfo;
+ 	sensorInfoMap_ = configInfo.sensorControls;
+ 
+ 	const ControlInfo &exposureInfo = sensorInfoMap_.find(V4L2_CID_EXPOSURE)->second;
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index c73a16c..8dc3f76 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -150,17 +150,9 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 	std::string ipaTuningFile =
+ 		ipa_->configurationFile(sensor->model() + ".yaml", "uncalibrated.yaml");
+ 
+-	IPACameraSensorInfo sensorInfo{};
+-	int ret = sensor->sensorInfo(&sensorInfo);
+-	if (ret) {
+-		LOG(SoftwareIsp, Error) << "Camera sensor information not available";
+-		return;
+-	}
+-
+-	ret = ipa_->init(IPASettings{ ipaTuningFile, sensor->model() },
++	int ret = ipa_->init(IPASettings{ ipaTuningFile, sensor->model() },
+ 			 debayer_->getStatsFD(),
+ 			 sharedParams_.fd(),
+-			 sensorInfo,
+ 			 sensor->controls(),
+ 			 ipaControls,
+ 			 &ccmEnabled_);
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1616,6 +1616,10 @@
+ 		return data->converter_->configure(inputCfg, outputCfgs);
+ 	} else {
+ 		ipa::soft::IPAConfigInfo configInfo;
++		ret = data->sensor_->sensorInfo(&configInfo.sensorInfo);
++		if (ret)
++			return ret;
++
+ 		configInfo.sensorControls = data->sensor_->controls();
+ 		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo);
+ 	}
