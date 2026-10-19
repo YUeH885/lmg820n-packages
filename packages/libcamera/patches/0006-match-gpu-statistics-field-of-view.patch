@@ -1,0 +1,60 @@
+Description: Match GPU statistics to the rendered RAW field of view
+ GPU debayering scales the input while statistics consume the original RAW
+ buffer. Derive the statistics window from the same projection scale instead
+ of using output pixel dimensions, which selected the upper-left input area.
+Forwarded: no
+
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 02651fe..f55d1f3 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -332,18 +332,14 @@ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 	outputSize_ = outputCfg.size;
+ 	nativeOutputSize_ = outSizeRange.max;
+ 
+-	window_.x = ((inputCfg.size.width - outputCfg.size.width) / 2) &
+-		    ~(inputConfig_.patternSize.width - 1);
+-	window_.y = ((inputCfg.size.height - outputCfg.size.height) / 2) &
+-		    ~(inputConfig_.patternSize.height - 1);
+-	window_.width = outputCfg.size.width;
+-	window_.height = outputCfg.size.height;
+-
+-	/*
+-	 * Don't pass x,y from window_ since process() already adjusts for it.
+-	 * But crop the window to 2/3 of its width and height for speedup.
+-	 */
+-	stats_->setWindow(Rectangle(window_.size()));
++	outputScale_ = std::max(static_cast<float>(outputSize_.width) / nativeOutputSize_.width,
++			       static_cast<float>(outputSize_.height) / nativeOutputSize_.height);
++	/* Statistics read unscaled RAW; match the shader's visible input area. */
++	Size visibleInput{
++		std::min(width_, static_cast<unsigned int>(outputSize_.width / outputScale_)),
++		std::min(height_, static_cast<unsigned int>(outputSize_.height / outputScale_)),
++	};
++	stats_->setWindow(Rectangle(visibleInput));
+ 
+ 	inputBufferCount_ = inputCfg.bufferCount;
+ 	outputBufferCount_ = outputCfg.bufferCount;
+@@ -409,8 +405,7 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	 * the input size. Keep the aspect ratio and prefer cropping over black
+ 	 * bars.
+ 	 */
+-	GLfloat scale = std::max((GLfloat)outputSize_.width / nativeOutputSize_.width,
+-				 (GLfloat)outputSize_.height / nativeOutputSize_.height);
++	GLfloat scale = outputScale_;
+ 	GLfloat trans = -(1.0f - scale);
+ 	GLfloat projMatrix[] = {
+ 		scale, 0, 0, 0,
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index d6223f3..8a156bb 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -112,7 +112,7 @@ private:
+ 	GLint contrastExpUniformDataIn_;
+ 
+ 	Size nativeOutputSize_;
+-	Rectangle window_;
++	float outputScale_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+ 	eGL egl_;
+ 	uint32_t width_;
