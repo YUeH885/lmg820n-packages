@@ -60,10 +60,10 @@ index 0000000..58b6f69
 +])
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
 new file mode 100644
-index 0000000..555f72d
+index 0000000..d7d1a5f
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1572 @@
+@@ -0,0 +1,1616 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -266,6 +266,9 @@ index 0000000..555f72d
 +	int processControls(const ControlList &controls);
 +	void pushSensorControls();
 +	int setLensPosition(int position);
++	void startAfMove(int step);
++	bool advanceAfMove(uint64_t timestamp);
++	void cancelAfMove();
 +	void startAfScan(uint64_t timestamp);
 +	double lensPosition() const;
 +	int lensPositionToCode(double position) const;
@@ -350,6 +353,8 @@ index 0000000..555f72d
 +	int afOriginalPosition_ = 0;
 +	int afBestStep_ = 0;
 +	int afFineEndStep_ = 0;
++	LgAfMovePlan afMovePlan_;
++	std::size_t afMoveIndex_ = 0;
 +	double afBestScore_ = -1.0;
 +	double afMinScore_ = 0.0;
 +	double afReferenceScore_ = 0.0;
@@ -901,8 +906,36 @@ index 0000000..555f72d
 +	if (!ret) {
 +		afPosition_ = position;
 +		lensSetTimestamp_ = monotonicNs();
++		LOG(QcomPipeline, Debug) << "AF lens code " << position
++					 << " step " << afModel_->afCodeToStep(position);
 +	}
 +	return ret;
++}
++
++void QcomCameraData::startAfMove(int step)
++{
++	int current = afModel_->afCodeToStep(afPosition_);
++	step = std::clamp<int>(step, afModel_->nearStep(), afModel_->farStep());
++	afMovePlan_ = lgAfMovePlan(current, step);
++	afMoveIndex_ = 1;
++	setLensPosition(afModel_->afStepToCode(afMovePlan_.targets[0]));
++}
++
++bool QcomCameraData::advanceAfMove(uint64_t timestamp)
++{
++	if (afMoveIndex_ >= afMovePlan_.count)
++		return false;
++
++	setLensPosition(afModel_->afStepToCode(
++		afMovePlan_.targets[afMoveIndex_++]));
++	afNextEval_ = timestamp + kAfSettleNs;
++	return true;
++}
++
++void QcomCameraData::cancelAfMove()
++{
++	afMovePlan_.count = 0;
++	afMoveIndex_ = 0;
 +}
 +
 +double QcomCameraData::lensPosition() const
@@ -1139,6 +1172,7 @@ index 0000000..555f72d
 +	if (!afEnabled_)
 +		return;
 +
++	cancelAfMove();
 +	afOriginalPosition_ = afPosition_;
 +	afBestStep_ = afModel_->afCodeToStep(afPosition_);
 +	afBestScore_ = -1.0;
@@ -1163,11 +1197,11 @@ index 0000000..555f72d
 +		setAfStage(AfStage::Restore);
 +		afState_ = controls::AfStateFailed;
 +		afStep_ = afModel_->afCodeToStep(afOriginalPosition_);
-+		setLensPosition(afOriginalPosition_);
++		startAfMove(afStep_);
 +		LOG(QcomPipeline, Info) << "AF scan failed";
 +	}
 +
-+	if (afDeferredPause_) {
++	if (success && afDeferredPause_) {
 +		afPaused_ = true;
 +		afDeferredPause_ = false;
 +		afPauseState_ = controls::AfPauseStatePaused;
@@ -1213,12 +1247,14 @@ index 0000000..555f72d
 +
 +	if (timestamp < std::max(afNextEval_, lensReadyTimestamp()))
 +		return;
++	if (advanceAfMove(timestamp))
++		return;
 +
 +	double score = focusScore();
 +
 +	if (afStage_ == AfStage::Warmup) {
 +		afStep_ = afModel_->farStep();
-+		setLensPosition(afModel_->afStepToCode(afStep_));
++		startAfMove(afStep_);
 +		afNextEval_ = timestamp + kAfSettleNs;
 +		setAfStage(AfStage::Coarse);
 +		return;
@@ -1239,13 +1275,13 @@ index 0000000..555f72d
 +			int start = std::max<int>(afModel_->nearStep(), afBestStep_ - range);
 +			afFineEndStep_ = std::min<int>(afModel_->farStep(), afBestStep_ + range);
 +			afStep_ = start;
-+			setLensPosition(afModel_->afStepToCode(afStep_));
++			startAfMove(afStep_);
 +			afNextEval_ = timestamp + kAfSettleNs;
 +			setAfStage(AfStage::Fine);
 +		} else {
 +			afStep_ = std::max<int>(afModel_->nearStep(),
 +						 afStep_ - static_cast<int>(step));
-+			setLensPosition(afModel_->afStepToCode(afStep_));
++			startAfMove(afStep_);
 +			afNextEval_ = timestamp + kAfSettleNs;
 +		}
 +		return;
@@ -1254,13 +1290,13 @@ index 0000000..555f72d
 +	if (afStage_ == AfStage::Fine) {
 +		if (afStep_ >= afFineEndStep_) {
 +			afStep_ = afBestStep_;
-+			setLensPosition(afModel_->afStepToCode(afBestStep_));
++			startAfMove(afBestStep_);
 +			afNextEval_ = timestamp + kAfSettleNs;
 +			setAfStage(AfStage::Confirm);
 +		} else {
 +			unsigned int step = afModel_->fineStep();
 +			afStep_ = std::min<int>(afFineEndStep_, afStep_ + step);
-+			setLensPosition(afModel_->afStepToCode(afStep_));
++			startAfMove(afStep_);
 +			afNextEval_ = timestamp + kAfSettleNs;
 +		}
 +		return;
@@ -1275,6 +1311,11 @@ index 0000000..555f72d
 +	if (afStage_ == AfStage::Restore) {
 +		afReferenceScore_ = score;
 +		setAfStage(AfStage::Idle);
++		if (afDeferredPause_) {
++			afPaused_ = true;
++			afDeferredPause_ = false;
++			afPauseState_ = controls::AfPauseStatePaused;
++		}
 +	}
 +}
 +
@@ -1331,6 +1372,7 @@ index 0000000..555f72d
 +	if (controls.contains(controls::AfMode.id())) {
 +		int mode = *controls.get(controls::AfMode);
 +		if (mode != afMode_) {
++			cancelAfMove();
 +			afMode_ = mode;
 +			afPaused_ = false;
 +			afDeferredPause_ = false;
@@ -1344,6 +1386,7 @@ index 0000000..555f72d
 +
 +	if (afMode_ == controls::AfModeManual && lens_ &&
 +	    controls.contains(controls::LensPosition.id())) {
++		cancelAfMove();
 +		double position = *controls.get(controls::LensPosition);
 +		int ret = setLensPosition(lensPositionToCode(position));
 +		if (ret)
@@ -1358,9 +1401,9 @@ index 0000000..555f72d
 +			startAfScan(statsTimestamp_);
 +		else if (trigger == controls::AfTriggerCancel) {
 +			afState_ = controls::AfStateIdle;
-+			setAfStage(AfStage::Idle);
++			setAfStage(AfStage::Restore);
 +			afStep_ = afModel_->afCodeToStep(afOriginalPosition_);
-+			setLensPosition(afOriginalPosition_);
++			startAfMove(afStep_);
 +		}
 +	}
 +
@@ -1528,6 +1571,7 @@ index 0000000..555f72d
 +	data->ifePending_ = true;
 +	data->afReferenceScore_ = 0.0;
 +	data->afSceneChanges_ = 0;
++	data->cancelAfMove();
 +	if (data->afEnabled_)
 +		data->setLensPosition(data->afPosition_);
 +
@@ -1707,10 +1751,10 @@ index 0000000..15d7ac4
 +#endif /* __LIBCAMERA_QCOM_CAMSS_H__ */
 diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
 new file mode 100644
-index 0000000..ab122cf
+index 0000000..341dc01
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,357 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +#pragma once
 +
@@ -1748,6 +1792,35 @@ index 0000000..ab122cf
 +/* The factory luma target is an 8-bit code; statistics use 10 bits. */
 +constexpr double kAeTargetScale = 4.0;
 +constexpr double kAeTolerance = kAeToleranceSteps * kAeTargetScale;
++
++struct LgAfMovePlan {
++	std::array<int, 4> targets{};
++	std::size_t count = 0;
++};
++
++inline LgAfMovePlan lgAfMovePlan(int current, int target)
++{
++	constexpr int kSegmentThreshold = 75;
++
++	LgAfMovePlan plan;
++	int distance = std::abs(target - current);
++	if (distance < kSegmentThreshold) {
++		plan.targets[0] = target;
++		plan.count = 1;
++		return plan;
++	}
++
++	/* The factory completion path submits three intermediate positions. */
++	int increment = distance / 5 + 1;
++	if (target < current)
++		increment = -increment;
++
++	for (unsigned int i = 0; i < 3; i++)
++		plan.targets[i] = current + increment * (i + 1);
++	plan.targets[3] = target;
++	plan.count = plan.targets.size();
++	return plan;
++}
 +
 +class LgAfModel
 +{
