@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..c111109
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1400 @@
+@@ -0,0 +1,1393 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -148,6 +148,7 @@ index 0000000..c111109
 +constexpr uint64_t kAfWarmupNs = 1000ULL * 1000 * 1000;
 +
 +constexpr double kBlackLevel = 64.0;
++constexpr double kGainCodeScale = 32.0;
 +using namespace qcom;
 +
 +uint64_t monotonicNs()
@@ -220,8 +221,8 @@ index 0000000..c111109
 +	std::map<uint32_t, FrameState> frameStates_;
 +	int32_t exposureMin_ = 1;
 +	int32_t exposureMax_ = 1;
-+	int32_t gainMin_ = 1;
-+	int32_t gainMax_ = 1;
++	double gainMin_ = 1.0;
++	double gainMax_ = 1.0;
 +
 +	/* AE state. */
 +	bool aeEnabled_ = true;
@@ -269,7 +270,6 @@ index 0000000..c111109
 +	int findPath(MediaEntity *sensor, MediaEntity *target);
 +	int disableLinks();
 +	int setIfeWb(double gainR, double gainB);
-+	void pushSensorControls(int32_t exposure, int32_t gain);
 +	void fetchStats();
 +	void updateAe(uint32_t sequence);
 +	void updateAwb();
@@ -598,15 +598,15 @@ index 0000000..c111109
 +	const ControlInfoMap &controls = sensor_->controls();
 +	exposureMin_ = controls.at(V4L2_CID_EXPOSURE).min().get<int32_t>();
 +	exposureMax_ = controls.at(V4L2_CID_EXPOSURE).max().get<int32_t>();
-+	gainMin_ = controls.at(V4L2_CID_ANALOGUE_GAIN).min().get<int32_t>();
-+	gainMax_ = controls.at(V4L2_CID_ANALOGUE_GAIN).max().get<int32_t>();
++	gainMin_ = controls.at(V4L2_CID_ANALOGUE_GAIN).min().get<int32_t>() / kGainCodeScale;
++	gainMax_ = controls.at(V4L2_CID_ANALOGUE_GAIN).max().get<int32_t>() / kGainCodeScale;
 +
 +	const uint32_t ids[] = { V4L2_CID_EXPOSURE, V4L2_CID_ANALOGUE_GAIN };
 +	ControlList initial = sensor_->getControls(ids);
 +	if (initial.empty())
 +		return -EIO;
 +	aeExposure_ = initial.get(V4L2_CID_EXPOSURE).get<int32_t>();
-+	aeGain_ = initial.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
++	aeGain_ = initial.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>() / kGainCodeScale;
 +
 +	if (!controlInfo_.empty()) {
 +		ControlInfoMap::Map map;
@@ -722,20 +722,13 @@ index 0000000..c111109
 +	return refreshSensorInfo();
 +}
 +
-+void QcomCameraData::pushSensorControls(int32_t exposure, int32_t gain)
-+{
-+	ControlList ctrls(sensor_->controls());
-+	ctrls.set(V4L2_CID_EXPOSURE,
-+		  std::clamp(exposure, exposureMin_, exposureMax_));
-+	ctrls.set(V4L2_CID_ANALOGUE_GAIN,
-+		  std::clamp(gain, gainMin_, gainMax_));
-+	delayedCtrls_->push(ctrls);
-+}
-+
 +void QcomCameraData::pushSensorControls()
 +{
-+	pushSensorControls(static_cast<int32_t>(std::lround(aeExposure_)),
-+			   static_cast<int32_t>(std::lround(aeGain_)));
++	ControlList ctrls(sensor_->controls());
++	ctrls.set(V4L2_CID_EXPOSURE, static_cast<int32_t>(std::lround(aeExposure_)));
++	ctrls.set(V4L2_CID_ANALOGUE_GAIN,
++		  static_cast<int32_t>(aeGain_ * kGainCodeScale));
++	delayedCtrls_->push(ctrls);
 +}
 +
 +int QcomCameraData::setIfeWb(double gainR, double gainB)
@@ -866,7 +859,7 @@ index 0000000..c111109
 +
 +	ControlList applied = delayedCtrls_->get(sequence);
 +	double exposure = applied.get(V4L2_CID_EXPOSURE).get<int32_t>();
-+	double gain = applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
++	double gain = applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>() / kGainCodeScale;
 +	double effective = exposure * gain * ratio;
 +	aeExposure_ = std::clamp(effective / gainMin_,
 +				  static_cast<double>(exposureMin_),
@@ -1229,7 +1222,7 @@ index 0000000..c111109
 +
 +	if (applied.contains(V4L2_CID_ANALOGUE_GAIN)) {
 +		int32_t gain = applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
-+		metadata.set(controls::AnalogueGain, static_cast<float>(gain));
++		metadata.set(controls::AnalogueGain, static_cast<float>(gain / kGainCodeScale));
 +	}
 +
 +	auto it = frameStates_.find(sequence);

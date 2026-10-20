@@ -1,9 +1,10 @@
 Description: Add S5K3M5 properties and Software ISP gain conversion
  Use the factory 1 um pixel pitch and RAW10 black level 64. The kernel
- analogue-gain control exposes whole multipliers. Exposure and gain take
- effect two frames after a SOF-triggered write; frame duration changes in
- the following frame. These delays were measured on LM-G820N at both
- 4032x3024 30 fps and 2016x1136 60 fps, with ten changes per control/mode.
+ analogue-gain control exposes register codes in units of 1/32 gain.
+ Exposure and gain take effect two frames after a SOF-triggered write;
+ frame duration changes in the following frame. These delays were measured
+ on LM-G820N at 4032x3024 30 fps and 2016x1136 60 fps, with ten changes per
+ control/mode.
 Forwarded: no
 
 diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
@@ -20,8 +21,8 @@ index 9457d62..9860cba 100644
 +	CameraSensorHelperS5k3m5()
 +	{
 +		blackLevel_ = 4096;
-+		/* The kernel exposes whole gain multipliers, not register codes. */
-+		gain_ = AnalogueGainLinear{ 1, 0, 0, 1 };
++		/* Samsung analogue gain uses 32 register codes per multiplier. */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
 +	}
 +};
 +REGISTER_CAMERA_SENSOR_HELPER("s5k3m5", CameraSensorHelperS5k3m5)
