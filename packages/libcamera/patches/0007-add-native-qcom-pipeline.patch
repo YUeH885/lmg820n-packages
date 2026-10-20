@@ -60,10 +60,10 @@ index 0000000..58b6f69
 +])
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
 new file mode 100644
-index 0000000..1bd67c5
+index 0000000..c6bdba5
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1475 @@
+@@ -0,0 +1,1466 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -1016,19 +1016,10 @@ index 0000000..1bd67c5
 +
 +double QcomCameraData::focusScore() const
 +{
-+	double score = 0.0;
++	/* Keep background edges outside the central focus target out of the score. */
++	const uint64_t *roi = &bf_[1 + (QCOM_CAMSS_BF_ROIS / 2) * 4];
 +
-+	for (unsigned int i = 0; i < QCOM_CAMSS_BF_ROIS; i++) {
-+		const uint64_t *roi = &bf_[1 + i * 4];
-+		unsigned int x = i % 5;
-+		unsigned int y = i / 5;
-+		double weight = (x >= 1 && x <= 3 && y >= 1 && y <= 3) ? 2.0 : 1.0;
-+
-+		score += weight * ((roi[1] & 0xffffffffffULL) +
-+				   (roi[3] & 0xffffffffffULL));
-+	}
-+
-+	return score;
++	return (roi[1] & 0xffffffffffULL) + (roi[3] & 0xffffffffffULL);
 +}
 +
 +void QcomCameraData::setAfStage(AfStage stage)
@@ -1610,7 +1601,7 @@ index 0000000..15d7ac4
 +#endif /* __LIBCAMERA_QCOM_CAMSS_H__ */
 diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
 new file mode 100644
-index 0000000..e8481ef
+index 0000000..8219870
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
 @@ -0,0 +1,230 @@
@@ -1677,22 +1668,22 @@ index 0000000..e8481ef
 +		kLensCodeMin, kLensCodeMax);
 +}
 +
-+/* Map factory step indices linearly onto the measured motor range. */
++/* Use uniform dioptre steps so AF and LensPosition share the measured mapping. */
 +inline int afStepToCode(unsigned int step)
 +{
 +	step = std::min(step, kAfStepCount - 1);
-+	double position = static_cast<double>(step) / (kAfStepCount - 1);
-+	return static_cast<int>(std::lround(
-+		kLensCodeMax + position * (kLensCodeMin - kLensCodeMax)));
++	double dioptre = kLensPositionMax * (kAfStepCount - 1 - step) /
++			 (kAfStepCount - 1);
++	return lensPositionToCode(dioptre);
 +}
 +
 +inline unsigned int afCodeToStep(int code)
 +{
-+	int step = static_cast<int>(std::lround(
-+		static_cast<double>(code - kLensCodeMax) *
-+		(kAfStepCount - 1) /
-+		static_cast<double>(kLensCodeMin - kLensCodeMax)));
-+	return std::clamp(step, 0, static_cast<int>(kAfStepCount - 1));
++	double dioptre = lensPositionFromCode(code);
++	double position = (kLensPositionMax - dioptre) / kLensPositionMax;
++	return std::clamp(static_cast<int>(std::lround(
++		position * (kAfStepCount - 1))),
++		0, static_cast<int>(kAfStepCount - 1));
 +}
 +
 +inline unsigned int afRegionIndex(unsigned int step)
