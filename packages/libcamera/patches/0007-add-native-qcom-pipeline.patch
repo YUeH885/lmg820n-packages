@@ -60,10 +60,10 @@ index 0000000..58b6f69
 +])
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
 new file mode 100644
-index 0000000..c6bdba5
+index 0000000..555f72d
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1466 @@
+@@ -0,0 +1,1572 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -74,13 +74,15 @@ index 0000000..c6bdba5
 + */
 +
 +#include <algorithm>
++#include <array>
 +#include <cmath>
 +#include <chrono>
-+#include <limits>
 +#include <cstdint>
 +#include <cstring>
 +#include <deque>
++#include <filesystem>
 +#include <iterator>
++#include <limits>
 +#include <map>
 +#include <memory>
 +#include <optional>
@@ -93,6 +95,7 @@ index 0000000..c6bdba5
 +#include <linux/media-bus-format.h>
 +#include <linux/v4l2-controls.h>
 +
++#include <libcamera/base/file.h>
 +#include <libcamera/base/log.h>
 +#include <libcamera/base/utils.h>
 +
@@ -140,8 +143,6 @@ index 0000000..c6bdba5
 +};
 +constexpr unsigned int kBufferCount = 4;
 +
-+constexpr int kAfPositionMin = qcom::kLensCodeMin;
-+constexpr int kAfPositionMax = qcom::kLensCodeMax;
 +constexpr uint64_t kAfSettleNs = 50ULL * 1000 * 1000;
 +constexpr uint64_t kAfSettleFrames = 2;
 +constexpr uint64_t kAfWarmupNs = 1000ULL * 1000 * 1000;
@@ -154,6 +155,96 @@ index 0000000..c6bdba5
 +{
 +	return std::chrono::duration_cast<std::chrono::nanoseconds>(
 +		utils::clock::now().time_since_epoch()).count();
++}
++
++template<std::size_t Size>
++int readFile(const std::filesystem::path &path, off_t offset,
++	     std::array<uint8_t, Size> *data)
++{
++	File file(path.string());
++	if (!file.open(File::OpenModeFlag::ReadOnly))
++		return file.error();
++	if (file.seek(offset) != offset)
++		return -EIO;
++
++	ssize_t bytes = file.read(*data);
++	if (bytes < 0)
++		return bytes;
++	return bytes == static_cast<ssize_t>(data->size()) ? 0 : -EIO;
++}
++
++uint32_t readBe32(const std::array<uint8_t, 4> &data)
++{
++	return static_cast<uint32_t>(data[0]) << 24 |
++	       static_cast<uint32_t>(data[1]) << 16 |
++	       static_cast<uint32_t>(data[2]) << 8 |
++	       data[3];
++}
++
++int loadAfModel(const std::string &sensorId, std::optional<LgAfModel> *model,
++		std::string *eepromPath)
++{
++	const std::filesystem::path sensorNode =
++		std::filesystem::path("/sys/firmware/devicetree") /
++		sensorId.substr(sensorId.starts_with('/') ? 1 : 0);
++	std::array<uint8_t, 4> property;
++
++	int ret = readFile(sensorNode / "lg,camera-id", 0, &property);
++	if (ret) {
++		LOG(QcomPipeline, Error)
++			<< "Failed to read LG camera ID from " << sensorNode;
++		return ret;
++	}
++	unsigned int cameraId = readBe32(property);
++
++	ret = readFile(sensorNode / "nvmem", 0, &property);
++	if (ret) {
++		LOG(QcomPipeline, Error)
++			<< "Failed to read NVMEM provider from " << sensorNode;
++		return ret;
++	}
++	uint32_t providerPhandle = readBe32(property);
++
++	std::error_code errorCode;
++	std::filesystem::path provider;
++	for (const auto &entry : std::filesystem::directory_iterator(
++		     "/sys/bus/nvmem/devices", errorCode)) {
++		std::array<uint8_t, 4> phandle;
++		if (!readFile(entry.path() / "of_node/phandle", 0, &phandle) &&
++		    readBe32(phandle) == providerPhandle) {
++			provider = entry.path();
++			break;
++		}
++	}
++	if (errorCode) {
++		LOG(QcomPipeline, Error)
++			<< "Failed to enumerate NVMEM devices: " << errorCode.message();
++		return -errorCode.value();
++	}
++	if (provider.empty()) {
++		LOG(QcomPipeline, Error)
++			<< "NVMEM provider " << providerPhandle << " not found";
++		return -ENODEV;
++	}
++
++	std::array<uint8_t, LgAfModel::kEepromBlockSize> block;
++	std::filesystem::path nvmem = provider / "nvmem";
++	ret = readFile(nvmem, LgAfModel::kEepromOffset, &block);
++	if (ret) {
++		LOG(QcomPipeline, Error)
++			<< "Failed to read S5K3M5 AF calibration from " << nvmem;
++		return ret;
++	}
++
++	std::string reason;
++	*model = LgAfModel::fromEeprom(cameraId, block, &reason);
++	if (!*model) {
++		LOG(QcomPipeline, Error) << "Invalid S5K3M5 AF calibration: " << reason;
++		return -EINVAL;
++	}
++
++	*eepromPath = nvmem.string();
++	return 0;
 +}
 +
 +} /* namespace */
@@ -254,12 +345,11 @@ index 0000000..c6bdba5
 +	bool afDeferredPause_ = false;
 +	AfStage afStage_ = AfStage::Idle;
 +	int afState_ = controls::AfStateIdle;
-+	int afPosition_ = kAfPositionMin;
-+	int afStep_ = kAfFarStep;
-+	int afOriginalPosition_ = kAfPositionMin;
-+	int afBestStep_ = kAfFarStep;
-+	int afFineEndStep_ = kAfNearStep;
-+	bool afLowLight_ = false;
++	int afPosition_ = 0;
++	int afStep_ = 0;
++	int afOriginalPosition_ = 0;
++	int afBestStep_ = 0;
++	int afFineEndStep_ = 0;
 +	double afBestScore_ = -1.0;
 +	double afMinScore_ = 0.0;
 +	double afReferenceScore_ = 0.0;
@@ -283,6 +373,7 @@ index 0000000..c6bdba5
 +	uint64_t lensReadyTimestamp() const;
 +
 +	CameraLens *lens_ = nullptr;
++	std::optional<LgAfModel> afModel_;
 +};
 +
 +class QcomCameraConfiguration : public CameraConfiguration
@@ -475,6 +566,22 @@ index 0000000..c6bdba5
 +	if (!sensor_)
 +		return -ENODEV;
 +
++	std::string eepromPath;
++	ret = loadAfModel(sensor_->id(), &afModel_, &eepromPath);
++	if (ret)
++		return ret;
++	afPosition_ = afModel_->codeMin();
++	afStep_ = afModel_->farStep();
++	afOriginalPosition_ = afPosition_;
++	afBestStep_ = afStep_;
++	afFineEndStep_ = afModel_->nearStep();
++	LOG(QcomPipeline, Info)
++		<< "Loaded LG camera ID " << afModel_->cameraId()
++		<< " AF calibration from " << eepromPath
++		<< ": infinity " << afModel_->rawInfinityDac()
++		<< ", macro " << afModel_->rawMacroDac()
++		<< ", checksum " << utils::hex(afModel_->checksum());
++
 +	pixEntity_ = media_->getEntityByName("msm_vfe0_pix");
 +	if (!pixEntity_) {
 +		LOG(QcomPipeline, Error) << "VFE PIX entity not found";
@@ -549,9 +656,9 @@ index 0000000..c6bdba5
 +	if (lens_) {
 +		int32_t position = 0;
 +		if (!lens_->getFocusPosition(&position)) {
-+			afPosition_ = std::clamp(position, kAfPositionMin,
-+						 kAfPositionMax);
-+			afStep_ = afCodeToStep(afPosition_);
++			afPosition_ = std::clamp(position, afModel_->codeMin(),
++						 afModel_->codeMax());
++			afStep_ = afModel_->afCodeToStep(afPosition_);
 +			afOriginalPosition_ = afPosition_;
 +			afBestStep_ = afStep_;
 +		}
@@ -576,8 +683,8 @@ index 0000000..c6bdba5
 +	ctrls[&controls::AfTrigger] = ControlInfo(controls::AfTriggerValues);
 +	if (lens_)
 +		ctrls[&controls::LensPosition] = ControlInfo(
-+			static_cast<float>(kLensPositionMin),
-+			static_cast<float>(kLensPositionMax),
++			static_cast<float>(LgAfModel::kLensPositionMin),
++			static_cast<float>(LgAfModel::kLensPositionMax),
 +			static_cast<float>(lensPosition()));
 +	ctrls[&controls::AfPause] = ControlInfo(
 +		{ { ControlValue(controls::AfPauseImmediate),
@@ -789,7 +896,7 @@ index 0000000..c6bdba5
 +	if (!lens_)
 +		return -ENODEV;
 +
-+	position = std::clamp(position, kAfPositionMin, kAfPositionMax);
++	position = std::clamp(position, afModel_->codeMin(), afModel_->codeMax());
 +	int ret = lens_->setFocusPosition(position);
 +	if (!ret) {
 +		afPosition_ = position;
@@ -800,12 +907,12 @@ index 0000000..c6bdba5
 +
 +double QcomCameraData::lensPosition() const
 +{
-+	return qcom::lensPositionFromCode(afPosition_);
++	return afModel_->lensPositionFromCode(afPosition_);
 +}
 +
 +int QcomCameraData::lensPositionToCode(double position) const
 +{
-+	return qcom::lensPositionToCode(position);
++	return afModel_->lensPositionToCode(position);
 +}
 +
 +uint64_t QcomCameraData::lensReadyTimestamp() const
@@ -1033,15 +1140,14 @@ index 0000000..c6bdba5
 +		return;
 +
 +	afOriginalPosition_ = afPosition_;
-+	afBestStep_ = afCodeToStep(afPosition_);
++	afBestStep_ = afModel_->afCodeToStep(afPosition_);
 +	afBestScore_ = -1.0;
 +	afMinScore_ = std::numeric_limits<double>::max();
 +	afSceneChanges_ = 0;
 +	afNextEval_ = timestamp ? timestamp + kAfWarmupNs : 0;
 +	afState_ = controls::AfStateScanning;
 +	setAfStage(AfStage::Warmup);
-+	LOG(QcomPipeline, Debug) << "AF scan started at code " << afOriginalPosition_
-+				 << " low light " << afLowLight_;
++	LOG(QcomPipeline, Debug) << "AF scan started at code " << afOriginalPosition_;
 +}
 +
 +void QcomCameraData::completeAfScan(bool success)
@@ -1052,11 +1158,11 @@ index 0000000..c6bdba5
 +		afState_ = controls::AfStateFocused;
 +		afReferenceScore_ = afBestScore_;
 +		LOG(QcomPipeline, Info) << "AF focused at step " << afBestStep_
-+					<< " code " << afStepToCode(afBestStep_);
++					<< " code " << afModel_->afStepToCode(afBestStep_);
 +	} else {
 +		setAfStage(AfStage::Restore);
 +		afState_ = controls::AfStateFailed;
-+		afStep_ = afCodeToStep(afOriginalPosition_);
++		afStep_ = afModel_->afCodeToStep(afOriginalPosition_);
 +		setLensPosition(afOriginalPosition_);
 +		LOG(QcomPipeline, Info) << "AF scan failed";
 +	}
@@ -1111,9 +1217,8 @@ index 0000000..c6bdba5
 +	double score = focusScore();
 +
 +	if (afStage_ == AfStage::Warmup) {
-+		afLowLight_ = aeGain_ >= kAfLowLightGain;
-+		afStep_ = kAfFarStep;
-+		setLensPosition(afStepToCode(afStep_));
++		afStep_ = afModel_->farStep();
++		setLensPosition(afModel_->afStepToCode(afStep_));
 +		afNextEval_ = timestamp + kAfSettleNs;
 +		setAfStage(AfStage::Coarse);
 +		return;
@@ -1128,18 +1233,19 @@ index 0000000..c6bdba5
 +	}
 +
 +	if (afStage_ == AfStage::Coarse) {
-+		unsigned int step = afCoarseStep(afStep_, afLowLight_);
-+		if (afStep_ == static_cast<int>(kAfNearStep)) {
-+			int range = afCoarseStep(afBestStep_, afLowLight_);
-+			int start = std::max<int>(kAfNearStep, afBestStep_ - range);
-+			afFineEndStep_ = std::min<int>(kAfFarStep, afBestStep_ + range);
++		unsigned int step = afModel_->coarseStep();
++		if (afStep_ == static_cast<int>(afModel_->nearStep())) {
++			int range = afModel_->coarseStep();
++			int start = std::max<int>(afModel_->nearStep(), afBestStep_ - range);
++			afFineEndStep_ = std::min<int>(afModel_->farStep(), afBestStep_ + range);
 +			afStep_ = start;
-+			setLensPosition(afStepToCode(afStep_));
++			setLensPosition(afModel_->afStepToCode(afStep_));
 +			afNextEval_ = timestamp + kAfSettleNs;
 +			setAfStage(AfStage::Fine);
 +		} else {
-+			afStep_ = std::max<int>(kAfNearStep, afStep_ - static_cast<int>(step));
-+			setLensPosition(afStepToCode(afStep_));
++			afStep_ = std::max<int>(afModel_->nearStep(),
++						 afStep_ - static_cast<int>(step));
++			setLensPosition(afModel_->afStepToCode(afStep_));
 +			afNextEval_ = timestamp + kAfSettleNs;
 +		}
 +		return;
@@ -1148,13 +1254,13 @@ index 0000000..c6bdba5
 +	if (afStage_ == AfStage::Fine) {
 +		if (afStep_ >= afFineEndStep_) {
 +			afStep_ = afBestStep_;
-+			setLensPosition(afStepToCode(afBestStep_));
++			setLensPosition(afModel_->afStepToCode(afBestStep_));
 +			afNextEval_ = timestamp + kAfSettleNs;
 +			setAfStage(AfStage::Confirm);
 +		} else {
-+			unsigned int step = afFineStep(afStep_, afLowLight_);
++			unsigned int step = afModel_->fineStep();
 +			afStep_ = std::min<int>(afFineEndStep_, afStep_ + step);
-+			setLensPosition(afStepToCode(afStep_));
++			setLensPosition(afModel_->afStepToCode(afStep_));
 +			afNextEval_ = timestamp + kAfSettleNs;
 +		}
 +		return;
@@ -1253,7 +1359,7 @@ index 0000000..c6bdba5
 +		else if (trigger == controls::AfTriggerCancel) {
 +			afState_ = controls::AfStateIdle;
 +			setAfStage(AfStage::Idle);
-+			afStep_ = afCodeToStep(afOriginalPosition_);
++			afStep_ = afModel_->afCodeToStep(afOriginalPosition_);
 +			setLensPosition(afOriginalPosition_);
 +		}
 +	}
@@ -1601,19 +1707,22 @@ index 0000000..15d7ac4
 +#endif /* __LIBCAMERA_QCOM_CAMSS_H__ */
 diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
 new file mode 100644
-index 0000000..8219870
+index 0000000..ab122cf
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,328 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +#pragma once
 +
 +#include <algorithm>
++#include <array>
 +#include <cmath>
++#include <cstddef>
 +#include <cstdint>
 +#include <iterator>
 +#include <limits>
 +#include <optional>
++#include <string>
 +
 +namespace libcamera::qcom {
 +
@@ -1640,76 +1749,171 @@ index 0000000..8219870
 +constexpr double kAeTargetScale = 4.0;
 +constexpr double kAeTolerance = kAeToleranceSteps * kAeTargetScale;
 +
-+/* Measured far-scene, 1 m and 20 cm positions; see camera.md. */
-+constexpr double kLensCodes[] = { 100, 212, 1075 };
-+constexpr double kLensDioptres[] = { 0, 1, 5 };
-+constexpr int kLensCodeMin = 100;
-+constexpr int kLensCodeMax = 1400;
-+constexpr double kLensPositionMin = 0.0;
-+constexpr double kLensPositionMax = 5.0 + (kLensCodeMax - 1075) * 4.0 / 863.0;
-+
-+inline double lensInterpolate(double value, const double *input, const double *output)
++class LgAfModel
 +{
-+	unsigned int i = value < input[1] ? 0 : 1;
-+	double t = (value - input[i]) / (input[i + 1] - input[i]);
-+	return output[i] + t * (output[i + 1] - output[i]);
-+}
++public:
++	static constexpr std::size_t kEepromOffset = 0x0a80;
++	static constexpr std::size_t kEepromBlockSize = 6;
++	static constexpr double kLensPositionMin = 0.0;
++	static constexpr double kLensPositionMax = 2.5;
 +
-+inline double lensPositionFromCode(int code)
-+{
-+	return std::clamp(lensInterpolate(code, kLensCodes, kLensDioptres),
-+			  kLensPositionMin, kLensPositionMax);
-+}
++	static std::optional<LgAfModel>
++	fromEeprom(unsigned int cameraId,
++		   const std::array<uint8_t, kEepromBlockSize> &block,
++		   std::string *error)
++	{
++		auto fail = [error](const std::string &message) {
++			if (error)
++				*error = message;
++			return std::optional<LgAfModel>{};
++		};
 +
-+inline int lensPositionToCode(double position)
-+{
-+	return std::clamp(static_cast<int>(std::lround(
-+		lensInterpolate(position, kLensDioptres, kLensCodes))),
-+		kLensCodeMin, kLensCodeMax);
-+}
++		if (cameraId != 3)
++			return fail("unsupported LG camera ID " +
++				    std::to_string(cameraId));
 +
-+/* Use uniform dioptre steps so AF and LensPosition share the measured mapping. */
-+inline int afStepToCode(unsigned int step)
-+{
-+	step = std::min(step, kAfStepCount - 1);
-+	double dioptre = kLensPositionMax * (kAfStepCount - 1 - step) /
-+			 (kAfStepCount - 1);
-+	return lensPositionToCode(dioptre);
-+}
++		uint16_t storedChecksum = block[4] | block[5] << 8;
++		uint16_t calculatedChecksum = block[0] + block[1] +
++					      block[2] + block[3];
++		if (storedChecksum != calculatedChecksum)
++			return fail("EEPROM AF checksum mismatch");
 +
-+inline unsigned int afCodeToStep(int code)
-+{
-+	double dioptre = lensPositionFromCode(code);
-+	double position = (kLensPositionMax - dioptre) / kLensPositionMax;
-+	return std::clamp(static_cast<int>(std::lround(
-+		position * (kAfStepCount - 1))),
-+		0, static_cast<int>(kAfStepCount - 1));
-+}
++		int16_t infinityDac = static_cast<int16_t>(block[0] | block[1] << 8);
++		int16_t macroDac = static_cast<int16_t>(block[2] | block[3] << 8);
++		int infinityQ = (infinityDac + 1023) / 2;
++		int macroQ = (macroDac + 1023) / 2;
++		if (infinityQ < 0 || infinityQ > 1023 ||
++		    macroQ < 0 || macroQ > 1023 || macroQ <= infinityQ)
++			return fail("invalid EEPROM AF endpoints");
 +
-+inline unsigned int afRegionIndex(unsigned int step)
-+{
-+	if (step > kAfDefaultNormalStep)
-+		return 0;
-+	if (step > kAfBoundaryStep)
-+		return 1;
-+	if (step > kAfMacroRegionStep)
-+		return 2;
-+	if (step > kAfDefaultMacroStep)
-+		return 3;
-+	return 4;
-+}
++		/* Camera ID 3 uses the factory type-3 infinity extension. */
++		infinityQ = std::max(0, static_cast<int>(
++			static_cast<float>(infinityQ) -
++			static_cast<float>(macroQ - infinityQ) * 0.1644f));
 +
-+inline unsigned int afCoarseStep(unsigned int step, bool lowLight)
-+{
-+	unsigned int index = afRegionIndex(step);
-+	return lowLight ? kAfCafCoarseLow[index] : kAfCafCoarseNormal[index];
-+}
++		LgAfModel model;
++		model.cameraId_ = cameraId;
++		model.checksum_ = storedChecksum;
++		model.rawInfinityDac_ = infinityDac;
++		model.rawMacroDac_ = macroDac;
++		model.infinityPosition_ = 1024 - infinityQ;
++		model.macroPosition_ = 1024 - macroQ;
++		model.nearPosition_ = model.positionForDistance(kReferenceDistanceMm);
++		int farTarget = model.positionForDistance(kFarDistanceMm);
++		int farMargin = static_cast<int>(
++			static_cast<float>(farTarget - model.nearPosition_) * 0.08f);
++		model.farPosition_ = std::min(1023, farTarget + farMargin);
 +
-+inline unsigned int afFineStep(unsigned int step, bool lowLight)
-+{
-+	unsigned int index = afRegionIndex(step);
-+	return lowLight ? kAfCafFineLow[index] : kAfCafFineNormal[index];
-+}
++		int span = macroQ - infinityQ;
++		model.coarseStep_ = static_cast<unsigned int>(
++			static_cast<float>(3.0f * kStepFraction) * span);
++		model.fineStep_ = static_cast<unsigned int>(kStepFraction * span);
++		if (model.infinityPosition_ > 1023 ||
++		    model.macroPosition_ < 0 ||
++		    model.nearPosition_ >= model.farPosition_ ||
++		    !model.coarseStep_ || !model.fineStep_)
++			return fail("invalid LG camera ID 3 AF model");
++
++		return model;
++	}
++
++	unsigned int cameraId() const { return cameraId_; }
++	uint16_t checksum() const { return checksum_; }
++	int rawInfinityDac() const { return rawInfinityDac_; }
++	int rawMacroDac() const { return rawMacroDac_; }
++	int infinityPosition() const { return infinityPosition_; }
++	int nearPosition() const { return nearPosition_; }
++	int farPosition() const { return farPosition_; }
++	int codeMin() const { return positionToCode(farPosition_); }
++	int codeMax() const { return positionToCode(nearPosition_); }
++	int infinityCode() const { return positionToCode(infinityPosition_); }
++	unsigned int nearStep() const { return 0; }
++	unsigned int farStep() const { return farPosition_ - nearPosition_; }
++	unsigned int stepCount() const { return farStep() + 1; }
++	unsigned int coarseStep() const { return coarseStep_; }
++	unsigned int fineStep() const { return fineStep_; }
++
++	double lensPositionFromCode(int code) const
++	{
++		int position = codeToPosition(std::clamp(code, codeMin(), codeMax()));
++		if (position <= nearPosition_)
++			return kLensPositionMax;
++		if (position >= infinityPosition_)
++			return kLensPositionMin;
++
++		double distance = kFocalLengthMm +
++			(kReferenceDistanceMm - kFocalLengthMm) *
++			(infinityPosition_ - nearPosition_) /
++			(infinityPosition_ - position);
++		return std::clamp(1000.0 / distance,
++				  kLensPositionMin, kLensPositionMax);
++	}
++
++	int lensPositionToCode(double position) const
++	{
++		position = std::clamp(position, kLensPositionMin, kLensPositionMax);
++		if (position <= kLensPositionMin)
++			return infinityCode();
++		if (position >= kLensPositionMax)
++			return codeMax();
++
++		double distance = 1000.0 / position;
++		if (distance <= kReferenceDistanceMm)
++			return codeMax();
++
++		return positionToCode(positionForDistance(distance));
++	}
++
++	int afStepToCode(unsigned int step) const
++	{
++		step = std::min(step, farStep());
++		return positionToCode(nearPosition_ + step);
++	}
++
++	unsigned int afCodeToStep(int code) const
++	{
++		int position = codeToPosition(std::clamp(code, codeMin(), codeMax()));
++		return std::clamp(position - nearPosition_, 0,
++				  static_cast<int>(farStep()));
++	}
++
++private:
++	static constexpr double kFocalLengthMm = 5.849999904632568;
++	static constexpr double kReferenceDistanceMm = 400.0;
++	static constexpr double kFarDistanceMm = 10000.0;
++	static constexpr float kStepFraction = 0.029999999329447746f;
++
++	static int codeToPosition(int code)
++	{
++		return 1024 - (code + 1023) / 2;
++	}
++
++	static int positionToCode(int position)
++	{
++		return 2 * (1024 - position) - 1023;
++	}
++
++	int positionForDistance(double distance) const
++	{
++		double ratio = (kReferenceDistanceMm - kFocalLengthMm) /
++			       (distance - kFocalLengthMm);
++		return std::clamp(static_cast<int>(
++			infinityPosition_ -
++			(infinityPosition_ - macroPosition_) * ratio),
++			0, 1023);
++	}
++
++	unsigned int cameraId_ = 0;
++	uint16_t checksum_ = 0;
++	int rawInfinityDac_ = 0;
++	int rawMacroDac_ = 0;
++	int infinityPosition_ = 0;
++	int macroPosition_ = 0;
++	int nearPosition_ = 0;
++	int farPosition_ = 0;
++	unsigned int coarseStep_ = 0;
++	unsigned int fineStep_ = 0;
++};
 +
 +inline std::optional<double> aeRegionLuma(const uint64_t sums[4],
 +					  const uint64_t counts[4], double blackLevel)
@@ -1932,12 +2136,9 @@ index 0000000..2facb50
 +	{ 0.028400, 0.035500, 0.057200, 0.084400, 0.114200, 0.141800, 0.161500, 0.168600, 0.168600, 0.161500, 0.141800, 0.114200, 0.084400, 0.057200, 0.035500, 0.028400 }
 +};
 diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index f2ed795..e065572 100644
 --- a/src/libcamera/pipeline/simple/simple.cpp
 +++ b/src/libcamera/pipeline/simple/simple.cpp
-@@ -268,6 +268,5 @@ static const SimplePipelineInfo supportedDevices[] = {
- 	{ "mtk-seninf", { { "mtk-mdp", 3 } }, false },
- 	{ "mxc-isi", {}, false },
+@@ -270 +269,0 @@ static const SimplePipelineInfo supportedDevices[] = {
 -	{ "qcom-camss", {}, true },
- 	{ "sun6i-csi", {}, false },
- };
  
