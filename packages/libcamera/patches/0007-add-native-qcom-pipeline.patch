@@ -60,10 +60,10 @@ index 0000000..58b6f69
 +])
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
 new file mode 100644
-index 0000000..d7d1a5f
+index 0000000..7d47b84
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1616 @@
+@@ -0,0 +1,1629 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -322,6 +322,7 @@ index 0000000..d7d1a5f
 +	double aeExposure_ = 1000.0;
 +	double aeGain_ = 1.0;
 +	std::optional<double> luxIndex_;
++	std::optional<double> aecLuma_;
 +
 +	/* AWB state. */
 +	bool awbEnabled_ = true;
@@ -346,6 +347,7 @@ index 0000000..d7d1a5f
 +	int afPauseState_ = controls::AfPauseStateRunning;
 +	bool afPaused_ = false;
 +	bool afDeferredPause_ = false;
++	bool afLowLight_ = false;
 +	AfStage afStage_ = AfStage::Idle;
 +	int afState_ = controls::AfStateIdle;
 +	int afPosition_ = 0;
@@ -366,8 +368,9 @@ index 0000000..d7d1a5f
 +	int disableLinks();
 +	int setIfeWb(double gainR, double gainB);
 +	void fetchStats();
-+	void updateAe(uint32_t sequence);
++	void updateAe(uint32_t sequence, double luma);
 +	std::optional<double> meteringLuma(bool applyWeights) const;
++	std::optional<double> measuredLuma() const;
 +	void updateAwb();
 +	void updateCcm(double r, double g, double b);
 +	void updateAf(uint64_t timestamp);
@@ -973,9 +976,10 @@ index 0000000..d7d1a5f
 +
 +	lastStatsSequence_ = request.sequence;
 +	statsTimestamp_ = request.timestamp;
++	aecLuma_ = measuredLuma();
 +
-+	if (aeEnabled_)
-+		updateAe(qcom::inputSequence(request.sequence));
++	if (aeEnabled_ && aecLuma_)
++		updateAe(qcom::inputSequence(request.sequence), *aecLuma_);
 +	if (awbEnabled_)
 +		updateAwb();
 +	if (afEnabled_)
@@ -1032,12 +1036,12 @@ index 0000000..d7d1a5f
 +	return std::nullopt;
 +}
 +
-+void QcomCameraData::updateAe(uint32_t sequence)
++std::optional<double> QcomCameraData::measuredLuma() const
 +{
 +	auto metered = meteringLuma(true);
 +	auto global = meteringLuma(false);
 +	if (!metered || !global)
-+		return;
++		return std::nullopt;
 +
 +	uint64_t histWeighted = 0;
 +	uint64_t histTotal = 0;
@@ -1046,11 +1050,15 @@ index 0000000..d7d1a5f
 +		histTotal += hist_[i];
 +	}
 +	if (!histTotal)
-+		return;
++		return std::nullopt;
 +
 +	/* Use BG only for spatial weighting; BHIST supplies the 10-bit level. */
 +	double histMean = static_cast<double>(histWeighted) / histTotal;
-+	double luma = *global > 0.0 ? histMean * *metered / *global : histMean;
++	return *global > 0.0 ? histMean * *metered / *global : histMean;
++}
++
++void QcomCameraData::updateAe(uint32_t sequence, double luma)
++{
 +	ControlList applied = delayedCtrls_->get(sequence);
 +	double exposure = applied.get(V4L2_CID_EXPOSURE).get<int32_t>() *
 +			  lineDurationNs_;
@@ -1253,6 +1261,10 @@ index 0000000..d7d1a5f
 +	double score = focusScore();
 +
 +	if (afStage_ == AfStage::Warmup) {
++		afLowLight_ = aecLuma_ && lgAfLowLight(*aecLuma_);
++		LOG(QcomPipeline, Debug) << "AF search luma "
++					 << aecLuma_.value_or(0.0)
++					 << " low light " << afLowLight_;
 +		afStep_ = afModel_->farStep();
 +		startAfMove(afStep_);
 +		afNextEval_ = timestamp + kAfSettleNs;
@@ -1269,9 +1281,9 @@ index 0000000..d7d1a5f
 +	}
 +
 +	if (afStage_ == AfStage::Coarse) {
-+		unsigned int step = afModel_->coarseStep();
++		unsigned int step = afModel_->coarseStep(afLowLight_);
 +		if (afStep_ == static_cast<int>(afModel_->nearStep())) {
-+			int range = afModel_->coarseStep();
++			int range = afModel_->coarseStep(afLowLight_);
 +			int start = std::max<int>(afModel_->nearStep(), afBestStep_ - range);
 +			afFineEndStep_ = std::min<int>(afModel_->farStep(), afBestStep_ + range);
 +			afStep_ = start;
@@ -1294,7 +1306,7 @@ index 0000000..d7d1a5f
 +			afNextEval_ = timestamp + kAfSettleNs;
 +			setAfStage(AfStage::Confirm);
 +		} else {
-+			unsigned int step = afModel_->fineStep();
++			unsigned int step = afModel_->fineStep(afLowLight_);
 +			afStep_ = std::min<int>(afFineEndStep_, afStep_ + step);
 +			startAfMove(afStep_);
 +			afNextEval_ = timestamp + kAfSettleNs;
@@ -1565,6 +1577,7 @@ index 0000000..d7d1a5f
 +	data->statsTimestamp_ = 0;
 +	data->awbCounter_ = 0;
 +	data->luxIndex_.reset();
++	data->aecLuma_.reset();
 +	data->frameStates_.clear();
 +	data->nextIfe_.reset();
 +	data->streaming_ = false;
@@ -1751,10 +1764,10 @@ index 0000000..15d7ac4
 +#endif /* __LIBCAMERA_QCOM_CAMSS_H__ */
 diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
 new file mode 100644
-index 0000000..341dc01
+index 0000000..8d42693
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,376 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +#pragma once
 +
@@ -1792,6 +1805,12 @@ index 0000000..341dc01
 +/* The factory luma target is an 8-bit code; statistics use 10 bits. */
 +constexpr double kAeTargetScale = 4.0;
 +constexpr double kAeTolerance = kAeToleranceSteps * kAeTargetScale;
++constexpr double kLgAfLowLightLuma8 = 17.0;
++
++inline bool lgAfLowLight(double luma10)
++{
++	return luma10 < kLgAfLowLightLuma8 * kAeTargetScale;
++}
 +
 +struct LgAfMovePlan {
 +	std::array<int, 4> targets{};
@@ -1878,13 +1897,18 @@ index 0000000..341dc01
 +		model.farPosition_ = std::min(1023, farTarget + farMargin);
 +
 +		int span = macroQ - infinityQ;
-+		model.coarseStep_ = static_cast<unsigned int>(
++		model.coarseStepNormal_ = static_cast<unsigned int>(
 +			static_cast<float>(3.0f * kStepFraction) * span);
-+		model.fineStep_ = static_cast<unsigned int>(kStepFraction * span);
++		model.fineStepNormal_ = static_cast<unsigned int>(kStepFraction * span);
++		model.coarseStepLowLight_ = static_cast<unsigned int>(
++			static_cast<float>(6.0f * kStepFraction) * span);
++		model.fineStepLowLight_ = static_cast<unsigned int>(
++			static_cast<float>(2.0f * kStepFraction) * span);
 +		if (model.infinityPosition_ > 1023 ||
 +		    model.macroPosition_ < 0 ||
 +		    model.nearPosition_ >= model.farPosition_ ||
-+		    !model.coarseStep_ || !model.fineStep_)
++		    !model.coarseStepNormal_ || !model.fineStepNormal_ ||
++		    !model.coarseStepLowLight_ || !model.fineStepLowLight_)
 +			return fail("invalid LG camera ID 3 AF model");
 +
 +		return model;
@@ -1903,8 +1927,14 @@ index 0000000..341dc01
 +	unsigned int nearStep() const { return 0; }
 +	unsigned int farStep() const { return farPosition_ - nearPosition_; }
 +	unsigned int stepCount() const { return farStep() + 1; }
-+	unsigned int coarseStep() const { return coarseStep_; }
-+	unsigned int fineStep() const { return fineStep_; }
++	unsigned int coarseStep(bool lowLight = false) const
++	{
++		return lowLight ? coarseStepLowLight_ : coarseStepNormal_;
++	}
++	unsigned int fineStep(bool lowLight = false) const
++	{
++		return lowLight ? fineStepLowLight_ : fineStepNormal_;
++	}
 +
 +	double lensPositionFromCode(int code) const
 +	{
@@ -1984,8 +2014,10 @@ index 0000000..341dc01
 +	int macroPosition_ = 0;
 +	int nearPosition_ = 0;
 +	int farPosition_ = 0;
-+	unsigned int coarseStep_ = 0;
-+	unsigned int fineStep_ = 0;
++	unsigned int coarseStepNormal_ = 0;
++	unsigned int fineStepNormal_ = 0;
++	unsigned int coarseStepLowLight_ = 0;
++	unsigned int fineStepLowLight_ = 0;
 +};
 +
 +inline std::optional<double> aeRegionLuma(const uint64_t sums[4],
