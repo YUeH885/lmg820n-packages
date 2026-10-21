@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..7d47b84
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1638 @@
+@@ -0,0 +1,1633 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -359,10 +359,9 @@ index 0000000..7d47b84
 +	std::size_t afMoveIndex_ = 0;
 +	double afBestScore_ = -1.0;
 +	double afMinScore_ = 0.0;
-+	double afReferenceScore_ = 0.0;
 +	LgAfCoarseStop afCoarseStop_;
++	LgAfSceneChange afSceneChange_;
 +	uint64_t afNextEval_ = 0;
-+	unsigned int afSceneChanges_ = 0;
 +
 +private:
 +	int findPath(MediaEntity *sensor, MediaEntity *target);
@@ -1187,7 +1186,7 @@ index 0000000..7d47b84
 +	afBestScore_ = -1.0;
 +	afMinScore_ = std::numeric_limits<double>::max();
 +	afCoarseStop_.reset();
-+	afSceneChanges_ = 0;
++	afSceneChange_.reset();
 +	afNextEval_ = timestamp ? timestamp + kAfWarmupNs : 0;
 +	afState_ = controls::AfStateScanning;
 +	setAfStage(AfStage::Warmup);
@@ -1200,7 +1199,6 @@ index 0000000..7d47b84
 +		afStep_ = afBestStep_;
 +		setAfStage(AfStage::Idle);
 +		afState_ = controls::AfStateFocused;
-+		afReferenceScore_ = afBestScore_;
 +		LOG(QcomPipeline, Info) << "AF focused at step " << afBestStep_
 +					<< " code " << afModel_->afStepToCode(afBestStep_);
 +	} else {
@@ -1238,14 +1236,11 @@ index 0000000..7d47b84
 +
 +	if (afStage_ == AfStage::Idle) {
 +		if (afMode_ == controls::AfModeContinuous && !afPaused_) {
-+			double score = focusScore();
-+			bool changed = afReferenceScore_ > 0.0
-+				? score < afReferenceScore_ * 0.70 || score > afReferenceScore_ * 1.40
-+				: afState_ == controls::AfStateFailed && score > 0.0;
-+			if (changed && ++afSceneChanges_ >= 3)
++			if (afSceneChange_.update(focusScore())) {
++				LOG(QcomPipeline, Debug)
++					<< "AF scene stabilized after focus change";
 +				startAfScan(timestamp);
-+			else if (!changed)
-+				afSceneChanges_ = 0;
++			}
 +		}
 +		return;
 +	}
@@ -1330,7 +1325,7 @@ index 0000000..7d47b84
 +	}
 +
 +	if (afStage_ == AfStage::Restore) {
-+		afReferenceScore_ = score;
++		afSceneChange_.reset();
 +		setAfStage(AfStage::Idle);
 +		if (afDeferredPause_) {
 +			afPaused_ = true;
@@ -1394,6 +1389,7 @@ index 0000000..7d47b84
 +		int mode = *controls.get(controls::AfMode);
 +		if (mode != afMode_) {
 +			cancelAfMove();
++			afSceneChange_.reset();
 +			afMode_ = mode;
 +			afPaused_ = false;
 +			afDeferredPause_ = false;
@@ -1591,8 +1587,7 @@ index 0000000..7d47b84
 +	data->nextIfe_.reset();
 +	data->streaming_ = false;
 +	data->ifePending_ = true;
-+	data->afReferenceScore_ = 0.0;
-+	data->afSceneChanges_ = 0;
++	data->afSceneChange_.reset();
 +	data->cancelAfMove();
 +	if (data->afEnabled_)
 +		data->setLensPosition(data->afPosition_);
@@ -1776,7 +1771,7 @@ new file mode 100644
 index 0000000..8d42693
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,462 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +#pragma once
 +
@@ -1875,6 +1870,65 @@ index 0000000..8d42693
 +private:
 +	std::optional<double> previousScore_;
 +	unsigned int downCount_ = 0;
++};
++
++class LgAfSceneChange
++{
++public:
++	void reset()
++	{
++		previousScore_.reset();
++		unstable_ = false;
++		stableCount_ = 0;
++	}
++
++	bool update(double score)
++	{
++		uint64_t current =
++			static_cast<uint64_t>(static_cast<float>(score)) >> 4;
++		if (!previousScore_) {
++			previousScore_ = current;
++			return false;
++		}
++
++		uint64_t previous = *previousScore_;
++		previousScore_ = current;
++		uint64_t maximum = std::max(current, previous);
++		if (!maximum) {
++			stableCount_ = 0;
++			return false;
++		}
++
++		double change = static_cast<double>(
++			current > previous ? current - previous : previous - current) /
++			maximum;
++		if (change > 0.5) {
++			unstable_ = true;
++			stableCount_ = 0;
++			return false;
++		}
++
++		if (!unstable_)
++			return false;
++		if (change >= 0.1) {
++			stableCount_ = 0;
++			return false;
++		}
++
++		if (++stableCount_ < 4)
++			return false;
++		unstable_ = false;
++		stableCount_ = 0;
++		return true;
++	}
++
++	bool unstable() const { return unstable_; }
++	unsigned int stableCount() const { return stableCount_; }
++
++private:
++	std::optional<uint64_t> previousScore_;
++	bool unstable_ = false;
++	unsigned int stableCount_ = 0;
 +};
 +
 +class LgAfModel
