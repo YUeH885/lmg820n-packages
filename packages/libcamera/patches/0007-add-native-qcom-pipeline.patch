@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..7d47b84
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1636 @@
+@@ -0,0 +1,1638 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -1287,7 +1287,9 @@ index 0000000..7d47b84
 +				<< afCoarseStop_.upCount()
 +				<< " up samples, focus range "
 +				<< afCoarseStop_.focusRange() << ", rise "
-+				<< afCoarseStop_.maximumRise();
++				<< afCoarseStop_.maximumRise() << ", reversals "
++				<< afCoarseStop_.reversalCount() << " in "
++				<< afCoarseStop_.sampleCount() << " samples";
 +		if (slopeStopped ||
 +		    afStep_ == static_cast<int>(afModel_->nearStep())) {
 +			int range = afModel_->coarseStep(afLowLight_);
@@ -1774,7 +1776,7 @@ new file mode 100644
 index 0000000..8d42693
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,537 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +#pragma once
 +
@@ -1861,12 +1863,16 @@ index 0000000..8d42693
 +		maximumRise_ = 0.0;
 +		upCount_ = 0;
 +		downCount_ = 0;
++		sampleCount_ = 0;
++		reversalCount_ = 0;
 +		focusRangeStop_ = false;
 +		flatRiseStop_ = false;
++		oscillationStop_ = false;
 +	}
 +
 +	bool update(double score, bool lowLight)
 +	{
++		sampleCount_++;
 +		uint64_t focus =
 +			static_cast<uint64_t>(static_cast<float>(score)) >> 4;
 +		minimumScore_ = minimumScore_
@@ -1877,12 +1883,16 @@ index 0000000..8d42693
 +			if (score > *previousScore_) {
 +				if (!upCount_)
 +					riseStartFocus_ = previousFocus_;
++				if (downCount_)
++					reversalCount_++;
 +				upCount_++;
 +				downCount_ = 0;
 +				double rise = static_cast<double>(focus - *riseStartFocus_) /
 +					std::max<uint64_t>(focus, 1);
 +				maximumRise_ = std::max(maximumRise_, rise);
 +			} else {
++				if (upCount_)
++					reversalCount_++;
 +				downCount_++;
 +				upCount_ = 0;
 +			}
@@ -1892,6 +1902,7 @@ index 0000000..8d42693
 +
 +		focusRangeStop_ = false;
 +		flatRiseStop_ = false;
++		oscillationStop_ = false;
 +		if (downCount_ >= (lowLight ? 3U : 4U))
 +			return true;
 +		if (downCount_ > 2 && focusRange() > 0.1) {
@@ -1902,11 +1913,17 @@ index 0000000..8d42693
 +			flatRiseStop_ = true;
 +			return true;
 +		}
++		if (sampleCount_ >= 9 && reversalCount_ >= 6) {
++			oscillationStop_ = true;
++			return true;
++		}
 +		return false;
 +	}
 +
 +	unsigned int upCount() const { return upCount_; }
 +	unsigned int downCount() const { return downCount_; }
++	unsigned int sampleCount() const { return sampleCount_; }
++	unsigned int reversalCount() const { return reversalCount_; }
 +	double maximumRise() const { return maximumRise_; }
 +	double focusRange() const
 +	{
@@ -1917,6 +1934,7 @@ index 0000000..8d42693
 +	}
 +	bool focusRangeStop() const { return focusRangeStop_; }
 +	bool flatRiseStop() const { return flatRiseStop_; }
++	bool oscillationStop() const { return oscillationStop_; }
 +
 +private:
 +	std::optional<double> previousScore_;
@@ -1927,8 +1945,11 @@ index 0000000..8d42693
 +	double maximumRise_ = 0.0;
 +	unsigned int upCount_ = 0;
 +	unsigned int downCount_ = 0;
++	unsigned int sampleCount_ = 0;
++	unsigned int reversalCount_ = 0;
 +	bool focusRangeStop_ = false;
 +	bool flatRiseStop_ = false;
++	bool oscillationStop_ = false;
 +};
 +
 +class LgAfSceneChange
