@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..7d47b84
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1634 @@
+@@ -0,0 +1,1636 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -1283,9 +1283,11 @@ index 0000000..7d47b84
 +		if (slopeStopped)
 +			LOG(QcomPipeline, Debug)
 +				<< "AF coarse search stopped after "
-+				<< afCoarseStop_.downCount()
-+				<< " descending samples, focus range "
-+				<< afCoarseStop_.focusRange();
++				<< afCoarseStop_.downCount() << " down and "
++				<< afCoarseStop_.upCount()
++				<< " up samples, focus range "
++				<< afCoarseStop_.focusRange() << ", rise "
++				<< afCoarseStop_.maximumRise();
 +		if (slopeStopped ||
 +		    afStep_ == static_cast<int>(afModel_->nearStep())) {
 +			int range = afModel_->coarseStep(afLowLight_);
@@ -1772,7 +1774,7 @@ new file mode 100644
 index 0000000..8d42693
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
-@@ -0,0 +1,489 @@
+@@ -0,0 +1,518 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +#pragma once
 +
@@ -1852,10 +1854,15 @@ index 0000000..8d42693
 +	void reset()
 +	{
 +		previousScore_.reset();
++		previousFocus_.reset();
++		riseStartFocus_.reset();
 +		minimumScore_.reset();
 +		maximumScore_.reset();
++		maximumRise_ = 0.0;
++		upCount_ = 0;
 +		downCount_ = 0;
 +		focusRangeStop_ = false;
++		flatRiseStop_ = false;
 +	}
 +
 +	bool update(double score, bool lowLight)
@@ -1866,23 +1873,41 @@ index 0000000..8d42693
 +			? std::min(*minimumScore_, focus) : focus;
 +		maximumScore_ = maximumScore_
 +			? std::max(*maximumScore_, focus) : focus;
-+		if (previousScore_ && score <= *previousScore_)
-+			downCount_++;
-+		else
-+			downCount_ = 0;
++		if (previousScore_) {
++			if (score > *previousScore_) {
++				if (!upCount_)
++					riseStartFocus_ = previousFocus_;
++				upCount_++;
++				downCount_ = 0;
++				double rise = static_cast<double>(focus - *riseStartFocus_) /
++					std::max<uint64_t>(focus, 1);
++				maximumRise_ = std::max(maximumRise_, rise);
++			} else {
++				downCount_++;
++				upCount_ = 0;
++			}
++		}
 +		previousScore_ = score;
++		previousFocus_ = focus;
 +
 +		focusRangeStop_ = false;
++		flatRiseStop_ = false;
 +		if (downCount_ >= (lowLight ? 3U : 4U))
 +			return true;
 +		if (downCount_ > 2 && focusRange() > 0.1) {
 +			focusRangeStop_ = true;
 +			return true;
 +		}
++		if (upCount_ > 2 && maximumRise_ < 0.01) {
++			flatRiseStop_ = true;
++			return true;
++		}
 +		return false;
 +	}
 +
++	unsigned int upCount() const { return upCount_; }
 +	unsigned int downCount() const { return downCount_; }
++	double maximumRise() const { return maximumRise_; }
 +	double focusRange() const
 +	{
 +		if (!minimumScore_ || !maximumScore_)
@@ -1891,13 +1916,19 @@ index 0000000..8d42693
 +			std::max<uint64_t>(*maximumScore_, 1);
 +	}
 +	bool focusRangeStop() const { return focusRangeStop_; }
++	bool flatRiseStop() const { return flatRiseStop_; }
 +
 +private:
 +	std::optional<double> previousScore_;
++	std::optional<uint64_t> previousFocus_;
++	std::optional<uint64_t> riseStartFocus_;
 +	std::optional<uint64_t> minimumScore_;
 +	std::optional<uint64_t> maximumScore_;
++	double maximumRise_ = 0.0;
++	unsigned int upCount_ = 0;
 +	unsigned int downCount_ = 0;
 +	bool focusRangeStop_ = false;
++	bool flatRiseStop_ = false;
 +};
 +
 +class LgAfSceneChange
