@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..7d47b84
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1633 @@
+@@ -0,0 +1,1634 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -1284,7 +1284,8 @@ index 0000000..7d47b84
 +			LOG(QcomPipeline, Debug)
 +				<< "AF coarse search stopped after "
 +				<< afCoarseStop_.downCount()
-+				<< " descending samples";
++				<< " descending samples, focus range "
++				<< afCoarseStop_.focusRange();
 +		if (slopeStopped ||
 +		    afStep_ == static_cast<int>(afModel_->nearStep())) {
 +			int range = afModel_->coarseStep(afLowLight_);
@@ -1771,7 +1772,7 @@ new file mode 100644
 index 0000000..8d42693
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,489 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +#pragma once
 +
@@ -1851,25 +1852,52 @@ index 0000000..8d42693
 +	void reset()
 +	{
 +		previousScore_.reset();
++		minimumScore_.reset();
++		maximumScore_.reset();
 +		downCount_ = 0;
++		focusRangeStop_ = false;
 +	}
 +
 +	bool update(double score, bool lowLight)
 +	{
++		uint64_t focus =
++			static_cast<uint64_t>(static_cast<float>(score)) >> 4;
++		minimumScore_ = minimumScore_
++			? std::min(*minimumScore_, focus) : focus;
++		maximumScore_ = maximumScore_
++			? std::max(*maximumScore_, focus) : focus;
 +		if (previousScore_ && score <= *previousScore_)
 +			downCount_++;
 +		else
 +			downCount_ = 0;
 +		previousScore_ = score;
 +
-+		return downCount_ >= (lowLight ? 3U : 4U);
++		focusRangeStop_ = false;
++		if (downCount_ >= (lowLight ? 3U : 4U))
++			return true;
++		if (downCount_ > 2 && focusRange() > 0.1) {
++			focusRangeStop_ = true;
++			return true;
++		}
++		return false;
 +	}
 +
 +	unsigned int downCount() const { return downCount_; }
++	double focusRange() const
++	{
++		if (!minimumScore_ || !maximumScore_)
++			return 0.0;
++		return static_cast<double>(*maximumScore_ - *minimumScore_) /
++			std::max<uint64_t>(*maximumScore_, 1);
++	}
++	bool focusRangeStop() const { return focusRangeStop_; }
 +
 +private:
 +	std::optional<double> previousScore_;
++	std::optional<uint64_t> minimumScore_;
++	std::optional<uint64_t> maximumScore_;
 +	unsigned int downCount_ = 0;
++	bool focusRangeStop_ = false;
 +};
 +
 +class LgAfSceneChange
