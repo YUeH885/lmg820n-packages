@@ -60,10 +60,10 @@ index 0000000..58b6f69
 +])
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
 new file mode 100644
-index 0000000..7d47b84
+index 0000000..f126865
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1637 @@
+@@ -0,0 +1,1669 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -301,6 +301,11 @@ index 0000000..7d47b84
 +		double red = 1.0;
 +		double blue = 1.0;
 +		double cct = 4250.0;
++		std::array<float, 9> ccm = {
++			214.0f / 128, -93.0f / 128, 7.0f / 128,
++			-38.0f / 128, 170.0f / 128, -5.0f / 128,
++			6.0f / 128, -157.0f / 128, 279.0f / 128,
++		};
 +	};
 +	struct FrameState {
 +		IfeState ife;
@@ -308,6 +313,7 @@ index 0000000..7d47b84
 +		int afMode;
 +		int afState;
 +		int afPauseState;
++		bool awbEnabled;
 +	};
 +	IfeState appliedIfe_;
 +	std::optional<std::pair<uint32_t, IfeState>> nextIfe_;
@@ -367,6 +373,7 @@ index 0000000..7d47b84
 +	int findPath(MediaEntity *sensor, MediaEntity *target);
 +	int disableLinks();
 +	int setIfeWb(double gainR, double gainB);
++	void setManualAwb(double gainR, double gainB);
 +	void fetchStats();
 +	void updateAe(uint32_t sequence, double luma);
 +	std::optional<double> meteringLuma(bool applyWeights) const;
@@ -749,7 +756,7 @@ index 0000000..7d47b84
 +		nextIfe_.reset();
 +	}
 +	frameStates_[sequence] = { appliedIfe_, static_cast<float>(lensPosition()),
-+				   afMode_, afState_, afPauseState_ };
++				   afMode_, afState_, afPauseState_, awbEnabled_ };
 +	while (frameStates_.size() > 64)
 +		frameStates_.erase(frameStates_.begin());
 +	if (ifePending_) {
@@ -859,6 +866,16 @@ index 0000000..7d47b84
 +	return 0;
 +}
 +
++void QcomCameraData::setManualAwb(double gainR, double gainB)
++{
++	awbGainR_ = std::clamp(gainR, 0.25, 8.0);
++	awbGainB_ = std::clamp(gainB, 0.25, 8.0);
++	colourTemperature_ = qcom::estimateCct(1.0 / awbGainR_,
++					       1.0 / awbGainB_);
++	qcom::interpolateCcm(colourTemperature_, ccmQ7_);
++	setIfeWb(awbGainR_, awbGainB_);
++}
++
 +int QcomCameraData::applyIfe(uint32_t sequence)
 +{
 +	struct qcom_camss_ife_config config = {};
@@ -887,8 +904,12 @@ index 0000000..7d47b84
 +	int ret = pix_->ioctl(VIDIOC_S_EXT_CTRLS, &controls);
 +	if (ret)
 +		return ret;
-+	IfeState state{ config.wb_gain_q7[0] / 128.0,
-+			config.wb_gain_q7[3] / 128.0, colourTemperature_ };
++	IfeState state;
++	state.red = config.wb_gain_q7[0] / 128.0;
++	state.blue = config.wb_gain_q7[3] / 128.0;
++	state.cct = colourTemperature_;
++	for (unsigned int i = 0; i < state.ccm.size(); i++)
++		state.ccm[i] = config.ccm_q7[i] / 128.0f;
 +	if (streaming_)
 +		nextIfe_ = std::make_pair(sequence, state);
 +	else
@@ -1110,41 +1131,53 @@ index 0000000..7d47b84
 +	if (++awbCounter_ % 4)
 +		return;
 +
-+	uint64_t sumR = 0, sumB = 0, sumGr = 0, sumGb = 0;
-+	uint64_t count = 0;
++	uint64_t sums[4] = {};
++	uint64_t counts[4] = {};
 +
 +	for (unsigned int y = 0; y < QCOM_CAMSS_AWB_BG_V_NUM; y++) {
 +		for (unsigned int x = 0; x < QCOM_CAMSS_AWB_BG_H_NUM; x++) {
 +			unsigned int i = y * QCOM_CAMSS_AWB_BG_H_NUM + x;
 +			const uint32_t *region = &awb_[i *
 +				(QCOM_CAMSS_AWB_BG_REGION_SIZE / sizeof(uint32_t))];
-+			uint32_t samples = region[4] & 0xffff;
-+			uint32_t satR = region[10] & 0xffff;
-+			uint32_t satB = region[10] >> 16;
-+			uint32_t satG = (region[11] & 0xffff) + (region[11] >> 16);
++			uint32_t regionCounts[4] = {
++				region[4] & 0xffff, region[4] >> 16,
++				region[5] & 0xffff, region[5] >> 16,
++			};
++			uint32_t saturated[4] = {
++				region[10] & 0xffff, region[10] >> 16,
++				region[11] & 0xffff, region[11] >> 16,
++			};
 +			unsigned int weight = x >= 8 && x < 24 && y >= 6 && y < 18
 +						? 4 : 1;
 +
-+			if (!samples || satR > samples || satB > samples ||
-+			    satG > 2 * samples)
++			if (std::any_of(std::begin(regionCounts), std::end(regionCounts),
++					[](uint32_t count) { return !count; }))
 +				continue;
-+			if (satR + satB + satG > samples / 2)
++			uint64_t sampleCount = 0;
++			uint64_t saturatedCount = 0;
++			for (unsigned int c = 0; c < 4; c++) {
++				sampleCount += regionCounts[c];
++				saturatedCount += saturated[c];
++			}
++			if (saturatedCount > sampleCount / 8)
 +				continue;
 +
-+			sumR += static_cast<uint64_t>(region[0]) * weight;
-+			sumB += static_cast<uint64_t>(region[1]) * weight;
-+			sumGr += static_cast<uint64_t>(region[2]) * weight;
-+			sumGb += static_cast<uint64_t>(region[3]) * weight;
-+			count += static_cast<uint64_t>(samples) * weight;
++			for (unsigned int c = 0; c < 4; c++) {
++				sums[c] += static_cast<uint64_t>(region[c] & 0x3fffffff) * weight;
++				counts[c] += static_cast<uint64_t>(regionCounts[c]) * weight;
++			}
 +		}
 +	}
 +
-+	if (!count || !sumR || !sumB)
++	if (std::any_of(std::begin(counts), std::end(counts),
++			[](uint64_t count) { return !count; }))
 +		return;
 +
-+	double r = static_cast<double>(sumR) / count - kBlackLevel;
-+	double b = static_cast<double>(sumB) / count - kBlackLevel;
-+	double g = static_cast<double>(sumGr + sumGb) / (2 * count) - kBlackLevel;
++	double r = static_cast<double>(sums[0]) / counts[0] - kBlackLevel;
++	double b = static_cast<double>(sums[1]) / counts[1] - kBlackLevel;
++	double gr = static_cast<double>(sums[2]) / counts[2] - kBlackLevel;
++	double gb = static_cast<double>(sums[3]) / counts[3] - kBlackLevel;
++	double g = (gr + gb) * 0.5;
 +
 +	if (r <= 4.0 || b <= 4.0 || g <= 4.0)
 +		return;
@@ -1378,15 +1411,11 @@ index 0000000..7d47b84
 +		awbEnabled_ = *controls.get(controls::AwbEnable);
 +		if (!awbEnabled_ && controls.contains(controls::ColourGains.id())) {
 +			const auto gains = *controls.get(controls::ColourGains);
-+			awbGainR_ = std::clamp(static_cast<double>(gains[0]), 0.25, 8.0);
-+			awbGainB_ = std::clamp(static_cast<double>(gains[1]), 0.25, 8.0);
-+			setIfeWb(awbGainR_, awbGainB_);
++			setManualAwb(gains[0], gains[1]);
 +		}
 +	} else if (!awbEnabled_ && controls.contains(controls::ColourGains.id())) {
 +		const auto gains = *controls.get(controls::ColourGains);
-+		awbGainR_ = std::clamp(static_cast<double>(gains[0]), 0.25, 8.0);
-+		awbGainB_ = std::clamp(static_cast<double>(gains[1]), 0.25, 8.0);
-+		setIfeWb(awbGainR_, awbGainB_);
++		setManualAwb(gains[0], gains[1]);
 +	}
 +
 +	if (controls.contains(controls::AfMode.id())) {
@@ -1478,6 +1507,9 @@ index 0000000..7d47b84
 +		       static_cast<float>(state.ife.blue) });
 +	metadata.set(controls::ColourTemperature,
 +		     static_cast<int32_t>(std::lround(state.ife.cct)));
++	metadata.set(controls::ColourCorrectionMatrix,
++		     Span<const float, 9>(state.ife.ccm));
++	metadata.set(controls::AwbEnable, state.awbEnabled);
 +	metadata.set(controls::AfMode, state.afMode);
 +	metadata.set(controls::AfState, state.afState);
 +	metadata.set(controls::AfPauseState, state.afPauseState);
