@@ -1,0 +1,214 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: use LG SFAF focus result criteria
+
+Evaluate focus using the factory position, peak, range, rise and fine search
+limits. Keep rejecting missing focus statistics and expose the result metrics
+for hardware validation.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 91ee8f2..48ba14b 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -607,8 +607,8 @@ public:
+ 	int afBestStep_ = 0;
+ 	int afFineEndStep_ = 0;
+ 	double afBestScore_ = -1.0;
+-	double afMinScore_ = 0.0;
+-	LgAfCoarseStop afCoarseStop_;
++	unsigned int afFineSamples_ = 0;
++	LgAfSearchStats afSearch_;
+ 	LgAfSceneChange afSceneChange_;
+ 	uint64_t afNextEval_ = 0;
+ 
+@@ -1470,8 +1470,8 @@ void QcomCameraData::startAfScan(uint64_t timestamp)
+ 	afOriginalPosition_ = afPosition_;
+ 	afBestStep_ = afModel_->afCodeToStep(afPosition_);
+ 	afBestScore_ = -1.0;
+-	afMinScore_ = std::numeric_limits<double>::max();
+-	afCoarseStop_.reset();
++	afFineSamples_ = 0;
++	afSearch_.reset();
+ 	afSceneChange_.reset();
+ 	afNextEval_ = timestamp ? timestamp + kAfSettleFrames * frameDurationNs_ : 0;
+ 	afState_ = controls::AfStateScanning;
+@@ -1558,7 +1558,6 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 	}
+ 
+ 	if (afStage_ == AfStage::Coarse || afStage_ == AfStage::Fine) {
+-		afMinScore_ = std::min(afMinScore_, score);
+ 		if (score > afBestScore_) {
+ 			afBestScore_ = score;
+ 			afBestStep_ = afStep_;
+@@ -1567,12 +1566,12 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 
+ 	if (afStage_ == AfStage::Coarse) {
+ 		unsigned int step = afModel_->coarseStep(afLowLight_);
+-		bool slopeStopped = afCoarseStop_.update(score, afLowLight_);
++		bool slopeStopped = afSearch_.update(score, afLowLight_);
+ 		if (slopeStopped)
+ 			LOG(QcomPipeline, Debug)
+ 				<< "AF coarse peak passed: "
+-				<< afCoarseStop_.downCount() << " down samples in "
+-				<< afCoarseStop_.sampleCount() << " total samples";
++				<< afSearch_.downCount() << " down samples in "
++				<< afSearch_.sampleCount() << " total samples";
+ 		if (slopeStopped ||
+ 		    afStep_ == static_cast<int>(afModel_->nearStep())) {
+ 			int range = afModel_->coarseStep(afLowLight_);
+@@ -1594,6 +1593,8 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 	}
+ 
+ 	if (afStage_ == AfStage::Fine) {
++		afFineSamples_++;
++		afSearch_.update(score, afLowLight_);
+ 		if (afStep_ >= afFineEndStep_) {
+ 			afStep_ = afBestStep_;
+ 			if (startAfMove(afBestStep_))
+@@ -1611,8 +1612,16 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 	}
+ 
+ 	if (afStage_ == AfStage::Confirm) {
+-		completeAfScan(afBestScore_ > afMinScore_ * 1.10 &&
+-			       score > 0.0 && score >= afBestScore_ * 0.60);
++		LgAfResult result{ afFineSamples_, afSearch_.peakScore(),
++				   afSearch_.focusRange(), afSearch_.maximumRise() };
++		bool success = score > 0.0 && lgAfScanSucceeded(
++			result, afModel_->nearPosition() + afBestStep_,
++			afModel_->positionForDistance(200),
++			afModel_->positionForDistance(700));
++		LOG(QcomPipeline, Debug) << "AF result peak " << result.peakScore
++			<< " range " << result.focusRange << " rise " << result.maximumRise
++			<< " fine samples " << result.fineSamples << " success " << success;
++		completeAfScan(success);
+ 		return;
+ 	}
+ 
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
+index c1c03b8..ca08f48 100644
+--- a/src/libcamera/pipeline/qcom/s5k3m5.h
++++ b/src/libcamera/pipeline/qcom/s5k3m5.h
+@@ -39,7 +39,7 @@ inline bool lgAfLowLight(double luma10)
+ 	return luma10 < kLgAfLowLightLuma8 * kAeTargetScale;
+ }
+ 
+-class LgAfCoarseStop
++class LgAfSearchStats
+ {
+ public:
+ 	void reset()
+@@ -48,7 +48,7 @@ public:
+ 		previousFocus_ = 0;
+ 		riseStartFocus_ = 0;
+ 		minimumFocus_ = 0;
+-		maximumFocus_ = 0;
++		maximumScore_ = 0;
+ 		maximumRise_ = 0.0;
+ 		upCount_ = 0;
+ 		downCount_ = 0;
+@@ -59,12 +59,12 @@ public:
+ 	bool update(double score, bool lowLight)
+ 	{
+ 		/* LG compares raw scores, but computes ratios from float-to-int FV >> 4. */
+-		uint64_t focus = static_cast<uint64_t>(static_cast<float>(score)) >> 4;
++		uint64_t raw = static_cast<uint64_t>(static_cast<float>(score));
++		uint64_t focus = raw >> 4;
+ 		if (!sampleCount_) {
+-			minimumFocus_ = maximumFocus_ = focus;
++			minimumFocus_ = focus;
+ 		} else {
+ 			minimumFocus_ = std::min(minimumFocus_, focus);
+-			maximumFocus_ = std::max(maximumFocus_, focus);
+ 			if (score > previousScore_) {
+ 				if (!upCount_)
+ 					riseStartFocus_ = previousFocus_;
+@@ -82,6 +82,7 @@ public:
+ 				upCount_ = 0;
+ 			}
+ 		}
++		maximumScore_ = std::max(maximumScore_, raw);
+ 		sampleCount_++;
+ 		previousScore_ = score;
+ 		previousFocus_ = focus;
+@@ -97,10 +98,12 @@ public:
+ 	unsigned int sampleCount() const { return sampleCount_; }
+ 	unsigned int reversalCount() const { return reversalCount_; }
+ 	double maximumRise() const { return maximumRise_; }
++	uint64_t peakScore() const { return maximumScore_; }
+ 	double focusRange() const
+ 	{
+-		return static_cast<double>(maximumFocus_ - minimumFocus_) /
+-		       std::max<uint64_t>(maximumFocus_, 1);
++		uint64_t maximum = maximumScore_ >> 4;
++		return static_cast<double>(maximum - minimumFocus_) /
++		       std::max<uint64_t>(maximum, 1);
+ 	}
+ 
+ private:
+@@ -108,7 +111,7 @@ private:
+ 	uint64_t previousFocus_ = 0;
+ 	uint64_t riseStartFocus_ = 0;
+ 	uint64_t minimumFocus_ = 0;
+-	uint64_t maximumFocus_ = 0;
++	uint64_t maximumScore_ = 0;
+ 	double maximumRise_ = 0.0;
+ 	unsigned int upCount_ = 0;
+ 	unsigned int downCount_ = 0;
+@@ -116,6 +119,24 @@ private:
+ 	unsigned int reversalCount_ = 0;
+ };
+ 
++struct LgAfResult {
++	unsigned int fineSamples;
++	uint64_t peakScore;
++	double focusRange;
++	double maximumRise;
++};
++
++inline bool lgAfScanSucceeded(const LgAfResult &result, int position,
++			     int position200mm, int position700mm)
++{
++	if (!result.peakScore || result.fineSamples > 30)
++		return false;
++
++	bool outside = position < position200mm || position > position700mm;
++	return !(outside && result.peakScore > 2000 &&
++		 result.focusRange < 0.1f && result.maximumRise < 0.015f);
++}
++
+ class LgAfSceneChange
+ {
+ public:
+@@ -328,6 +349,16 @@ public:
+ 				  static_cast<int>(farStep()));
+ 	}
+ 
++	int positionForDistance(double distance) const
++	{
++		double ratio = (referenceDistanceMm_ - focalLengthMm_) /
++			       (distance - focalLengthMm_);
++		return std::clamp(static_cast<int>(
++			infinityPosition_ -
++			(infinityPosition_ - macroPosition_) * ratio),
++			0, 1023);
++	}
++
+ private:
+ 	static constexpr double kFarDistanceMm = 10000.0;
+ 
+@@ -341,16 +372,6 @@ private:
+ 		return 2 * (1024 - position) - 1023;
+ 	}
+ 
+-	int positionForDistance(double distance) const
+-	{
+-		double ratio = (referenceDistanceMm_ - focalLengthMm_) /
+-			       (distance - focalLengthMm_);
+-		return std::clamp(static_cast<int>(
+-			infinityPosition_ -
+-			(infinityPosition_ - macroPosition_) * ratio),
+-			0, 1023);
+-	}
+-
+ 	unsigned int cameraId_ = 0;
+ 	uint16_t checksum_ = 0;
+ 	int rawInfinityDac_ = 0;
