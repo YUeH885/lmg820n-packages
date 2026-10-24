@@ -1,0 +1,845 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: restore factory 3A parameters and simplify control state
+
+Regenerate sensor AE targets from Chromatix and restore the verified LG
+contrast AF stop and scene-change conditions. Remove duplicate tuning
+helpers, unused generic AF constants, extra AE holds and AF cooldowns.
+Wait for AE convergence before starting an automatic focus scan, and avoid
+resubmitting unchanged sensor controls. Report lens and OIS control failures
+and complete deferred pauses when a lens move fails.
+
+diff --git a/src/libcamera/pipeline/qcom/imx351_tuning.h b/src/libcamera/pipeline/qcom/imx351_tuning.h
+index a246e19..07edeeb 100644
+--- a/src/libcamera/pipeline/qcom/imx351_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx351_tuning.h
+@@ -25,11 +25,11 @@ constexpr double kImx351AeLuxLogScale = 77.89852905273438;
+ constexpr double kImx351AeToleranceSteps = 2.0;
+ 
+ constexpr AeLuxZone kImx351AeLuxZones[] = {
+-	{ 0.0, 120.0, 85.0 },
+-	{ 200.0, 240.0, 95.0 },
+-	{ 300.0, 340.0, 105.0 },
+-	{ 380.0, 420.0, 105.0 },
+-	{ 450.0, 1000.0, 100.0 },
++	{ 0.0, 120.0, 40.0 },
++	{ 200.0, 240.0, 37.5 },
++	{ 300.0, 340.0, 35.0 },
++	{ 380.0, 420.0, 28.0 },
++	{ 450.0, 1000.0, 26.0 },
+ };
+ 
+ constexpr AeExposureKnee kImx351AeExposureKnees[] = {
+diff --git a/src/libcamera/pipeline/qcom/imx363_tuning.h b/src/libcamera/pipeline/qcom/imx363_tuning.h
+index 11a6d6e..922f3dc 100644
+--- a/src/libcamera/pipeline/qcom/imx363_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx363_tuning.h
+@@ -25,11 +25,11 @@ constexpr double kImx363AeLuxLogScale = 77.89852905273438;
+ constexpr double kImx363AeToleranceSteps = 4.0;
+ 
+ constexpr AeLuxZone kImx363AeLuxZones[] = {
+-	{ 0.0, 100.0, 85.0 },
+-	{ 166.0, 265.0, 95.0 },
+-	{ 290.0, 320.0, 105.0 },
+-	{ 362.0, 400.0, 105.0 },
+-	{ 450.0, 1000.0, 100.0 },
++	{ 0.0, 100.0, 42.0 },
++	{ 166.0, 265.0, 40.0 },
++	{ 290.0, 320.0, 35.0 },
++	{ 362.0, 400.0, 26.0 },
++	{ 450.0, 1000.0, 26.0 },
+ };
+ 
+ constexpr AeExposureKnee kImx363AeExposureKnees[] = {
+diff --git a/src/libcamera/pipeline/qcom/imx520_tuning.h b/src/libcamera/pipeline/qcom/imx520_tuning.h
+index 71e0b66..cb13eb9 100644
+--- a/src/libcamera/pipeline/qcom/imx520_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx520_tuning.h
+@@ -24,11 +24,11 @@ constexpr double kImx520AeLuxLogScale = 77.89852905273438;
+ constexpr double kImx520AeToleranceSteps = 2.0;
+ 
+ constexpr AeLuxZone kImx520AeLuxZones[] = {
+-	{ 1.0, 160.0, 85.0 },
+-	{ 190.0, 230.0, 95.0 },
+-	{ 250.0, 280.0, 105.0 },
+-	{ 300.0, 340.0, 105.0 },
+-	{ 370.0, 1000.0, 100.0 },
++	{ 1.0, 160.0, 46.0 },
++	{ 190.0, 230.0, 44.0 },
++	{ 250.0, 280.0, 42.0 },
++	{ 300.0, 340.0, 38.0 },
++	{ 370.0, 1000.0, 36.0 },
+ };
+ 
+ constexpr AeExposureKnee kImx520AeExposureKnees[] = {
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index ebd3259..91ee8f2 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -89,7 +89,6 @@ constexpr unsigned int kBufferCount = 4;
+ 
+ constexpr uint64_t kAfSettleNs = 50ULL * 1000 * 1000;
+ constexpr uint64_t kAfSettleFrames = 2;
+-constexpr uint64_t kAfWarmupNs = 1000ULL * 1000 * 1000;
+ 
+ using namespace qcom;
+ 
+@@ -513,7 +512,7 @@ public:
+ 	int processControls(const ControlList &controls);
+ 	void pushSensorControls();
+ 	int setLensPosition(int position);
+-	void startAfMove(int step);
++	int startAfMove(int step);
+ 	void startAfScan(uint64_t timestamp);
+ 	double lensPosition() const;
+ 	int lensPositionToCode(double position) const;
+@@ -573,7 +572,6 @@ public:
+ 	bool aeEnabled_ = true;
+ 	double aeExposure_ = 1000.0;
+ 	double aeGain_ = 1.0;
+-	unsigned int aeHoldFrames_ = 0;
+ 	std::optional<double> luxIndex_;
+ 	std::optional<double> aecLuma_;
+ 
+@@ -613,22 +611,20 @@ public:
+ 	LgAfCoarseStop afCoarseStop_;
+ 	LgAfSceneChange afSceneChange_;
+ 	uint64_t afNextEval_ = 0;
+-	uint64_t afCooldownNs_ = 0;
+ 
+ private:
+ 	int findPath(MediaEntity *sensor, MediaEntity *target);
+ 	int disableLinks();
+-	int setIfeWb(double gainR, double gainB);
++	void setIfeWb(double gainR, double gainB);
+ 	void setManualAwb(double gainR, double gainB);
+ 	void fetchStats();
+-	void updateAe(uint32_t sequence, double luma);
++	bool updateAe(uint32_t sequence, double luma);
+ 	std::optional<double> meteringLuma(bool applyWeights) const;
+ 	std::optional<double> measuredLuma() const;
+ 	void updateAwb();
+ 	void updateCcm(double r, double g, double b);
+-	void updateAf(uint64_t timestamp);
+-	void setAfStage(AfStage stage);
+-	void completeAfScan(bool success, uint64_t timestamp);
++	void updateAf(uint64_t timestamp, bool aeSettled);
++	void completeAfScan(bool success);
+ 	double focusScore() const;
+ 	void updateMetadata(Request *request, uint32_t sequence);
+ 	uint64_t lensReadyTimestamp() const;
+@@ -1121,12 +1117,11 @@ void QcomCameraData::pushSensorControls()
+ 	delayedCtrls_->push(ctrls);
+ }
+ 
+-int QcomCameraData::setIfeWb(double gainR, double gainB)
++void QcomCameraData::setIfeWb(double gainR, double gainB)
+ {
+ 	awbGainR_ = gainR;
+ 	awbGainB_ = gainB;
+ 	ifePending_ = true;
+-	return 0;
+ }
+ 
+ void QcomCameraData::setManualAwb(double gainR, double gainB)
+@@ -1199,11 +1194,21 @@ int QcomCameraData::setLensPosition(int position)
+ 	return ret;
+ }
+ 
+-void QcomCameraData::startAfMove(int step)
++int QcomCameraData::startAfMove(int step)
+ {
+-	step = std::clamp<int>(step, afModel_->nearStep(), afModel_->farStep());
+ 	afStep_ = step;
+-	setLensPosition(afModel_->afStepToCode(step));
++	int ret = setLensPosition(afModel_->afStepToCode(step));
++	if (ret) {
++		afState_ = controls::AfStateFailed;
++		afStage_ = AfStage::Idle;
++		if (afDeferredPause_) {
++			afPaused_ = true;
++			afDeferredPause_ = false;
++			afPauseState_ = controls::AfPauseStatePaused;
++		}
++		LOG(QcomPipeline, Error) << "AF lens move failed: " << ret;
++	}
++	return ret;
+ }
+ 
+ double QcomCameraData::lensPosition() const
+@@ -1243,12 +1248,13 @@ void QcomCameraData::fetchStats()
+ 	statsTimestamp_ = request.timestamp;
+ 	aecLuma_ = measuredLuma();
+ 
++	bool aeSettled = !aeEnabled_;
+ 	if (aeEnabled_ && aecLuma_)
+-		updateAe(qcom::inputSequence(request.sequence), *aecLuma_);
++		aeSettled = updateAe(qcom::inputSequence(request.sequence), *aecLuma_);
+ 	if (awbEnabled_)
+ 		updateAwb();
+ 	if (afEnabled_)
+-		updateAf(request.timestamp);
++		updateAf(request.timestamp, aeSettled);
+ }
+ 
+ std::optional<double> QcomCameraData::meteringLuma(bool applyWeights) const
+@@ -1323,7 +1329,7 @@ std::optional<double> QcomCameraData::measuredLuma() const
+ 	return *global > 0.0 ? histMean * *metered / *global : histMean;
+ }
+ 
+-void QcomCameraData::updateAe(uint32_t sequence, double luma)
++bool QcomCameraData::updateAe(uint32_t sequence, double luma)
+ {
+ 	ControlList applied = delayedCtrls_->get(sequence);
+ 	double exposure = applied.get(V4L2_CID_EXPOSURE).get<int32_t>() *
+@@ -1336,19 +1342,12 @@ void QcomCameraData::updateAe(uint32_t sequence, double luma)
+ 			       index * (1.0 - profile_.aeLuxFilterFactor) : index;
+ 	double target = aeTargetForLux(profile_, *luxIndex_) * kAeTargetScale;
+ 
+-	if (aeHoldFrames_ > 0) {
+-		aeHoldFrames_--;
+-		return;
+-	}
+-
+-	double tolerance = std::max(profile_.aeToleranceSteps * kAeTargetScale,
+-				    target * 0.08);
++	double tolerance = profile_.aeToleranceSteps * kAeTargetScale;
+ 	if (std::abs(luma - target) <= tolerance)
+-		return;
++		return true;
+ 
+-	double ratio = target / std::max(luma, 1.0);
+-	ratio = std::clamp(ratio, 0.50, 2.00);
+-	double stepRatio = std::pow(ratio, profile_.aeAggressiveness * 0.65);
++	double ratio = target / std::max(luma, profile_.aeLuxLumaMinimum8 * kAeTargetScale);
++	double stepRatio = std::pow(ratio, profile_.aeAggressiveness);
+ 	double corrected = total * stepRatio;
+ 	double allocatedGain, allocatedExposure;
+ 	aeAllocateExposure(profile_, corrected, allocatedGain, allocatedExposure);
+@@ -1363,12 +1362,17 @@ void QcomCameraData::updateAe(uint32_t sequence, double luma)
+ 
+ 	aeExposure_ = allocatedExposure / lineDurationNs_;
+ 	aeGain_ = allocatedGain;
++	if (static_cast<int32_t>(std::lround(aeExposure_)) ==
++		    applied.get(V4L2_CID_EXPOSURE).get<int32_t>() &&
++	    gainToCode(profile_, aeGain_) ==
++		    applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>())
++		return true;
+ 	pushSensorControls();
+-	aeHoldFrames_ = 4;
+ 
+ 	LOG(QcomPipeline, Debug) << "AE luma " << luma << " target " << target
+ 				 << " index " << *luxIndex_ << " exposure "
+ 				 << aeExposure_ << " gain " << aeGain_;
++	return false;
+ }
+ 
+ void QcomCameraData::updateCcm(double r, double g, double b)
+@@ -1458,11 +1462,6 @@ double QcomCameraData::focusScore() const
+ 	return (roi[1] & 0xffffffffffULL) + (roi[3] & 0xffffffffffULL);
+ }
+ 
+-void QcomCameraData::setAfStage(AfStage stage)
+-{
+-	afStage_ = stage;
+-}
+-
+ void QcomCameraData::startAfScan(uint64_t timestamp)
+ {
+ 	if (!afEnabled_)
+@@ -1474,27 +1473,26 @@ void QcomCameraData::startAfScan(uint64_t timestamp)
+ 	afMinScore_ = std::numeric_limits<double>::max();
+ 	afCoarseStop_.reset();
+ 	afSceneChange_.reset();
+-	afNextEval_ = timestamp ? timestamp + kAfWarmupNs : 0;
++	afNextEval_ = timestamp ? timestamp + kAfSettleFrames * frameDurationNs_ : 0;
+ 	afState_ = controls::AfStateScanning;
+-	setAfStage(AfStage::Warmup);
++	afStage_ = AfStage::Warmup;
+ 	LOG(QcomPipeline, Debug) << "AF scan started at code " << afOriginalPosition_;
+ }
+ 
+-void QcomCameraData::completeAfScan(bool success, uint64_t timestamp)
++void QcomCameraData::completeAfScan(bool success)
+ {
+-	afCooldownNs_ = timestamp + (success ? 2000ULL * 1000 * 1000 : 3000ULL * 1000 * 1000);
+-
+ 	if (success) {
+ 		afStep_ = afBestStep_;
+-		setAfStage(AfStage::Idle);
++		afStage_ = AfStage::Idle;
+ 		afState_ = controls::AfStateFocused;
+ 		LOG(QcomPipeline, Info) << "AF focused at step " << afBestStep_
+ 					<< " code " << afModel_->afStepToCode(afBestStep_);
+ 	} else {
+-		setAfStage(AfStage::Restore);
++		afStage_ = AfStage::Restore;
+ 		afState_ = controls::AfStateFailed;
+ 		afStep_ = afModel_->afCodeToStep(afOriginalPosition_);
+-		startAfMove(afStep_);
++		if (startAfMove(afStep_))
++			return;
+ 		LOG(QcomPipeline, Info) << "AF scan failed";
+ 	}
+ 
+@@ -1505,14 +1503,14 @@ void QcomCameraData::completeAfScan(bool success, uint64_t timestamp)
+ 	}
+ }
+ 
+-void QcomCameraData::updateAf(uint64_t timestamp)
++void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ {
+ 	if (!afEnabled_)
+ 		return;
+ 
+ 	if (afMode_ != controls::AfModeContinuous &&
+ 	    afMode_ != controls::AfModeAuto) {
+-		setAfStage(AfStage::Idle);
++		afStage_ = AfStage::Idle;
+ 		return;
+ 	}
+ 
+@@ -1524,8 +1522,6 @@ void QcomCameraData::updateAf(uint64_t timestamp)
+ 	}
+ 
+ 	if (afStage_ == AfStage::Idle) {
+-		if (timestamp < afCooldownNs_)
+-			return;
+ 		if (afMode_ == controls::AfModeContinuous && !afPaused_) {
+ 			if (afSceneChange_.update(focusScore())) {
+ 				LOG(QcomPipeline, Debug)
+@@ -1537,7 +1533,7 @@ void QcomCameraData::updateAf(uint64_t timestamp)
+ 	}
+ 
+ 	if (!afNextEval_) {
+-		afNextEval_ = timestamp + kAfWarmupNs;
++		afNextEval_ = timestamp + kAfSettleFrames * frameDurationNs_;
+ 		return;
+ 	}
+ 
+@@ -1547,14 +1543,17 @@ void QcomCameraData::updateAf(uint64_t timestamp)
+ 	double score = focusScore();
+ 
+ 	if (afStage_ == AfStage::Warmup) {
++		if (!aeSettled)
++			return;
+ 		afLowLight_ = aecLuma_ && lgAfLowLight(*aecLuma_);
+ 		LOG(QcomPipeline, Debug) << "AF search luma "
+ 					 << aecLuma_.value_or(0.0)
+ 					 << " low light " << afLowLight_;
+ 		afStep_ = afModel_->farStep();
+-		startAfMove(afStep_);
++		if (startAfMove(afStep_))
++			return;
+ 		afNextEval_ = timestamp + kAfSettleNs;
+-		setAfStage(AfStage::Coarse);
++		afStage_ = AfStage::Coarse;
+ 		return;
+ 	}
+ 
+@@ -1580,13 +1579,15 @@ void QcomCameraData::updateAf(uint64_t timestamp)
+ 			int start = std::max<int>(afModel_->nearStep(), afBestStep_ - range);
+ 			afFineEndStep_ = std::min<int>(afModel_->farStep(), afBestStep_ + range);
+ 			afStep_ = start;
+-			startAfMove(afStep_);
++			if (startAfMove(afStep_))
++				return;
+ 			afNextEval_ = timestamp + kAfSettleNs;
+-			setAfStage(AfStage::Fine);
++			afStage_ = AfStage::Fine;
+ 		} else {
+ 			afStep_ = std::max<int>(afModel_->nearStep(),
+ 						 afStep_ - static_cast<int>(step));
+-			startAfMove(afStep_);
++			if (startAfMove(afStep_))
++				return;
+ 			afNextEval_ = timestamp + kAfSettleNs;
+ 		}
+ 		return;
+@@ -1595,13 +1596,15 @@ void QcomCameraData::updateAf(uint64_t timestamp)
+ 	if (afStage_ == AfStage::Fine) {
+ 		if (afStep_ >= afFineEndStep_) {
+ 			afStep_ = afBestStep_;
+-			startAfMove(afBestStep_);
++			if (startAfMove(afBestStep_))
++				return;
+ 			afNextEval_ = timestamp + kAfSettleNs;
+-			setAfStage(AfStage::Confirm);
++			afStage_ = AfStage::Confirm;
+ 		} else {
+ 			unsigned int step = afModel_->fineStep(afLowLight_);
+ 			afStep_ = std::min<int>(afFineEndStep_, afStep_ + step);
+-			startAfMove(afStep_);
++			if (startAfMove(afStep_))
++				return;
+ 			afNextEval_ = timestamp + kAfSettleNs;
+ 		}
+ 		return;
+@@ -1609,16 +1612,13 @@ void QcomCameraData::updateAf(uint64_t timestamp)
+ 
+ 	if (afStage_ == AfStage::Confirm) {
+ 		completeAfScan(afBestScore_ > afMinScore_ * 1.10 &&
+-			       score > 0.0 && score >= afBestScore_ * 0.60,
+-			       timestamp);
++			       score > 0.0 && score >= afBestScore_ * 0.60);
+ 		return;
+ 	}
+ 
+ 	if (afStage_ == AfStage::Restore) {
+-		if (timestamp < std::max(afNextEval_, lensReadyTimestamp()))
+-			return;
+ 		afSceneChange_.reset();
+-		setAfStage(AfStage::Idle);
++		afStage_ = AfStage::Idle;
+ 		if (afDeferredPause_) {
+ 			afPaused_ = true;
+ 			afDeferredPause_ = false;
+@@ -1683,8 +1683,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 			afDeferredPause_ = false;
+ 			afPauseState_ = controls::AfPauseStateRunning;
+ 			afState_ = controls::AfStateIdle;
+-			afCooldownNs_ = 0;
+-			setAfStage(AfStage::Idle);
++			afStage_ = AfStage::Idle;
+ 			if (afMode_ == controls::AfModeContinuous)
+ 				startAfScan(statsTimestamp_);
+ 		}
+@@ -1703,14 +1702,15 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 		int trigger = *controls.get(controls::AfTrigger);
+ 		if (trigger == controls::AfTriggerStart &&
+ 		    afStage_ == AfStage::Idle) {
+-			afCooldownNs_ = 0;
+ 			startAfScan(statsTimestamp_);
+ 		}
+ 		else if (trigger == controls::AfTriggerCancel) {
+ 			afState_ = controls::AfStateIdle;
+-			setAfStage(AfStage::Restore);
++			afStage_ = AfStage::Restore;
+ 			afStep_ = afModel_->afCodeToStep(afOriginalPosition_);
+-			startAfMove(afStep_);
++			int ret = startAfMove(afStep_);
++			if (ret)
++				return ret;
+ 		}
+ 	}
+ 
+@@ -1890,10 +1890,11 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->streaming_ = false;
+ 	data->ifePending_ = true;
+ 	data->afSceneChange_.reset();
+-	data->afCooldownNs_ = 0;
+-	data->aeHoldFrames_ = 0;
+-	if (data->afEnabled_)
+-		data->setLensPosition(data->afPosition_);
++	if (data->afEnabled_) {
++		ret = data->setLensPosition(data->afPosition_);
++		if (ret)
++			return ret;
++	}
+ 
+ 	if (controls) {
+ 		ret = data->processControls(*controls);
+@@ -1905,13 +1906,6 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		return ret;
+ 	data->pushSensorControls();
+ 
+-	V4L2Subdevice *ois = data->sensor_->ois();
+-	if (ois) {
+-		ControlList ctrls(ois->controls());
+-		ctrls.set(V4L2_CID_IMAGE_STABILIZATION, 1);
+-		ois->setControls(&ctrls);
+-	}
+-
+ 	if (data->afEnabled_ && data->afMode_ == controls::AfModeContinuous &&
+ 	    !data->afPaused_)
+ 		data->startAfScan(0);
+@@ -1936,6 +1930,18 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	}
+ 	activeCamera_ = camera;
+ 
++	V4L2Subdevice *ois = data->sensor_->ois();
++	if (ois) {
++		ControlList ctrls(ois->controls());
++		ctrls.set(V4L2_CID_IMAGE_STABILIZATION, 1);
++		ret = ois->setControls(&ctrls);
++		if (ret) {
++			LOG(QcomPipeline, Error) << "Failed to enable OIS: " << ret;
++			stopDevice(camera);
++			return ret;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1947,7 +1953,9 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 	if (ois) {
+ 		ControlList ctrls(ois->controls());
+ 		ctrls.set(V4L2_CID_IMAGE_STABILIZATION, 0);
+-		ois->setControls(&ctrls);
++		int ret = ois->setControls(&ctrls);
++		if (ret)
++			LOG(QcomPipeline, Error) << "Failed to disable OIS: " << ret;
+ 	}
+ 
+ 	data->streaming_ = false;
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
+index 3e9509d..c1c03b8 100644
+--- a/src/libcamera/pipeline/qcom/s5k3m5.h
++++ b/src/libcamera/pipeline/qcom/s5k3m5.h
+@@ -6,8 +6,6 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+-#include <iterator>
+-#include <limits>
+ #include <optional>
+ #include <string>
+ 
+@@ -34,7 +32,6 @@ struct CctReference {
+ 
+ /* The factory luma target is an 8-bit code; statistics use 10 bits. */
+ constexpr double kAeTargetScale = 4.0;
+-constexpr double kAeTolerance = kAeToleranceSteps * kAeTargetScale;
+ constexpr double kLgAfLowLightLuma8 = 17.0;
+ 
+ inline bool lgAfLowLight(double luma10)
+@@ -48,43 +45,75 @@ public:
+ 	void reset()
+ 	{
+ 		previousScore_ = 0.0;
+-		peakScore_ = 0.0;
++		previousFocus_ = 0;
++		riseStartFocus_ = 0;
++		minimumFocus_ = 0;
++		maximumFocus_ = 0;
++		maximumRise_ = 0.0;
++		upCount_ = 0;
+ 		downCount_ = 0;
+ 		sampleCount_ = 0;
++		reversalCount_ = 0;
+ 	}
+ 
+-	bool update(double score, [[maybe_unused]] bool lowLight)
++	bool update(double score, bool lowLight)
+ 	{
+-		sampleCount_++;
+-		if (score > peakScore_) {
+-			peakScore_ = score;
+-			downCount_ = 0;
+-		} else if (score < previousScore_) {
+-			downCount_++;
++		/* LG compares raw scores, but computes ratios from float-to-int FV >> 4. */
++		uint64_t focus = static_cast<uint64_t>(static_cast<float>(score)) >> 4;
++		if (!sampleCount_) {
++			minimumFocus_ = maximumFocus_ = focus;
++		} else {
++			minimumFocus_ = std::min(minimumFocus_, focus);
++			maximumFocus_ = std::max(maximumFocus_, focus);
++			if (score > previousScore_) {
++				if (!upCount_)
++					riseStartFocus_ = previousFocus_;
++				if (downCount_)
++					reversalCount_++;
++				upCount_++;
++				downCount_ = 0;
++				double rise = static_cast<double>(focus - riseStartFocus_) /
++					std::max<uint64_t>(focus, 1);
++				maximumRise_ = std::max(maximumRise_, rise);
++			} else {
++				if (upCount_)
++					reversalCount_++;
++				downCount_++;
++				upCount_ = 0;
++			}
+ 		}
++		sampleCount_++;
+ 		previousScore_ = score;
++		previousFocus_ = focus;
+ 
+-		/*
+-		 * A coarse peak is confirmed passed when the score drops consecutively
+-		 * and drops by at least 15% from the observed peak.
+-		 */
+-		if (peakScore_ > 0.0 && downCount_ >= 2) {
+-			double dropRatio = (peakScore_ - score) / peakScore_;
+-			if (dropRatio >= 0.15)
+-				return true;
+-		}
+-
+-		return false;
++		return downCount_ >= (lowLight ? 3U : 4U) ||
++		       (downCount_ > 2 && focusRange() > 0.1) ||
++		       (upCount_ > 2 && maximumRise_ < 0.01) ||
++		       (sampleCount_ >= 9 && reversalCount_ >= 6);
+ 	}
+ 
++	unsigned int upCount() const { return upCount_; }
+ 	unsigned int downCount() const { return downCount_; }
+ 	unsigned int sampleCount() const { return sampleCount_; }
++	unsigned int reversalCount() const { return reversalCount_; }
++	double maximumRise() const { return maximumRise_; }
++	double focusRange() const
++	{
++		return static_cast<double>(maximumFocus_ - minimumFocus_) /
++		       std::max<uint64_t>(maximumFocus_, 1);
++	}
+ 
+ private:
+ 	double previousScore_ = 0.0;
+-	double peakScore_ = 0.0;
++	uint64_t previousFocus_ = 0;
++	uint64_t riseStartFocus_ = 0;
++	uint64_t minimumFocus_ = 0;
++	uint64_t maximumFocus_ = 0;
++	double maximumRise_ = 0.0;
++	unsigned int upCount_ = 0;
+ 	unsigned int downCount_ = 0;
+ 	unsigned int sampleCount_ = 0;
++	unsigned int reversalCount_ = 0;
+ };
+ 
+ class LgAfSceneChange
+@@ -92,23 +121,26 @@ class LgAfSceneChange
+ public:
+ 	void reset()
+ 	{
+-		previousScore_ = 0.0;
++		previousScore_.reset();
+ 		unstable_ = false;
+ 		stableCount_ = 0;
+ 	}
+ 
+ 	bool update(double score)
+ 	{
+-		if (previousScore_ <= 0.0) {
+-			previousScore_ = score;
++		uint64_t current = static_cast<uint64_t>(static_cast<float>(score)) >> 4;
++		if (!previousScore_) {
++			previousScore_ = current;
+ 			return false;
+ 		}
+ 
+-		double change = std::abs(score - previousScore_) /
+-				std::max(score, previousScore_);
+-		previousScore_ = score;
++		uint64_t previous = *previousScore_;
++		previousScore_ = current;
++		uint64_t maximum = std::max<uint64_t>({ current, previous, 1 });
++		double change = static_cast<double>(
++			current > previous ? current - previous : previous - current) / maximum;
+ 
+-		if (change > 0.40) {
++		if (change > 0.50) {
+ 			unstable_ = true;
+ 			stableCount_ = 0;
+ 			return false;
+@@ -117,7 +149,7 @@ public:
+ 		if (!unstable_)
+ 			return false;
+ 
+-		if (change < 0.10) {
++		if (change < 0.1f) {
+ 			if (++stableCount_ >= 4) {
+ 				unstable_ = false;
+ 				stableCount_ = 0;
+@@ -134,7 +166,7 @@ public:
+ 	unsigned int stableCount() const { return stableCount_; }
+ 
+ private:
+-	double previousScore_ = 0.0;
++	std::optional<uint64_t> previousScore_;
+ 	bool unstable_ = false;
+ 	unsigned int stableCount_ = 0;
+ };
+@@ -336,136 +368,4 @@ private:
+ 	unsigned int fineStepLowLight_ = 0;
+ };
+ 
+-inline std::optional<double> aeRegionLuma(const uint64_t sums[4],
+-					  const uint64_t counts[4], double blackLevel)
+-{
+-	double values[4];
+-	for (unsigned int c = 0; c < 4; c++) {
+-		if (!counts[c])
+-			return std::nullopt;
+-		values[c] = std::max(0.0, static_cast<double>(sums[c]) / counts[c] - blackLevel);
+-	}
+-
+-	return kAeRgbWeights[0] * values[0] +
+-	       kAeRgbWeights[1] * (values[2] + values[3]) * 0.5 +
+-	       kAeRgbWeights[2] * values[1];
+-}
+-
+-inline double aeLuxIndex(double exposureIndex, double luma10)
+-{
+-	double luma8 = std::max(luma10 / kAeTargetScale,
+-				 kAeLuxLumaMinimum8);
+-	return std::max(0.0, exposureIndex +
+-			     kAeLuxLogScale *
+-			     std::log10(kAeLuxReferenceLuma8 / luma8));
+-}
+-
+-inline double aeTargetForLux(double lux)
+-{
+-	if (lux <= kAeLuxZones[0].start)
+-		return kAeLuxZones[0].target8;
+-
+-	for (unsigned int i = 0; i + 1 < std::size(kAeLuxZones); i++) {
+-		const AeLuxZone &zone = kAeLuxZones[i];
+-		const AeLuxZone &next = kAeLuxZones[i + 1];
+-		if (lux <= zone.end)
+-			return zone.target8;
+-		if (lux < next.start) {
+-			double t = (lux - zone.end) / (next.start - zone.end);
+-			return zone.target8 + t * (next.target8 - zone.target8);
+-		}
+-	}
+-
+-	return kAeLuxZones[std::size(kAeLuxZones) - 1].target8;
+-}
+-
+-inline double aeTotalExposure(const AeExposureKnee &knee)
+-{
+-	return knee.gain * knee.exposureNs;
+-}
+-
+-inline double aeExposureIndex(double total)
+-{
+-	if (total <= aeTotalExposure(kAeExposureKnees[0]))
+-		return kAeExposureKnees[0].index;
+-
+-	for (unsigned int i = 0; i + 1 < std::size(kAeExposureKnees); i++) {
+-		double lower = aeTotalExposure(kAeExposureKnees[i]);
+-		double upper = aeTotalExposure(kAeExposureKnees[i + 1]);
+-		if (total <= upper) {
+-			double t = (std::log2(total) - std::log2(lower)) /
+-				   (std::log2(upper) - std::log2(lower));
+-			return kAeExposureKnees[i].index + t *
+-			       (kAeExposureKnees[i + 1].index -
+-				kAeExposureKnees[i].index);
+-		}
+-	}
+-
+-	return kAeExposureKnees[std::size(kAeExposureKnees) - 1].index;
+-}
+-
+-inline void aeAllocateExposure(double total, double &gain, double &exposureNs)
+-{
+-	if (total <= aeTotalExposure(kAeExposureKnees[0])) {
+-		gain = kAeExposureKnees[0].gain;
+-		exposureNs = kAeExposureKnees[0].exposureNs;
+-		return;
+-	}
+-
+-	for (unsigned int i = 0; i + 1 < std::size(kAeExposureKnees); i++) {
+-		double lower = aeTotalExposure(kAeExposureKnees[i]);
+-		double upper = aeTotalExposure(kAeExposureKnees[i + 1]);
+-		if (total <= upper) {
+-			double t = (std::log2(total) - std::log2(lower)) /
+-				   (std::log2(upper) - std::log2(lower));
+-			gain = kAeExposureKnees[i].gain * std::pow(
+-			kAeExposureKnees[i + 1].gain / kAeExposureKnees[i].gain, t);
+-			exposureNs = total / gain;
+-			return;
+-		}
+-	}
+-
+-	const AeExposureKnee &last =
+-		kAeExposureKnees[std::size(kAeExposureKnees) - 1];
+-	gain = last.gain;
+-	exposureNs = last.exposureNs;
+-}
+-
+-inline double estimateCct(double rg, double bg)
+-{
+-	double bestDistance = std::numeric_limits<double>::max();
+-	double cct = 4250.0;
+-	for (unsigned int i = 0; i + 1 < std::size(kCctReferences); i++) {
+-		const auto &lower = kCctReferences[i];
+-		const auto &upper = kCctReferences[i + 1];
+-		double dx = upper.rg - lower.rg;
+-		double dy = upper.bg - lower.bg;
+-		double t = std::clamp(((rg - lower.rg) * dx + (bg - lower.bg) * dy) /
+-				      (dx * dx + dy * dy), 0.0, 1.0);
+-		double ex = rg - (lower.rg + t * dx);
+-		double ey = bg - (lower.bg + t * dy);
+-		double distance = ex * ex + ey * ey;
+-		if (distance < bestDistance) {
+-			bestDistance = distance;
+-			/* Reciprocal temperature is linear along the illuminant locus. */
+-			cct = 1.0 / ((1.0 - t) / lower.cct + t / upper.cct);
+-		}
+-	}
+-	return cct;
+-}
+-
+-inline void interpolateCcm(double cct, int16_t (&coefficients)[9])
+-{
+-	cct = std::clamp(cct, static_cast<double>(kCcmEntries[0].cct),
+-			 static_cast<double>(kCcmEntries[std::size(kCcmEntries) - 1].cct));
+-	unsigned int i = 0;
+-	while (i + 2 < std::size(kCcmEntries) && cct > kCcmEntries[i + 1].cct)
+-		i++;
+-	const auto &lower = kCcmEntries[i];
+-	const auto &upper = kCcmEntries[i + 1];
+-	double t = (cct - lower.cct) / (upper.cct - lower.cct);
+-	for (unsigned int j = 0; j < 9; j++)
+-		coefficients[j] = std::lround(lower.q7[j] + t * (upper.q7[j] - lower.q7[j]));
+-}
+-
+ } /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5_tuning.h b/src/libcamera/pipeline/qcom/s5k3m5_tuning.h
+index 1b28251..29d5437 100644
+--- a/src/libcamera/pipeline/qcom/s5k3m5_tuning.h
++++ b/src/libcamera/pipeline/qcom/s5k3m5_tuning.h
+@@ -14,33 +14,11 @@ constexpr CctReference kCctReferences[] = {
+ 	{ 7500, 0.562896788, 0.661324978 }
+ };
+ 
+-constexpr unsigned int kAfStepCount = 400;
+-constexpr unsigned int kAfNearStep = 0;
+-constexpr unsigned int kAfDefaultMacroStep = 106;
+-constexpr unsigned int kAfMacroRegionStep = 171;
+-constexpr unsigned int kAfBoundaryStep = 259;
+-constexpr unsigned int kAfDefaultNormalStep = 335;
+-constexpr unsigned int kAfFarStep = 399;
+-constexpr double kAfLowLightGain = 10.0;
+-constexpr unsigned int kAfCafCoarseNormal[] = {
+-	12, 12, 15, 15, 20
+-};
+-constexpr unsigned int kAfCafCoarseLow[] = {
+-	14, 15, 20, 22, 22
+-};
+-constexpr unsigned int kAfCafFineNormal[] = {
+-	6, 6, 6, 10, 10
+-};
+-constexpr unsigned int kAfCafFineLow[] = {
+-	6, 6, 8, 10, 10
+-};
+-
+ constexpr double kAeAggressiveness = 0.649999976;
+ constexpr double kAeLuxFilterFactor = 0.500000000;
+ constexpr double kAeLuxReferenceLuma8 = 50.0;
+ constexpr double kAeLuxLumaMinimum8 = 0.1;
+ constexpr double kAeLuxLogScale = 77.89852905273438;
+-constexpr double kAeLuxReferenceSensitivityNs = 74906.0;
+ constexpr double kAeToleranceSteps = 2.0;
+ constexpr double kAeRgbWeights[] = { 0.298799992, 0.586899996, 0.113700002 };
+ struct AeLuxZone {
+@@ -49,11 +27,11 @@ struct AeLuxZone {
+ 	double target8;
+ };
+ constexpr AeLuxZone kAeLuxZones[] = {
+-	{ 0.0, 120.0, 85.0 },
+-	{ 200.0, 240.0, 95.0 },
+-	{ 300.0, 340.0, 105.0 },
+-	{ 380.0, 420.0, 105.0 },
+-	{ 450.0, 1000.0, 100.0 }
++	{ 0.0, 120.0, 40.0 },
++	{ 200.0, 240.0, 37.5 },
++	{ 300.0, 340.0, 35.0 },
++	{ 380.0, 420.0, 28.0 },
++	{ 450.0, 1000.0, 26.0 }
+ };
+ struct AeExposureKnee {
+ 	double gain;
