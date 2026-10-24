@@ -1,0 +1,41 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: interpret AE tolerance in exposure index steps
+
+Compare the logarithmic exposure-index error with the factory tolerance.
+Use a strict comparison, matching the factory fast-convergence boundary,
+and share the same brightness ratio with the exposure correction.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 48ba14b..621027f 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -1342,11 +1342,10 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma)
+ 			       index * (1.0 - profile_.aeLuxFilterFactor) : index;
+ 	double target = aeTargetForLux(profile_, *luxIndex_) * kAeTargetScale;
+ 
+-	double tolerance = profile_.aeToleranceSteps * kAeTargetScale;
+-	if (std::abs(luma - target) <= tolerance)
++	double ratio = target / std::max(luma, profile_.aeLuxLumaMinimum8 * kAeTargetScale);
++	if (aeWithinTolerance(ratio, profile_.aeLuxLogScale, profile_.aeToleranceSteps))
+ 		return true;
+ 
+-	double ratio = target / std::max(luma, profile_.aeLuxLumaMinimum8 * kAeTargetScale);
+ 	double stepRatio = std::pow(ratio, profile_.aeAggressiveness);
+ 	double corrected = total * stepRatio;
+ 	double allocatedGain, allocatedExposure;
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
+index ca08f48..4c3691e 100644
+--- a/src/libcamera/pipeline/qcom/s5k3m5.h
++++ b/src/libcamera/pipeline/qcom/s5k3m5.h
+@@ -34,6 +34,11 @@ struct CctReference {
+ constexpr double kAeTargetScale = 4.0;
+ constexpr double kLgAfLowLightLuma8 = 17.0;
+ 
++inline bool aeWithinTolerance(double ratio, double indexScale, double tolerance)
++{
++	return std::abs(indexScale * std::log10(ratio)) < tolerance;
++}
++
+ inline bool lgAfLowLight(double luma10)
+ {
+ 	return luma10 < kLgAfLowLightLuma8 * kAeTargetScale;
