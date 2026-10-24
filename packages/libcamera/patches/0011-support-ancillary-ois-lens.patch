@@ -1,9 +1,14 @@
-Description: Support ancillary OIS lens in CameraSensor and Qcom pipeline
-Forwarded: no
+From 125a19a5baa5995a27cbac6d7a9f7fba1ba0e93d Mon Sep 17 00:00:00 2001
+From: LM-G820N Developer <developer@lmg820n.invalid>
+Date: Sat, 24 Oct 2026 14:44:08 +0800
+Subject: [PATCH] 0011-support-ancillary-ois-lens
 
+
+diff --git a/include/libcamera/internal/camera_sensor.h b/include/libcamera/internal/camera_sensor.h
+index e6b72d2..cfb4d75 100644
 --- a/include/libcamera/internal/camera_sensor.h
 +++ b/include/libcamera/internal/camera_sensor.h
-@@ -48,6 +48,7 @@
+@@ -48,6 +48,7 @@ public:
  	virtual V4L2Subdevice *device() = 0;
  
  	virtual CameraLens *focusLens() = 0;
@@ -11,9 +16,43 @@ Forwarded: no
  
  	virtual const std::vector<unsigned int> &mbusCodes() const = 0;
  	virtual std::vector<Size> sizes(unsigned int mbusCode) const = 0;
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index e64b2b4..311a2b9 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -1889,6 +1889,13 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		return ret;
+ 	data->pushSensorControls();
+ 
++	V4L2Subdevice *ois = data->sensor_->ois();
++	if (ois) {
++		ControlList ctrls(ois->controls());
++		ctrls.set(V4L2_CID_IMAGE_STABILIZATION, 1);
++		ois->setControls(&ctrls);
++	}
++
+ 	if (data->afEnabled_ && data->afMode_ == controls::AfModeContinuous &&
+ 	    !data->afPaused_)
+ 		data->startAfScan(0);
+@@ -1920,6 +1927,13 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ {
+ 	QcomCameraData *data = cameraData(camera);
+ 
++	V4L2Subdevice *ois = data->sensor_->ois();
++	if (ois) {
++		ControlList ctrls(ois->controls());
++		ctrls.set(V4L2_CID_IMAGE_STABILIZATION, 0);
++		ois->setControls(&ctrls);
++	}
++
+ 	data->streaming_ = false;
+ 	data->video_->streamOff();
+ 	data->pix_->setFrameStartEnabled(false);
+diff --git a/src/libcamera/sensor/camera_sensor_legacy.cpp b/src/libcamera/sensor/camera_sensor_legacy.cpp
+index 6a68382..1fe3a55 100644
 --- a/src/libcamera/sensor/camera_sensor_legacy.cpp
 +++ b/src/libcamera/sensor/camera_sensor_legacy.cpp
-@@ -68,6 +68,7 @@
+@@ -68,6 +68,7 @@ public:
  	V4L2Subdevice *device() override { return subdev_.get(); }
  
  	CameraLens *focusLens() override { return focusLens_.get(); }
@@ -21,7 +60,7 @@ Forwarded: no
  
  	const std::vector<unsigned int> &mbusCodes() const override { return mbusCodes_; }
  	std::vector<Size> sizes(unsigned int mbusCode) const override;
-@@ -140,6 +141,7 @@
+@@ -140,6 +141,7 @@ private:
  	ControlList properties_;
  
  	std::unique_ptr<CameraLens> focusLens_;
@@ -29,7 +68,7 @@ Forwarded: no
  };
  
  /**
-@@ -656,15 +658,36 @@
+@@ -656,15 +658,36 @@ int CameraSensorLegacy::discoverAncillaryDevices()
  
  	for (MediaEntity *ancillary : entity_->ancillaryEntities()) {
  		switch (ancillary->function()) {
@@ -65,42 +104,11 @@ Forwarded: no
 +					break;
 +				}
  			}
--			break;
 +			LOG(CameraSensor, Info)
 +				<< "Ignoring unsupported lens ancillary entity "
 +				<< ancillary->name();
-+			break;
+ 			break;
 +		}
  
  		default:
  			LOG(CameraSensor, Warning)
---- a/src/libcamera/pipeline/qcom/qcom.cpp
-+++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -1915,6 +1915,13 @@
- 		return ret;
- 	data->pushSensorControls();
- 
-+	V4L2Subdevice *ois = data->sensor_->ois();
-+	if (ois) {
-+		ControlList ctrls(ois->controls());
-+		ctrls.set(V4L2_CID_IMAGE_STABILIZATION, 1);
-+		ois->setControls(&ctrls);
-+	}
-+
- 	if (data->afEnabled_ && data->afMode_ == controls::AfModeContinuous &&
- 	    !data->afPaused_)
- 		data->startAfScan(0);
-@@ -1945,6 +1952,13 @@
- void QcomPipelineHandler::stopDevice(Camera *camera)
- {
- 	QcomCameraData *data = cameraData(camera);
-+
-+	V4L2Subdevice *ois = data->sensor_->ois();
-+	if (ois) {
-+		ControlList ctrls(ois->controls());
-+		ctrls.set(V4L2_CID_IMAGE_STABILIZATION, 0);
-+		ois->setControls(&ctrls);
-+	}
- 
- 	data->streaming_ = false;
- 	data->video_->streamOff();

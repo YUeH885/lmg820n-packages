@@ -1,5 +1,8 @@
-Description: Support IMX363 rear camera in the native Qcom pipeline
-Forwarded: no
+From 218f7fc976915994160acc7a4674aae2b3ad5bed Mon Sep 17 00:00:00 2001
+From: LM-G820N Developer <developer@lmg820n.invalid>
+Date: Sat, 24 Oct 2026 14:44:08 +0800
+Subject: [PATCH] 0008-support-imx363-rear-camera
+
 
 diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
 index 7ae79c1..f4a2ae0 100644
@@ -25,7 +28,7 @@ index 7ae79c1..f4a2ae0 100644
  public:
 diff --git a/src/libcamera/pipeline/qcom/imx363_tuning.h b/src/libcamera/pipeline/qcom/imx363_tuning.h
 new file mode 100644
-index 0000000..922f3dc
+index 0000000..11a6d6e
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/imx363_tuning.h
 @@ -0,0 +1,50 @@
@@ -56,11 +59,11 @@ index 0000000..922f3dc
 +constexpr double kImx363AeToleranceSteps = 4.0;
 +
 +constexpr AeLuxZone kImx363AeLuxZones[] = {
-+	{ 0.0, 100.0, 42.0 },
-+	{ 166.0, 265.0, 40.0 },
-+	{ 290.0, 320.0, 35.0 },
-+	{ 362.0, 400.0, 26.0 },
-+	{ 450.0, 1000.0, 26.0 },
++	{ 0.0, 100.0, 85.0 },
++	{ 166.0, 265.0, 95.0 },
++	{ 290.0, 320.0, 105.0 },
++	{ 362.0, 400.0, 105.0 },
++	{ 450.0, 1000.0, 100.0 },
 +};
 +
 +constexpr AeExposureKnee kImx363AeExposureKnees[] = {
@@ -80,7 +83,7 @@ index 0000000..922f3dc
 +
 +} /* namespace libcamera::qcom */
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
-index f126865..6b55e91 100644
+index c9788c6..d794ea0 100644
 --- a/src/libcamera/pipeline/qcom/qcom.cpp
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
 @@ -58,6 +58,7 @@
@@ -359,7 +362,7 @@ index f126865..6b55e91 100644
  	{
  	}
  
-@@ -214,6 +442,7 @@ public:
+@@ -212,6 +440,7 @@ public:
  	std::unique_ptr<DelayedControls> delayedCtrls_;
  
  	std::shared_ptr<MediaDevice> media_;
@@ -367,7 +370,7 @@ index f126865..6b55e91 100644
  	std::vector<MediaEntity *> path_;
  	std::vector<MediaLink *> links_;
  	MediaEntity *pixEntity_ = nullptr;
-@@ -364,6 +593,7 @@ private:
+@@ -361,6 +590,7 @@ private:
  	}
  
  	std::shared_ptr<MediaDevice> media_;
@@ -375,7 +378,7 @@ index f126865..6b55e91 100644
  };
  
  CameraConfiguration::Status QcomCameraConfiguration::validate()
-@@ -543,10 +773,6 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+@@ -540,10 +770,6 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
  		return ret;
  	}
  
@@ -386,7 +389,7 @@ index f126865..6b55e91 100644
  	MediaEntity *videoEntity = nullptr;
  	for (const MediaPad *pad : pixEntity_->pads()) {
  		if (!(pad->flags() & MEDIA_PAD_FL_SOURCE))
-@@ -595,6 +821,10 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+@@ -592,6 +818,10 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
  	if (ret < 0)
  		return ret;
  
@@ -397,7 +400,7 @@ index f126865..6b55e91 100644
  	awb_ = std::vector<uint32_t>(QCOM_CAMSS_AWB_BG_REGIONS *
  				     QCOM_CAMSS_AWB_BG_REGION_SIZE / sizeof(uint32_t));
  	hist_ = std::vector<uint32_t>(QCOM_CAMSS_BHIST_BINS);
-@@ -633,7 +863,7 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+@@ -630,7 +860,7 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
  	if (lens_)
  		ctrls[&controls::LensPosition] = ControlInfo(
  			static_cast<float>(LgAfModel::kLensPositionMin),
@@ -406,7 +409,7 @@ index f126865..6b55e91 100644
  			static_cast<float>(lensPosition()));
  	ctrls[&controls::AfPause] = ControlInfo(
  		{ { ControlValue(controls::AfPauseImmediate),
-@@ -659,15 +889,18 @@ int QcomCameraData::refreshSensorInfo()
+@@ -656,15 +886,18 @@ int QcomCameraData::refreshSensorInfo()
  	const ControlInfoMap &controls = sensor_->controls();
  	exposureMin_ = controls.at(V4L2_CID_EXPOSURE).min().get<int32_t>();
  	exposureMax_ = controls.at(V4L2_CID_EXPOSURE).max().get<int32_t>();
@@ -428,7 +431,7 @@ index f126865..6b55e91 100644
  
  	if (!controlInfo_.empty()) {
  		ControlInfoMap::Map map;
-@@ -703,12 +936,16 @@ void QcomCameraData::frameStart(uint32_t sequence)
+@@ -700,12 +933,16 @@ void QcomCameraData::frameStart(uint32_t sequence)
  
  int QcomCameraData::setFormats(const Size &size)
  {
@@ -447,7 +450,7 @@ index f126865..6b55e91 100644
  	if (ret < 0)
  		return ret;
  
-@@ -788,7 +1025,7 @@ void QcomCameraData::pushSensorControls()
+@@ -785,7 +1022,7 @@ void QcomCameraData::pushSensorControls()
  	ControlList ctrls(sensor_->controls());
  	ctrls.set(V4L2_CID_EXPOSURE, static_cast<int32_t>(std::lround(aeExposure_)));
  	ctrls.set(V4L2_CID_ANALOGUE_GAIN,
@@ -456,7 +459,7 @@ index f126865..6b55e91 100644
  	delayedCtrls_->push(ctrls);
  }
  
-@@ -804,9 +1041,9 @@ void QcomCameraData::setManualAwb(double gainR, double gainB)
+@@ -801,9 +1038,9 @@ void QcomCameraData::setManualAwb(double gainR, double gainB)
  {
  	awbGainR_ = std::clamp(gainR, 0.25, 8.0);
  	awbGainB_ = std::clamp(gainB, 0.25, 8.0);
@@ -469,7 +472,7 @@ index f126865..6b55e91 100644
  	setIfeWb(awbGainR_, awbGainB_);
  }
  
-@@ -975,10 +1212,11 @@ std::optional<double> QcomCameraData::meteringLuma(bool applyWeights) const
+@@ -953,10 +1190,11 @@ std::optional<double> QcomCameraData::meteringLuma(bool applyWeights) const
  					}
  				}
  
@@ -483,7 +486,7 @@ index f126865..6b55e91 100644
  				sum += *luma * weight;
  				weights += weight;
  			}
-@@ -1017,20 +1255,21 @@ void QcomCameraData::updateAe(uint32_t sequence, double luma)
+@@ -995,26 +1233,27 @@ void QcomCameraData::updateAe(uint32_t sequence, double luma)
  	ControlList applied = delayedCtrls_->get(sequence);
  	double exposure = applied.get(V4L2_CID_EXPOSURE).get<int32_t>() *
  			  lineDurationNs_;
@@ -500,11 +503,17 @@ index f126865..6b55e91 100644
 +			       index * (1.0 - profile_.aeLuxFilterFactor) : index;
 +	double target = aeTargetForLux(profile_, *luxIndex_) * kAeTargetScale;
  
+ 	if (aeHoldFrames_ > 0) {
+ 		aeHoldFrames_--;
+ 		return;
+ 	}
+ 
 -	if (std::abs(luma - target) <= kAeTolerance)
 +	if (std::abs(luma - target) <= profile_.aeToleranceSteps * kAeTargetScale)
  		return;
  
  	double ratio = target / std::max(luma, 1.0);
+ 	ratio = std::clamp(ratio, 0.75, 1.33);
 -	double corrected = total * std::pow(ratio, kAeAggressiveness);
 +	double corrected = total * std::pow(ratio, profile_.aeAggressiveness);
  	double allocatedGain, allocatedExposure;
@@ -513,7 +522,7 @@ index f126865..6b55e91 100644
  
  	double exposureMinNs = exposureMin_ * lineDurationNs_;
  	double exposureMaxNs = exposureMax_ * lineDurationNs_;
-@@ -1051,9 +1290,9 @@ void QcomCameraData::updateAe(uint32_t sequence, double luma)
+@@ -1036,9 +1275,9 @@ void QcomCameraData::updateAe(uint32_t sequence, double luma)
  
  void QcomCameraData::updateCcm(double r, double g, double b)
  {
@@ -525,7 +534,7 @@ index f126865..6b55e91 100644
  
  	LOG(QcomPipeline, Debug) << "AWB CCT " << colourTemperature_
  				 << " CCM " << ccmQ7_[0] << " " << ccmQ7_[4]
-@@ -1107,10 +1346,10 @@ void QcomCameraData::updateAwb()
+@@ -1092,10 +1331,10 @@ void QcomCameraData::updateAwb()
  			[](uint64_t count) { return !count; }))
  		return;
  
@@ -540,7 +549,7 @@ index f126865..6b55e91 100644
  	double g = (gr + gb) * 0.5;
  
  	if (r <= 4.0 || b <= 4.0 || g <= 4.0)
-@@ -1427,7 +1666,8 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+@@ -1402,7 +1641,8 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
  
  	if (applied.contains(V4L2_CID_ANALOGUE_GAIN)) {
  		int32_t gain = applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
@@ -550,7 +559,7 @@ index f126865..6b55e91 100644
  	}
  
  	auto it = frameStates_.find(sequence);
-@@ -1520,6 +1760,9 @@ QcomPipelineHandler::generateConfiguration(Camera *camera,
+@@ -1495,6 +1735,9 @@ QcomPipelineHandler::generateConfiguration(Camera *camera,
  
  int QcomPipelineHandler::configure(Camera *camera, CameraConfiguration *config)
  {
@@ -560,7 +569,7 @@ index f126865..6b55e91 100644
  	QcomCameraData *data = cameraData(camera);
  	StreamConfiguration &cfg = config->at(0);
  	int ret;
-@@ -1544,6 +1787,9 @@ int QcomPipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
+@@ -1519,6 +1762,9 @@ int QcomPipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
  
  int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
  {
@@ -570,7 +579,7 @@ index f126865..6b55e91 100644
  	QcomCameraData *data = cameraData(camera);
  	int ret;
  
-@@ -1594,6 +1840,7 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+@@ -1569,6 +1815,7 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
  		data->video_->releaseBuffers();
  		return ret;
  	}
@@ -578,7 +587,7 @@ index f126865..6b55e91 100644
  
  	return 0;
  }
-@@ -1608,6 +1855,8 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+@@ -1583,6 +1830,8 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
  	data->video_->releaseBuffers();
  	data->delayedCtrls_->reset();
  	data->lastStatsSequence_ = UINT32_MAX;
@@ -587,7 +596,7 @@ index f126865..6b55e91 100644
  }
  
  int QcomPipelineHandler::queueRequestDevice(Camera *camera, Request *request)
-@@ -1636,32 +1885,41 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+@@ -1611,32 +1860,41 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
  	if (!media_)
  		return false;
  
@@ -607,34 +616,34 @@ index f126865..6b55e91 100644
 +			}
 +		}
 +		if (!profile)
- 			continue;
--		sensorEntity = entity;
--		break;
--	}
- 
--	if (!sensorEntity) {
--		LOG(QcomPipeline, Debug) << "No supported sensor found";
--		return false;
--	}
++			continue;
++
 +		auto data = std::make_unique<QcomCameraData>(this, media_, *profile);
 +		int ret = data->init(entity);
 +		if (ret < 0) {
 +			LOG(QcomPipeline, Error)
 +				<< "Failed to initialize " << entity->name() << ": " << ret;
-+			continue;
+ 			continue;
+-		sensorEntity = entity;
+-		break;
+-	}
 +		}
  
--	auto data = std::make_unique<QcomCameraData>(this, media_);
--	int ret = data->init(sensorEntity);
--	if (ret < 0)
+-	if (!sensorEntity) {
+-		LOG(QcomPipeline, Debug) << "No supported sensor found";
 -		return false;
 +		std::set<Stream *> streams{ &data->stream_ };
 +		std::shared_ptr<Camera> camera =
 +			Camera::create(std::move(data), entity->name(), streams);
 +		registerCamera(std::move(camera));
 +		registered++;
-+	}
+ 	}
  
+-	auto data = std::make_unique<QcomCameraData>(this, media_);
+-	int ret = data->init(sensorEntity);
+-	if (ret < 0)
+-		return false;
+-
 -	std::set<Stream *> streams{ &data->stream_ };
 -	std::shared_ptr<Camera> camera =
 -		Camera::create(std::move(data), sensorEntity->name(), streams);
@@ -648,10 +657,10 @@ index f126865..6b55e91 100644
  
  REGISTER_PIPELINE_HANDLER(QcomPipelineHandler, "qcom")
 diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
-index 3352f83..e057153 100644
+index 8021c35..8fe3774 100644
 --- a/src/libcamera/pipeline/qcom/s5k3m5.h
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
-@@ -236,9 +236,8 @@ class LgAfModel
+@@ -143,9 +143,8 @@ class LgAfModel
  {
  public:
  	static constexpr std::size_t kEepromOffset = 0x0a80;
@@ -662,7 +671,7 @@ index 3352f83..e057153 100644
  
  	static std::optional<LgAfModel>
  	fromEeprom(unsigned int cameraId,
-@@ -251,13 +250,16 @@ public:
+@@ -158,13 +157,16 @@ public:
  			return std::optional<LgAfModel>{};
  		};
  
@@ -683,7 +692,7 @@ index 3352f83..e057153 100644
  		if (storedChecksum != calculatedChecksum)
  			return fail("EEPROM AF checksum mismatch");
  
-@@ -269,19 +271,27 @@ public:
+@@ -176,19 +178,27 @@ public:
  		    macroQ < 0 || macroQ > 1023 || macroQ <= infinityQ)
  			return fail("invalid EEPROM AF endpoints");
  
@@ -717,7 +726,7 @@ index 3352f83..e057153 100644
  		int farTarget = model.positionForDistance(kFarDistanceMm);
  		int farMargin = static_cast<int>(
  			static_cast<float>(farTarget - model.nearPosition_) * 0.08f);
-@@ -289,18 +299,18 @@ public:
+@@ -196,18 +206,18 @@ public:
  
  		int span = macroQ - infinityQ;
  		model.coarseStepNormal_ = static_cast<unsigned int>(
@@ -741,7 +750,7 @@ index 3352f83..e057153 100644
  
  		return model;
  	}
-@@ -315,6 +325,7 @@ public:
+@@ -222,6 +232,7 @@ public:
  	int codeMin() const { return positionToCode(farPosition_); }
  	int codeMax() const { return positionToCode(nearPosition_); }
  	int infinityCode() const { return positionToCode(infinityPosition_); }
@@ -749,7 +758,7 @@ index 3352f83..e057153 100644
  	unsigned int nearStep() const { return 0; }
  	unsigned int farStep() const { return farPosition_ - nearPosition_; }
  	unsigned int stepCount() const { return farStep() + 1; }
-@@ -331,28 +342,28 @@ public:
+@@ -238,28 +249,28 @@ public:
  	{
  		int position = codeToPosition(std::clamp(code, codeMin(), codeMax()));
  		if (position <= nearPosition_)
@@ -785,7 +794,7 @@ index 3352f83..e057153 100644
  			return codeMax();
  
  		return positionToCode(positionForDistance(distance));
-@@ -372,10 +383,7 @@ public:
+@@ -279,10 +290,7 @@ public:
  	}
  
  private:
@@ -796,7 +805,7 @@ index 3352f83..e057153 100644
  
  	static int codeToPosition(int code)
  	{
-@@ -389,8 +397,8 @@ private:
+@@ -296,8 +304,8 @@ private:
  
  	int positionForDistance(double distance) const
  	{
@@ -807,7 +816,7 @@ index 3352f83..e057153 100644
  		return std::clamp(static_cast<int>(
  			infinityPosition_ -
  			(infinityPosition_ - macroPosition_) * ratio),
-@@ -401,6 +409,9 @@ private:
+@@ -308,6 +316,9 @@ private:
  	uint16_t checksum_ = 0;
  	int rawInfinityDac_ = 0;
  	int rawMacroDac_ = 0;

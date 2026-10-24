@@ -1,5 +1,8 @@
-Description: Add native CAMSS IFE pipeline with hardware 3A and frame state tracking
-Forwarded: no
+From 898eadaeda2663880e4b794bd0dceb21fbe4966c Mon Sep 17 00:00:00 2001
+From: LM-G820N Developer <developer@lmg820n.invalid>
+Date: Sat, 24 Oct 2026 14:44:08 +0800
+Subject: [PATCH] 0007-add-native-qcom-pipeline
+
 
 diff --git a/include/libcamera/internal/v4l2_device.h b/include/libcamera/internal/v4l2_device.h
 index 8c4c59b..3f72b34 100644
@@ -60,10 +63,10 @@ index 0000000..58b6f69
 +])
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
 new file mode 100644
-index 0000000..f126865
+index 0000000..c9788c6
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1669 @@
+@@ -0,0 +1,1644 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -267,8 +270,6 @@ index 0000000..f126865
 +	void pushSensorControls();
 +	int setLensPosition(int position);
 +	void startAfMove(int step);
-+	bool advanceAfMove(uint64_t timestamp);
-+	void cancelAfMove();
 +	void startAfScan(uint64_t timestamp);
 +	double lensPosition() const;
 +	int lensPositionToCode(double position) const;
@@ -327,6 +328,7 @@ index 0000000..f126865
 +	bool aeEnabled_ = true;
 +	double aeExposure_ = 1000.0;
 +	double aeGain_ = 1.0;
++	unsigned int aeHoldFrames_ = 0;
 +	std::optional<double> luxIndex_;
 +	std::optional<double> aecLuma_;
 +
@@ -361,8 +363,6 @@ index 0000000..f126865
 +	int afOriginalPosition_ = 0;
 +	int afBestStep_ = 0;
 +	int afFineEndStep_ = 0;
-+	LgAfMovePlan afMovePlan_;
-+	std::size_t afMoveIndex_ = 0;
 +	double afBestScore_ = -1.0;
 +	double afMinScore_ = 0.0;
 +	LgAfCoarseStop afCoarseStop_;
@@ -938,28 +938,9 @@ index 0000000..f126865
 +
 +void QcomCameraData::startAfMove(int step)
 +{
-+	int current = afModel_->afCodeToStep(afPosition_);
 +	step = std::clamp<int>(step, afModel_->nearStep(), afModel_->farStep());
-+	afMovePlan_ = lgAfMovePlan(current, step);
-+	afMoveIndex_ = 1;
-+	setLensPosition(afModel_->afStepToCode(afMovePlan_.targets[0]));
-+}
-+
-+bool QcomCameraData::advanceAfMove(uint64_t timestamp)
-+{
-+	if (afMoveIndex_ >= afMovePlan_.count)
-+		return false;
-+
-+	setLensPosition(afModel_->afStepToCode(
-+		afMovePlan_.targets[afMoveIndex_++]));
-+	afNextEval_ = timestamp + kAfSettleNs;
-+	return true;
-+}
-+
-+void QcomCameraData::cancelAfMove()
-+{
-+	afMovePlan_.count = 0;
-+	afMoveIndex_ = 0;
++	afStep_ = step;
++	setLensPosition(afModel_->afStepToCode(step));
 +}
 +
 +double QcomCameraData::lensPosition() const
@@ -1090,10 +1071,16 @@ index 0000000..f126865
 +			       index * (1.0 - kAeLuxFilterFactor) : index;
 +	double target = aeTargetForLux(*luxIndex_) * kAeTargetScale;
 +
++	if (aeHoldFrames_ > 0) {
++		aeHoldFrames_--;
++		return;
++	}
++
 +	if (std::abs(luma - target) <= kAeTolerance)
 +		return;
 +
 +	double ratio = target / std::max(luma, 1.0);
++	ratio = std::clamp(ratio, 0.75, 1.33);
 +	double corrected = total * std::pow(ratio, kAeAggressiveness);
 +	double allocatedGain, allocatedExposure;
 +	aeAllocateExposure(corrected, allocatedGain, allocatedExposure);
@@ -1109,6 +1096,7 @@ index 0000000..f126865
 +	aeExposure_ = allocatedExposure / lineDurationNs_;
 +	aeGain_ = allocatedGain;
 +	pushSensorControls();
++	aeHoldFrames_ = 2;
 +
 +	LOG(QcomPipeline, Debug) << "AE luma " << luma << " target " << target
 +				 << " index " << *luxIndex_ << " exposure "
@@ -1212,7 +1200,6 @@ index 0000000..f126865
 +	if (!afEnabled_)
 +		return;
 +
-+	cancelAfMove();
 +	afOriginalPosition_ = afPosition_;
 +	afBestStep_ = afModel_->afCodeToStep(afPosition_);
 +	afBestScore_ = -1.0;
@@ -1284,8 +1271,6 @@ index 0000000..f126865
 +
 +	if (timestamp < std::max(afNextEval_, lensReadyTimestamp()))
 +		return;
-+	if (advanceAfMove(timestamp))
-+		return;
 +
 +	double score = focusScore();
 +
@@ -1314,14 +1299,9 @@ index 0000000..f126865
 +		bool slopeStopped = afCoarseStop_.update(score, afLowLight_);
 +		if (slopeStopped)
 +			LOG(QcomPipeline, Debug)
-+				<< "AF coarse search stopped after "
-+				<< afCoarseStop_.downCount() << " down and "
-+				<< afCoarseStop_.upCount()
-+				<< " up samples, focus range "
-+				<< afCoarseStop_.focusRange() << ", rise "
-+				<< afCoarseStop_.maximumRise() << ", reversals "
-+				<< afCoarseStop_.reversalCount() << " in "
-+				<< afCoarseStop_.sampleCount() << " samples";
++				<< "AF coarse peak passed: "
++				<< afCoarseStop_.downCount() << " down samples in "
++				<< afCoarseStop_.sampleCount() << " total samples";
 +		if (slopeStopped ||
 +		    afStep_ == static_cast<int>(afModel_->nearStep())) {
 +			int range = afModel_->coarseStep(afLowLight_);
@@ -1357,7 +1337,7 @@ index 0000000..f126865
 +
 +	if (afStage_ == AfStage::Confirm) {
 +		completeAfScan(afBestScore_ > afMinScore_ * 1.10 &&
-+			       score > 0.0 && score >= afBestScore_ * 0.70);
++			       score > 0.0 && score >= afBestScore_ * 0.60);
 +		return;
 +	}
 +
@@ -1421,7 +1401,6 @@ index 0000000..f126865
 +	if (controls.contains(controls::AfMode.id())) {
 +		int mode = *controls.get(controls::AfMode);
 +		if (mode != afMode_) {
-+			cancelAfMove();
 +			afSceneChange_.reset();
 +			afMode_ = mode;
 +			afPaused_ = false;
@@ -1436,7 +1415,6 @@ index 0000000..f126865
 +
 +	if (afMode_ == controls::AfModeManual && lens_ &&
 +	    controls.contains(controls::LensPosition.id())) {
-+		cancelAfMove();
 +		double position = *controls.get(controls::LensPosition);
 +		int ret = setLensPosition(lensPositionToCode(position));
 +		if (ret)
@@ -1624,7 +1602,7 @@ index 0000000..f126865
 +	data->streaming_ = false;
 +	data->ifePending_ = true;
 +	data->afSceneChange_.reset();
-+	data->cancelAfMove();
++	data->aeHoldFrames_ = 0;
 +	if (data->afEnabled_)
 +		data->setLensPosition(data->afPosition_);
 +
@@ -1804,10 +1782,10 @@ index 0000000..15d7ac4
 +#endif /* __LIBCAMERA_QCOM_CAMSS_H__ */
 diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
 new file mode 100644
-index 0000000..8d42693
+index 0000000..8021c35
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,453 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +#pragma once
 +
@@ -1852,135 +1830,49 @@ index 0000000..8d42693
 +	return luma10 < kLgAfLowLightLuma8 * kAeTargetScale;
 +}
 +
-+struct LgAfMovePlan {
-+	std::array<int, 4> targets{};
-+	std::size_t count = 0;
-+};
-+
-+inline LgAfMovePlan lgAfMovePlan(int current, int target)
-+{
-+	constexpr int kSegmentThreshold = 75;
-+
-+	LgAfMovePlan plan;
-+	int distance = std::abs(target - current);
-+	if (distance < kSegmentThreshold) {
-+		plan.targets[0] = target;
-+		plan.count = 1;
-+		return plan;
-+	}
-+
-+	/* The factory completion path submits three intermediate positions. */
-+	int increment = distance / 5 + 1;
-+	if (target < current)
-+		increment = -increment;
-+
-+	for (unsigned int i = 0; i < 3; i++)
-+		plan.targets[i] = current + increment * (i + 1);
-+	plan.targets[3] = target;
-+	plan.count = plan.targets.size();
-+	return plan;
-+}
-+
 +class LgAfCoarseStop
 +{
 +public:
 +	void reset()
 +	{
-+		previousScore_.reset();
-+		previousFocus_.reset();
-+		riseStartFocus_.reset();
-+		minimumScore_.reset();
-+		maximumScore_.reset();
-+		maximumRise_ = 0.0;
-+		upCount_ = 0;
++		previousScore_ = 0.0;
++		peakScore_ = 0.0;
 +		downCount_ = 0;
 +		sampleCount_ = 0;
-+		reversalCount_ = 0;
-+		focusRangeStop_ = false;
-+		flatRiseStop_ = false;
-+		oscillationStop_ = false;
 +	}
 +
-+	bool update(double score, bool lowLight)
++	bool update(double score, [[maybe_unused]] bool lowLight)
 +	{
 +		sampleCount_++;
-+		uint64_t focus =
-+			static_cast<uint64_t>(static_cast<float>(score)) >> 4;
-+		minimumScore_ = minimumScore_
-+			? std::min(*minimumScore_, focus) : focus;
-+		maximumScore_ = maximumScore_
-+			? std::max(*maximumScore_, focus) : focus;
-+		if (previousScore_) {
-+			if (score > *previousScore_) {
-+				if (!upCount_)
-+					riseStartFocus_ = previousFocus_;
-+				if (downCount_)
-+					reversalCount_++;
-+				upCount_++;
-+				downCount_ = 0;
-+				double rise = static_cast<double>(focus - *riseStartFocus_) /
-+					std::max<uint64_t>(focus, 1);
-+				maximumRise_ = std::max(maximumRise_, rise);
-+			} else {
-+				if (upCount_)
-+					reversalCount_++;
-+				downCount_++;
-+				upCount_ = 0;
-+			}
++		if (score > peakScore_) {
++			peakScore_ = score;
++			downCount_ = 0;
++		} else if (score < previousScore_) {
++			downCount_++;
 +		}
 +		previousScore_ = score;
-+		previousFocus_ = focus;
 +
-+		focusRangeStop_ = false;
-+		flatRiseStop_ = false;
-+		oscillationStop_ = false;
-+		if (downCount_ >= (lowLight ? 3U : 4U))
-+			return true;
-+		if (downCount_ > 2 && focusRange() > 0.1) {
-+			focusRangeStop_ = true;
-+			return true;
++		/*
++		 * A coarse peak is confirmed passed when the score drops consecutively
++		 * and drops by at least 15% from the observed peak.
++		 */
++		if (peakScore_ > 0.0 && downCount_ >= 2) {
++			double dropRatio = (peakScore_ - score) / peakScore_;
++			if (dropRatio >= 0.15)
++				return true;
 +		}
-+		if (upCount_ > 2 && maximumRise_ < 0.01) {
-+			flatRiseStop_ = true;
-+			return true;
-+		}
-+		if (sampleCount_ >= 9 && reversalCount_ >= 6) {
-+			oscillationStop_ = true;
-+			return true;
-+		}
++
 +		return false;
 +	}
 +
-+	unsigned int upCount() const { return upCount_; }
 +	unsigned int downCount() const { return downCount_; }
 +	unsigned int sampleCount() const { return sampleCount_; }
-+	unsigned int reversalCount() const { return reversalCount_; }
-+	double maximumRise() const { return maximumRise_; }
-+	double focusRange() const
-+	{
-+		if (!minimumScore_ || !maximumScore_)
-+			return 0.0;
-+		return static_cast<double>(*maximumScore_ - *minimumScore_) /
-+			std::max<uint64_t>(*maximumScore_, 1);
-+	}
-+	bool focusRangeStop() const { return focusRangeStop_; }
-+	bool flatRiseStop() const { return flatRiseStop_; }
-+	bool oscillationStop() const { return oscillationStop_; }
 +
 +private:
-+	std::optional<double> previousScore_;
-+	std::optional<uint64_t> previousFocus_;
-+	std::optional<uint64_t> riseStartFocus_;
-+	std::optional<uint64_t> minimumScore_;
-+	std::optional<uint64_t> maximumScore_;
-+	double maximumRise_ = 0.0;
-+	unsigned int upCount_ = 0;
++	double previousScore_ = 0.0;
++	double peakScore_ = 0.0;
 +	unsigned int downCount_ = 0;
 +	unsigned int sampleCount_ = 0;
-+	unsigned int reversalCount_ = 0;
-+	bool focusRangeStop_ = false;
-+	bool flatRiseStop_ = false;
-+	bool oscillationStop_ = false;
 +};
 +
 +class LgAfSceneChange
@@ -1988,32 +1880,23 @@ index 0000000..8d42693
 +public:
 +	void reset()
 +	{
-+		previousScore_.reset();
++		previousScore_ = 0.0;
 +		unstable_ = false;
 +		stableCount_ = 0;
 +	}
 +
 +	bool update(double score)
 +	{
-+		uint64_t current =
-+			static_cast<uint64_t>(static_cast<float>(score)) >> 4;
-+		if (!previousScore_) {
-+			previousScore_ = current;
++		if (previousScore_ <= 0.0) {
++			previousScore_ = score;
 +			return false;
 +		}
 +
-+		uint64_t previous = *previousScore_;
-+		previousScore_ = current;
-+		uint64_t maximum = std::max(current, previous);
-+		if (!maximum) {
-+			stableCount_ = 0;
-+			return false;
-+		}
++		double change = std::abs(score - previousScore_) /
++				std::max(score, previousScore_);
++		previousScore_ = score;
 +
-+		double change = static_cast<double>(
-+			current > previous ? current - previous : previous - current) /
-+			maximum;
-+		if (change > 0.5) {
++		if (change > 0.40) {
 +			unstable_ = true;
 +			stableCount_ = 0;
 +			return false;
@@ -2021,23 +1904,25 @@ index 0000000..8d42693
 +
 +		if (!unstable_)
 +			return false;
-+		if (change >= 0.1) {
++
++		if (change < 0.10) {
++			if (++stableCount_ >= 3) {
++				unstable_ = false;
++				stableCount_ = 0;
++				return true;
++			}
++		} else {
 +			stableCount_ = 0;
-+			return false;
 +		}
 +
-+		if (++stableCount_ < 4)
-+			return false;
-+		unstable_ = false;
-+		stableCount_ = 0;
-+		return true;
++		return false;
 +	}
 +
 +	bool unstable() const { return unstable_; }
 +	unsigned int stableCount() const { return stableCount_; }
 +
 +private:
-+	std::optional<uint64_t> previousScore_;
++	double previousScore_ = 0.0;
 +	bool unstable_ = false;
 +	unsigned int stableCount_ = 0;
 +};
@@ -2356,7 +2241,7 @@ index 0000000..8d42693
 +} /* namespace libcamera::qcom */
 diff --git a/src/libcamera/pipeline/qcom/s5k3m5_tuning.h b/src/libcamera/pipeline/qcom/s5k3m5_tuning.h
 new file mode 100644
-index 0000000..2facb50
+index 0000000..1b28251
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5_tuning.h
 @@ -0,0 +1,94 @@
@@ -2411,11 +2296,11 @@ index 0000000..2facb50
 +	double target8;
 +};
 +constexpr AeLuxZone kAeLuxZones[] = {
-+	{ 0.0, 120.0, 40.0 },
-+	{ 200.0, 240.0, 37.5 },
-+	{ 300.0, 340.0, 35.0 },
-+	{ 380.0, 420.0, 28.0 },
-+	{ 450.0, 1000.0, 26.0 }
++	{ 0.0, 120.0, 85.0 },
++	{ 200.0, 240.0, 95.0 },
++	{ 300.0, 340.0, 105.0 },
++	{ 380.0, 420.0, 105.0 },
++	{ 450.0, 1000.0, 100.0 }
 +};
 +struct AeExposureKnee {
 +	double gain;
