@@ -1,8 +1,23 @@
-From 898eadaeda2663880e4b794bd0dceb21fbe4966c Mon Sep 17 00:00:00 2001
-From: LM-G820N Developer <developer@lmg820n.invalid>
-Date: Sat, 24 Oct 2026 14:44:08 +0800
-Subject: [PATCH] 0007-add-native-qcom-pipeline
+From e5f96e2030a6d59e79f893545616e65ea5f15b9d Mon Sep 17 00:00:00 2001
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Date: Sat, 24 Oct 2026 15:38:33 +0800
+Subject: [PATCH 1/5] 0007-add-native-qcom-pipeline
 
+---
+ include/libcamera/internal/v4l2_device.h    |    4 +-
+ meson.build                                 |    1 +
+ meson_options.txt                           |    1 +
+ src/libcamera/pipeline/qcom/meson.build     |    5 +
+ src/libcamera/pipeline/qcom/qcom.cpp        | 1659 +++++++++++++++++++
+ src/libcamera/pipeline/qcom/qcom_camss.h    |   63 +
+ src/libcamera/pipeline/qcom/s5k3m5.h        |  453 +++++
+ src/libcamera/pipeline/qcom/s5k3m5_tuning.h |   94 ++
+ 8 files changed, 2278 insertions(+), 2 deletions(-)
+ create mode 100644 src/libcamera/pipeline/qcom/meson.build
+ create mode 100644 src/libcamera/pipeline/qcom/qcom.cpp
+ create mode 100644 src/libcamera/pipeline/qcom/qcom_camss.h
+ create mode 100644 src/libcamera/pipeline/qcom/s5k3m5.h
+ create mode 100644 src/libcamera/pipeline/qcom/s5k3m5_tuning.h
 
 diff --git a/include/libcamera/internal/v4l2_device.h b/include/libcamera/internal/v4l2_device.h
 index 8c4c59b..3f72b34 100644
@@ -63,10 +78,10 @@ index 0000000..58b6f69
 +])
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
 new file mode 100644
-index 0000000..c9788c6
+index 0000000..e0bfdde
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -0,0 +1,1644 @@
+@@ -0,0 +1,1659 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the Qualcomm CAMSS IFE PIX path.
@@ -368,6 +383,7 @@ index 0000000..c9788c6
 +	LgAfCoarseStop afCoarseStop_;
 +	LgAfSceneChange afSceneChange_;
 +	uint64_t afNextEval_ = 0;
++	uint64_t afCooldownNs_ = 0;
 +
 +private:
 +	int findPath(MediaEntity *sensor, MediaEntity *target);
@@ -382,7 +398,7 @@ index 0000000..c9788c6
 +	void updateCcm(double r, double g, double b);
 +	void updateAf(uint64_t timestamp);
 +	void setAfStage(AfStage stage);
-+	void completeAfScan(bool success);
++	void completeAfScan(bool success, uint64_t timestamp);
 +	double focusScore() const;
 +	void updateMetadata(Request *request, uint32_t sequence);
 +	uint64_t lensReadyTimestamp() const;
@@ -1076,12 +1092,14 @@ index 0000000..c9788c6
 +		return;
 +	}
 +
-+	if (std::abs(luma - target) <= kAeTolerance)
++	double tolerance = std::max(kAeTolerance, target * 0.08);
++	if (std::abs(luma - target) <= tolerance)
 +		return;
 +
 +	double ratio = target / std::max(luma, 1.0);
-+	ratio = std::clamp(ratio, 0.75, 1.33);
-+	double corrected = total * std::pow(ratio, kAeAggressiveness);
++	ratio = std::clamp(ratio, 0.50, 2.00);
++	double stepRatio = std::pow(ratio, kAeAggressiveness * 0.65);
++	double corrected = total * stepRatio;
 +	double allocatedGain, allocatedExposure;
 +	aeAllocateExposure(corrected, allocatedGain, allocatedExposure);
 +
@@ -1096,7 +1114,7 @@ index 0000000..c9788c6
 +	aeExposure_ = allocatedExposure / lineDurationNs_;
 +	aeGain_ = allocatedGain;
 +	pushSensorControls();
-+	aeHoldFrames_ = 2;
++	aeHoldFrames_ = 4;
 +
 +	LOG(QcomPipeline, Debug) << "AE luma " << luma << " target " << target
 +				 << " index " << *luxIndex_ << " exposure "
@@ -1212,8 +1230,10 @@ index 0000000..c9788c6
 +	LOG(QcomPipeline, Debug) << "AF scan started at code " << afOriginalPosition_;
 +}
 +
-+void QcomCameraData::completeAfScan(bool success)
++void QcomCameraData::completeAfScan(bool success, uint64_t timestamp)
 +{
++	afCooldownNs_ = timestamp + (success ? 2000ULL * 1000 * 1000 : 3000ULL * 1000 * 1000);
++
 +	if (success) {
 +		afStep_ = afBestStep_;
 +		setAfStage(AfStage::Idle);
@@ -1254,6 +1274,8 @@ index 0000000..c9788c6
 +	}
 +
 +	if (afStage_ == AfStage::Idle) {
++		if (timestamp < afCooldownNs_)
++			return;
 +		if (afMode_ == controls::AfModeContinuous && !afPaused_) {
 +			if (afSceneChange_.update(focusScore())) {
 +				LOG(QcomPipeline, Debug)
@@ -1337,11 +1359,14 @@ index 0000000..c9788c6
 +
 +	if (afStage_ == AfStage::Confirm) {
 +		completeAfScan(afBestScore_ > afMinScore_ * 1.10 &&
-+			       score > 0.0 && score >= afBestScore_ * 0.60);
++			       score > 0.0 && score >= afBestScore_ * 0.60,
++			       timestamp);
 +		return;
 +	}
 +
 +	if (afStage_ == AfStage::Restore) {
++		if (timestamp < std::max(afNextEval_, lensReadyTimestamp()))
++			return;
 +		afSceneChange_.reset();
 +		setAfStage(AfStage::Idle);
 +		if (afDeferredPause_) {
@@ -1349,6 +1374,7 @@ index 0000000..c9788c6
 +			afDeferredPause_ = false;
 +			afPauseState_ = controls::AfPauseStatePaused;
 +		}
++		return;
 +	}
 +}
 +
@@ -1407,6 +1433,7 @@ index 0000000..c9788c6
 +			afDeferredPause_ = false;
 +			afPauseState_ = controls::AfPauseStateRunning;
 +			afState_ = controls::AfStateIdle;
++			afCooldownNs_ = 0;
 +			setAfStage(AfStage::Idle);
 +			if (afMode_ == controls::AfModeContinuous)
 +				startAfScan(statsTimestamp_);
@@ -1425,8 +1452,10 @@ index 0000000..c9788c6
 +	    controls.contains(controls::AfTrigger.id())) {
 +		int trigger = *controls.get(controls::AfTrigger);
 +		if (trigger == controls::AfTriggerStart &&
-+		    afStage_ == AfStage::Idle)
++		    afStage_ == AfStage::Idle) {
++			afCooldownNs_ = 0;
 +			startAfScan(statsTimestamp_);
++		}
 +		else if (trigger == controls::AfTriggerCancel) {
 +			afState_ = controls::AfStateIdle;
 +			setAfStage(AfStage::Restore);
@@ -1602,6 +1631,7 @@ index 0000000..c9788c6
 +	data->streaming_ = false;
 +	data->ifePending_ = true;
 +	data->afSceneChange_.reset();
++	data->afCooldownNs_ = 0;
 +	data->aeHoldFrames_ = 0;
 +	if (data->afEnabled_)
 +		data->setLensPosition(data->afPosition_);
@@ -1782,7 +1812,7 @@ index 0000000..15d7ac4
 +#endif /* __LIBCAMERA_QCOM_CAMSS_H__ */
 diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
 new file mode 100644
-index 0000000..8021c35
+index 0000000..828f0ab
 --- /dev/null
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
 @@ -0,0 +1,453 @@
@@ -1906,7 +1936,7 @@ index 0000000..8021c35
 +			return false;
 +
 +		if (change < 0.10) {
-+			if (++stableCount_ >= 3) {
++			if (++stableCount_ >= 4) {
 +				unstable_ = false;
 +				stableCount_ = 0;
 +				return true;
@@ -2339,3 +2369,6 @@ index 0000000..1b28251
 +	{ 0.035500, 0.044400, 0.071500, 0.105500, 0.142800, 0.177300, 0.201800, 0.210700, 0.210700, 0.201800, 0.177300, 0.142800, 0.105500, 0.071500, 0.044400, 0.035500 },
 +	{ 0.028400, 0.035500, 0.057200, 0.084400, 0.114200, 0.141800, 0.161500, 0.168600, 0.168600, 0.161500, 0.141800, 0.114200, 0.084400, 0.057200, 0.035500, 0.028400 }
 +};
+-- 
+2.55.0
+

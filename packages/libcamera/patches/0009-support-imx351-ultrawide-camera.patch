@@ -1,8 +1,15 @@
-From bd321ff63ade575173ba92f4d114ad01b22d8e26 Mon Sep 17 00:00:00 2001
-From: LM-G820N Developer <developer@lmg820n.invalid>
-Date: Sat, 24 Oct 2026 14:44:08 +0800
-Subject: [PATCH] 0009-support-imx351-ultrawide-camera
+From 11352f64a02ec2ed4eb4b88defc15bceb12f4253 Mon Sep 17 00:00:00 2001
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Date: Sat, 24 Oct 2026 15:38:33 +0800
+Subject: [PATCH 3/5] 0009-support-imx351-ultrawide-camera
 
+---
+ src/ipa/libipa/camera_sensor_helper.cpp       |  11 ++
+ src/libcamera/pipeline/qcom/imx351_tuning.h   |  69 +++++++++
+ src/libcamera/pipeline/qcom/qcom.cpp          | 132 ++++++++++++------
+ .../sensor/camera_sensor_properties.cpp       |  11 ++
+ 4 files changed, 180 insertions(+), 43 deletions(-)
+ create mode 100644 src/libcamera/pipeline/qcom/imx351_tuning.h
 
 diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
 index f4a2ae0..d7a39e6 100644
@@ -102,7 +109,7 @@ index 0000000..a246e19
 +
 +} /* namespace libcamera::qcom */
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
-index d794ea0..e7906ff 100644
+index d42188c..36e810d 100644
 --- a/src/libcamera/pipeline/qcom/qcom.cpp
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
 @@ -58,6 +58,7 @@
@@ -176,7 +183,7 @@ index d794ea0..e7906ff 100644
  double gainFromCode(const SensorProfile &profile, int32_t code)
  {
  	if (profile.gainModel == GainModel::Linear32)
-@@ -615,7 +651,8 @@ CameraConfiguration::Status QcomCameraConfiguration::validate()
+@@ -616,7 +652,8 @@ CameraConfiguration::Status QcomCameraConfiguration::validate()
  
  	bool sizeSupported = false;
  	for (const Size &size : kOutputSizes)
@@ -186,7 +193,7 @@ index d794ea0..e7906ff 100644
  			sizeSupported = true;
  
  	if (!sizeSupported) {
-@@ -742,21 +779,25 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+@@ -743,21 +780,25 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
  	if (!sensor_)
  		return -ENODEV;
  
@@ -227,7 +234,7 @@ index d794ea0..e7906ff 100644
  
  	pixEntity_ = media_->getEntityByName("msm_vfe0_pix");
  	if (!pixEntity_) {
-@@ -827,8 +868,6 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+@@ -828,8 +869,6 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
  	hist_ = std::vector<uint32_t>(QCOM_CAMSS_BHIST_BINS);
  	bf_ = std::vector<uint64_t>(QCOM_CAMSS_BF_SIZE / sizeof(uint64_t));
  
@@ -236,7 +243,7 @@ index d794ea0..e7906ff 100644
  	if (lens_) {
  		int32_t position = 0;
  		if (!lens_->getFocusPosition(&position)) {
-@@ -851,22 +890,23 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+@@ -852,22 +891,23 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
  		static_cast<float>(aeGain_));
  	ctrls[&controls::AwbEnable] = ControlInfo(false, true, true);
  	ctrls[&controls::ColourGains] = ControlInfo(0.0f, 8.0f, 1.0f);
@@ -272,7 +279,7 @@ index d794ea0..e7906ff 100644
  
  	controlInfo_ = ControlInfoMap(std::move(ctrls), controls::controls);
  	properties_ = sensor_->properties();
-@@ -919,7 +959,8 @@ void QcomCameraData::frameStart(uint32_t sequence)
+@@ -920,7 +960,8 @@ void QcomCameraData::frameStart(uint32_t sequence)
  		appliedIfe_ = nextIfe_->second;
  		nextIfe_.reset();
  	}
@@ -282,7 +289,7 @@ index d794ea0..e7906ff 100644
  				   afMode_, afState_, afPauseState_, awbEnabled_ };
  	while (frameStates_.size() > 64)
  		frameStates_.erase(frameStates_.begin());
-@@ -937,7 +978,8 @@ int QcomCameraData::setFormats(const Size &size)
+@@ -938,7 +979,8 @@ int QcomCameraData::setFormats(const Size &size)
  	if (ret < 0)
  		return ret;
  
@@ -292,7 +299,7 @@ index d794ea0..e7906ff 100644
  	V4L2SubdeviceFormat format;
  	format.code = profile_.mediaBusCode;
  	format.size = inputSize;
-@@ -1090,7 +1132,7 @@ int QcomCameraData::applyIfe(uint32_t sequence)
+@@ -1091,7 +1133,7 @@ int QcomCameraData::applyIfe(uint32_t sequence)
  
  int QcomCameraData::setLensPosition(int position)
  {
@@ -301,7 +308,7 @@ index d794ea0..e7906ff 100644
  		return -ENODEV;
  
  	position = std::clamp(position, afModel_->codeMin(), afModel_->codeMax());
-@@ -1568,7 +1610,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+@@ -1580,7 +1622,7 @@ int QcomCameraData::processControls(const ControlList &controls)
  		setManualAwb(gains[0], gains[1]);
  	}
  
@@ -310,7 +317,7 @@ index d794ea0..e7906ff 100644
  		int mode = *controls.get(controls::AfMode);
  		if (mode != afMode_) {
  			afSceneChange_.reset();
-@@ -1583,7 +1625,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+@@ -1596,7 +1638,7 @@ int QcomCameraData::processControls(const ControlList &controls)
  		}
  	}
  
@@ -319,7 +326,7 @@ index d794ea0..e7906ff 100644
  	    controls.contains(controls::LensPosition.id())) {
  		double position = *controls.get(controls::LensPosition);
  		int ret = setLensPosition(lensPositionToCode(position));
-@@ -1591,7 +1633,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+@@ -1604,7 +1646,7 @@ int QcomCameraData::processControls(const ControlList &controls)
  			return ret;
  	}
  
@@ -328,7 +335,7 @@ index d794ea0..e7906ff 100644
  	    controls.contains(controls::AfTrigger.id())) {
  		int trigger = *controls.get(controls::AfTrigger);
  		if (trigger == controls::AfTriggerStart &&
-@@ -1605,7 +1647,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+@@ -1620,7 +1662,7 @@ int QcomCameraData::processControls(const ControlList &controls)
  		}
  	}
  
@@ -337,7 +344,7 @@ index d794ea0..e7906ff 100644
  	    controls.contains(controls::AfPause.id())) {
  		int pause = *controls.get(controls::AfPause);
  		if (pause == controls::AfPauseResume) {
-@@ -1659,11 +1701,12 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+@@ -1674,11 +1716,12 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
  	metadata.set(controls::ColourCorrectionMatrix,
  		     Span<const float, 9>(state.ife.ccm));
  	metadata.set(controls::AwbEnable, state.awbEnabled);
@@ -354,7 +361,7 @@ index d794ea0..e7906ff 100644
  	if (lastStatsSequence_ != UINT32_MAX &&
  	    qcom::inputSequence(lastStatsSequence_) == sequence)
  		metadata.set(controls::FocusFoM,
-@@ -1717,8 +1760,11 @@ QcomPipelineHandler::generateConfiguration(Camera *camera,
+@@ -1732,8 +1775,11 @@ QcomPipelineHandler::generateConfiguration(Camera *camera,
  
  	std::map<PixelFormat, std::vector<SizeRange>> formats;
  	std::vector<SizeRange> sizes;
@@ -367,7 +374,7 @@ index d794ea0..e7906ff 100644
  	formats[formats::NV12] = std::move(sizes);
  
  	StreamConfiguration cfg(formats);
-@@ -1867,7 +1913,7 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+@@ -1883,7 +1929,7 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
  
  		const SensorProfile *profile = nullptr;
  		for (const SensorProfile *candidate :
@@ -398,3 +405,6 @@ index 74e64c7..8ed8214 100644
  		{ "imx363", {
  			.unitCellSize = { 1400, 1400 },
  			.testPatternModes = {},
+-- 
+2.55.0
+

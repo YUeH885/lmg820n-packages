@@ -1,8 +1,13 @@
-From 125a19a5baa5995a27cbac6d7a9f7fba1ba0e93d Mon Sep 17 00:00:00 2001
-From: LM-G820N Developer <developer@lmg820n.invalid>
-Date: Sat, 24 Oct 2026 14:44:08 +0800
-Subject: [PATCH] 0011-support-ancillary-ois-lens
+From 2023a8966f8a5ecd151f6f2245adb33fa57381fb Mon Sep 17 00:00:00 2001
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Date: Sat, 24 Oct 2026 15:38:33 +0800
+Subject: [PATCH 5/5] 0011-support-ancillary-ois-lens
 
+---
+ include/libcamera/internal/camera_sensor.h    |  1 +
+ src/libcamera/pipeline/qcom/qcom.cpp          | 14 +++++++
+ src/libcamera/sensor/camera_sensor_legacy.cpp | 37 +++++++++++++++----
+ 3 files changed, 45 insertions(+), 7 deletions(-)
 
 diff --git a/include/libcamera/internal/camera_sensor.h b/include/libcamera/internal/camera_sensor.h
 index e6b72d2..cfb4d75 100644
@@ -17,10 +22,10 @@ index e6b72d2..cfb4d75 100644
  	virtual const std::vector<unsigned int> &mbusCodes() const = 0;
  	virtual std::vector<Size> sizes(unsigned int mbusCode) const = 0;
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
-index e64b2b4..311a2b9 100644
+index 411c250..8ceb1e1 100644
 --- a/src/libcamera/pipeline/qcom/qcom.cpp
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
-@@ -1889,6 +1889,13 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+@@ -1905,6 +1905,13 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
  		return ret;
  	data->pushSensorControls();
  
@@ -34,7 +39,7 @@ index e64b2b4..311a2b9 100644
  	if (data->afEnabled_ && data->afMode_ == controls::AfModeContinuous &&
  	    !data->afPaused_)
  		data->startAfScan(0);
-@@ -1920,6 +1927,13 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+@@ -1936,6 +1943,13 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
  {
  	QcomCameraData *data = cameraData(camera);
  
@@ -112,3 +117,6 @@ index 6a68382..1fe3a55 100644
  
  		default:
  			LOG(CameraSensor, Warning)
+-- 
+2.55.0
+

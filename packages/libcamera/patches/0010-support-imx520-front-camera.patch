@@ -1,8 +1,16 @@
-From 43c045e4a2e35fba970e65ef90c9464f18165ce9 Mon Sep 17 00:00:00 2001
-From: LM-G820N Developer <developer@lmg820n.invalid>
-Date: Sat, 24 Oct 2026 14:44:08 +0800
-Subject: [PATCH] 0010-support-imx520-front-camera
+From 09fdc5a4e49d143069760ab8e0a6c9c9cb9733fc Mon Sep 17 00:00:00 2001
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Date: Sat, 24 Oct 2026 15:38:33 +0800
+Subject: [PATCH 4/5] 0010-support-imx520-front-camera
 
+---
+ src/ipa/libipa/camera_sensor_helper.cpp       | 11 +++
+ src/libcamera/pipeline/qcom/imx520_tuning.h   | 51 ++++++++++++
+ src/libcamera/pipeline/qcom/qcom.cpp          | 83 +++++++++++++++----
+ src/libcamera/pipeline/qcom/s5k3m5.h          | 11 ++-
+ .../sensor/camera_sensor_properties.cpp       | 11 +++
+ 5 files changed, 149 insertions(+), 18 deletions(-)
+ create mode 100644 src/libcamera/pipeline/qcom/imx520_tuning.h
 
 diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
 index d7a39e6..064167d 100644
@@ -84,7 +92,7 @@ index 0000000..71e0b66
 +
 +} /* namespace libcamera::qcom */
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
-index e7906ff..e64b2b4 100644
+index 36e810d..411c250 100644
 --- a/src/libcamera/pipeline/qcom/qcom.cpp
 +++ b/src/libcamera/pipeline/qcom/qcom.cpp
 @@ -60,6 +60,7 @@
@@ -155,7 +163,7 @@ index e7906ff..e64b2b4 100644
  
 +constexpr SensorProfile kImx520Profile = {
 +	.model = "imx520",
-+	.mediaBusCode = MEDIA_BUS_FMT_SBGGR10_1X10,
++	.mediaBusCode = MEDIA_BUS_FMT_SGBRG10_1X10,
 +	.fullInputSize = { 3280, 2460 },
 +	.nativeInputSize = { 1640, 924 },
 +	.fullResolutionOutput = true,
@@ -194,7 +202,7 @@ index e7906ff..e64b2b4 100644
  	if (ret) {
  		LOG(QcomPipeline, Error)
  			<< "Failed to read AF calibration from " << nvmem;
-@@ -650,13 +699,14 @@ CameraConfiguration::Status QcomCameraConfiguration::validate()
+@@ -651,13 +700,14 @@ CameraConfiguration::Status QcomCameraConfiguration::validate()
  	}
  
  	bool sizeSupported = false;
@@ -213,7 +221,7 @@ index e7906ff..e64b2b4 100644
  		status = Adjusted;
  	}
  
-@@ -978,8 +1028,10 @@ int QcomCameraData::setFormats(const Size &size)
+@@ -979,8 +1029,10 @@ int QcomCameraData::setFormats(const Size &size)
  	if (ret < 0)
  		return ret;
  
@@ -226,7 +234,7 @@ index e7906ff..e64b2b4 100644
  	V4L2SubdeviceFormat format;
  	format.code = profile_.mediaBusCode;
  	format.size = inputSize;
-@@ -1045,7 +1097,7 @@ int QcomCameraData::setFormats(const Size &size)
+@@ -1046,7 +1098,7 @@ int QcomCameraData::setFormats(const Size &size)
  
  	V4L2DeviceFormat videoFormat;
  	videoFormat.fourcc = video_->toV4L2PixelFormat(formats::NV12);
@@ -235,7 +243,7 @@ index e7906ff..e64b2b4 100644
  	videoFormat.colorSpace = ColorSpace::Sycc;
  
  	ret = video_->setFormat(&videoFormat);
-@@ -1053,7 +1105,7 @@ int QcomCameraData::setFormats(const Size &size)
+@@ -1054,7 +1106,7 @@ int QcomCameraData::setFormats(const Size &size)
  		return ret;
  
  	if (videoFormat.fourcc != video_->toV4L2PixelFormat(formats::NV12) ||
@@ -244,7 +252,7 @@ index e7906ff..e64b2b4 100644
  		return -EINVAL;
  
  	return refreshSensorInfo();
-@@ -1760,16 +1812,14 @@ QcomPipelineHandler::generateConfiguration(Camera *camera,
+@@ -1775,16 +1827,14 @@ QcomPipelineHandler::generateConfiguration(Camera *camera,
  
  	std::map<PixelFormat, std::vector<SizeRange>> formats;
  	std::vector<SizeRange> sizes;
@@ -265,7 +273,7 @@ index e7906ff..e64b2b4 100644
  	cfg.colorSpace = ColorSpace::Sycc;
  	cfg.bufferCount = kBufferCount;
  
-@@ -1913,7 +1963,8 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
+@@ -1929,7 +1979,8 @@ bool QcomPipelineHandler::match(DeviceEnumerator *enumerator)
  
  		const SensorProfile *profile = nullptr;
  		for (const SensorProfile *candidate :
@@ -276,7 +284,7 @@ index e7906ff..e64b2b4 100644
  				profile = candidate;
  				break;
 diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
-index 8fe3774..06a8911 100644
+index 5420a85..3e9509d 100644
 --- a/src/libcamera/pipeline/qcom/s5k3m5.h
 +++ b/src/libcamera/pipeline/qcom/s5k3m5.h
 @@ -142,9 +142,12 @@ private:
@@ -335,3 +343,6 @@ index 8ed8214..23f5611 100644
  		{ "imx462", {
  			.unitCellSize = { 2900, 2900 },
  			.testPatternModes = {},
+-- 
+2.55.0
+
