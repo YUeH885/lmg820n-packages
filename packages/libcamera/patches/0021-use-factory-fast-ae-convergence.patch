@@ -1,0 +1,276 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: apply the factory fast AE convergence path
+
+Use the Chromatix base index step and tolerance multiplier. Converge from
+the latest requested exposure while limiting the step by the measured
+frame exposure and pipeline latency. Round and cap indices in the factory
+domain, and report settling from the delayed exposure and table limits.
+
+diff --git a/src/libcamera/pipeline/qcom/ae_convergence.h b/src/libcamera/pipeline/qcom/ae_convergence.h
+new file mode 100644
+index 0000000..620fa8b
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ae_convergence.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++
++namespace libcamera::qcom {
++
++struct AeConvergenceTuning {
++	float unitStep;
++	float toleranceSteps;
++	float aggressiveness;
++};
++
++struct AeConvergenceResult {
++	float index;
++	bool settled;
++};
++
++inline AeConvergenceResult aeConvergeFast(const AeConvergenceTuning &tuning,
++					 float current, float applied, float target,
++					 float minimum, float maximum,
++					 unsigned int latency)
++{
++	float tolerance = tuning.unitStep * tuning.toleranceSteps;
++	float delta = target - current;
++	float index = current;
++	if (std::abs(delta) >= tolerance) {
++		float appliedDelta = target - applied;
++		float step = 0.0f;
++		if (delta * appliedDelta >= 0.0f) {
++			step = delta * tuning.aggressiveness;
++			float limit = appliedDelta / static_cast<float>(latency);
++			if (std::abs(step) > std::abs(limit))
++				step = limit;
++			if (std::abs(step) < tuning.unitStep)
++				step = step > 0.0f ? tuning.unitStep : -tuning.unitStep;
++		}
++		index += step;
++	}
++	index = std::clamp(std::round(index / tuning.unitStep) * tuning.unitStep,
++			   minimum, maximum);
++	float settledRange = 2.0f * tolerance;
++	return { index, index + settledRange >= maximum ||
++			index - settledRange <= minimum ||
++			std::abs(index - applied) <= settledRange };
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/imx351_tuning.h b/src/libcamera/pipeline/qcom/imx351_tuning.h
+index 07edeeb..ae0126a 100644
+--- a/src/libcamera/pipeline/qcom/imx351_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx351_tuning.h
+@@ -23,6 +23,7 @@ constexpr double kImx351AeLuxReferenceLuma8 = 50.0;
+ constexpr double kImx351AeLuxLumaMinimum8 = 0.1;
+ constexpr double kImx351AeLuxLogScale = 77.89852905273438;
+ constexpr double kImx351AeToleranceSteps = 2.0;
++constexpr double kImx351AeUnitStep = 0.500000000;
+ 
+ constexpr AeLuxZone kImx351AeLuxZones[] = {
+ 	{ 0.0, 120.0, 40.0 },
+diff --git a/src/libcamera/pipeline/qcom/imx363_tuning.h b/src/libcamera/pipeline/qcom/imx363_tuning.h
+index 922f3dc..b9275d0 100644
+--- a/src/libcamera/pipeline/qcom/imx363_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx363_tuning.h
+@@ -23,6 +23,7 @@ constexpr double kImx363AeLuxReferenceLuma8 = 50.0;
+ constexpr double kImx363AeLuxLumaMinimum8 = 0.1;
+ constexpr double kImx363AeLuxLogScale = 77.89852905273438;
+ constexpr double kImx363AeToleranceSteps = 4.0;
++constexpr double kImx363AeUnitStep = 0.500000000;
+ 
+ constexpr AeLuxZone kImx363AeLuxZones[] = {
+ 	{ 0.0, 100.0, 42.0 },
+diff --git a/src/libcamera/pipeline/qcom/imx520_tuning.h b/src/libcamera/pipeline/qcom/imx520_tuning.h
+index cb13eb9..2faff43 100644
+--- a/src/libcamera/pipeline/qcom/imx520_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx520_tuning.h
+@@ -22,6 +22,7 @@ constexpr double kImx520AeLuxReferenceLuma8 = 50.0;
+ constexpr double kImx520AeLuxLumaMinimum8 = 0.1;
+ constexpr double kImx520AeLuxLogScale = 77.89852905273438;
+ constexpr double kImx520AeToleranceSteps = 2.0;
++constexpr double kImx520AeUnitStep = 0.500000000;
+ 
+ constexpr AeLuxZone kImx520AeLuxZones[] = {
+ 	{ 1.0, 160.0, 46.0 },
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index b8d91f1..91db82f 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -58,6 +58,7 @@
+ #include "libcamera/internal/v4l2_videodevice.h"
+ 
+ #include "qcom_camss.h"
++#include "ae_convergence.h"
+ #include "ae_histogram.h"
+ #include "ae_histogram_tuning.h"
+ #include "s5k3m5.h"
+@@ -127,6 +128,7 @@ struct SensorProfile {
+ 	double aeLuxLumaMinimum8;
+ 	double aeLuxLogScale;
+ 	double aeToleranceSteps;
++	double aeUnitStep;
+ 	const double *aeRgbWeights;
+ 	const AeHistogramTuning *aeHistogram;
+ };
+@@ -156,6 +158,7 @@ constexpr SensorProfile kS5k3m5Profile = {
+ 	.aeLuxLumaMinimum8 = kAeLuxLumaMinimum8,
+ 	.aeLuxLogScale = kAeLuxLogScale,
+ 	.aeToleranceSteps = kAeToleranceSteps,
++	.aeUnitStep = kAeUnitStep,
+ 	.aeRgbWeights = kAeRgbWeights,
+ 	.aeHistogram = &kS5k3m5HistogramTuning,
+ };
+@@ -185,6 +188,7 @@ constexpr SensorProfile kImx363Profile = {
+ 	.aeLuxLumaMinimum8 = kImx363AeLuxLumaMinimum8,
+ 	.aeLuxLogScale = kImx363AeLuxLogScale,
+ 	.aeToleranceSteps = kImx363AeToleranceSteps,
++	.aeUnitStep = kImx363AeUnitStep,
+ 	.aeRgbWeights = kAeRgbWeights,
+ 	.aeHistogram = &kImx363HistogramTuning,
+ };
+@@ -214,6 +218,7 @@ constexpr SensorProfile kImx351Profile = {
+ 	.aeLuxLumaMinimum8 = kImx351AeLuxLumaMinimum8,
+ 	.aeLuxLogScale = kImx351AeLuxLogScale,
+ 	.aeToleranceSteps = kImx351AeToleranceSteps,
++	.aeUnitStep = kImx351AeUnitStep,
+ 	.aeRgbWeights = kAeRgbWeights,
+ 	.aeHistogram = &kImx351HistogramTuning,
+ };
+@@ -243,6 +248,7 @@ constexpr SensorProfile kImx520Profile = {
+ 	.aeLuxLumaMinimum8 = kImx520AeLuxLumaMinimum8,
+ 	.aeLuxLogScale = kImx520AeLuxLogScale,
+ 	.aeToleranceSteps = kImx520AeToleranceSteps,
++	.aeUnitStep = kImx520AeUnitStep,
+ 	.aeRgbWeights = kAeRgbWeights,
+ 	.aeHistogram = &kImx520HistogramTuning,
+ };
+@@ -309,6 +315,23 @@ double aeExposureIndex(const SensorProfile &profile, double total)
+ 	return knees[profile.aeExposureKneeCount - 1].index;
+ }
+ 
++double aeExposureForIndex(const SensorProfile &profile, double index)
++{
++	const AeExposureKnee *knees = profile.aeExposureKnees;
++	if (index <= knees[0].index)
++		return profileTotalExposure(knees[0]);
++	for (std::size_t i = 0; i + 1 < profile.aeExposureKneeCount; i++) {
++		if (index <= knees[i + 1].index) {
++			double t = (index - knees[i].index) /
++				   (knees[i + 1].index - knees[i].index);
++			return profileTotalExposure(knees[i]) *
++			       std::pow(profileTotalExposure(knees[i + 1]) /
++					profileTotalExposure(knees[i]), t);
++		}
++	}
++	return profileTotalExposure(knees[profile.aeExposureKneeCount - 1]);
++}
++
+ double aeLuxIndex(const SensorProfile &profile, double exposureIndex,
+ 		  double luma10)
+ {
+@@ -1427,7 +1450,8 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma)
+ 	double gain = gainFromCode(
+ 		profile_, applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>());
+ 	double total = exposure * gain;
+-	double index = aeLuxIndex(profile_, aeExposureIndex(profile_, total), luma);
++	float appliedIndex = aeExposureIndex(profile_, total);
++	double index = aeLuxIndex(profile_, appliedIndex, luma);
+ 	luxIndex_ = luxIndex_ ? *luxIndex_ * profile_.aeLuxFilterFactor +
+ 			       index * (1.0 - profile_.aeLuxFilterFactor) : index;
+ 	float luxTarget = aeTargetForLux(profile_, *luxIndex_);
+@@ -1444,11 +1468,35 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma)
+ 				 << " target " << histogramTarget;
+ 
+ 	double ratio = target / std::max(luma, profile_.aeLuxLumaMinimum8 * kAeTargetScale);
+-	if (aeWithinTolerance(ratio, profile_.aeLuxLogScale, profile_.aeToleranceSteps))
+-		return true;
+-
+-	double stepRatio = std::pow(ratio, profile_.aeAggressiveness);
+-	double corrected = total * stepRatio;
++	float targetIndex = appliedIndex + profile_.aeLuxLogScale * std::log10(ratio);
++	int32_t previousExposure = std::lround(aeExposure_);
++	int32_t previousGain = gainToCode(profile_, aeGain_);
++	double requested = previousExposure * lineDurationNs_ *
++		gainFromCode(profile_, previousGain);
++	float currentIndex = aeExposureIndex(profile_, requested);
++	float minimumIndex = aeExposureIndex(profile_, exposureMin_ * lineDurationNs_ * gainMin_);
++	float maximumIndex = aeExposureIndex(profile_, exposureMax_ * lineDurationNs_ * gainMax_);
++	const auto &delays = sensor_->sensorDelays();
++	/* Include the statistics age and the next SOF control write. */
++	unsigned int latency = std::max(delays.exposureDelay, delays.gainDelay) +
++		frameStates_.rbegin()->first - sequence + 1;
++	AeConvergenceTuning convergence{ static_cast<float>(profile_.aeUnitStep),
++		static_cast<float>(profile_.aeToleranceSteps),
++		static_cast<float>(profile_.aeAggressiveness) };
++	auto result = aeConvergeFast(convergence, currentIndex, appliedIndex, targetIndex,
++				     minimumIndex, maximumIndex, latency);
++	LOG(QcomPipeline, Debug) << std::setprecision(9)
++		<< "AE convergence frame " << sequence << " current " << currentIndex
++		<< " applied " << appliedIndex << " target " << targetIndex
++		<< " bounds " << minimumIndex << " " << maximumIndex
++		<< " latency " << latency << " output " << result.index
++		<< " settled " << result.settled;
++	double corrected = aeExposureForIndex(profile_, result.index);
++	/* Preserve exact control limits when their float indices are rounded. */
++	if (result.index == minimumIndex)
++		corrected = exposureMin_ * lineDurationNs_ * gainMin_;
++	else if (result.index == maximumIndex)
++		corrected = exposureMax_ * lineDurationNs_ * gainMax_;
+ 	double allocatedGain, allocatedExposure;
+ 	aeAllocateExposure(profile_, corrected, allocatedGain, allocatedExposure);
+ 
+@@ -1462,17 +1510,14 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma)
+ 
+ 	aeExposure_ = allocatedExposure / lineDurationNs_;
+ 	aeGain_ = allocatedGain;
+-	if (static_cast<int32_t>(std::lround(aeExposure_)) ==
+-		    applied.get(V4L2_CID_EXPOSURE).get<int32_t>() &&
+-	    gainToCode(profile_, aeGain_) ==
+-		    applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>())
+-		return true;
+-	pushSensorControls();
++	if (static_cast<int32_t>(std::lround(aeExposure_)) != previousExposure ||
++	    gainToCode(profile_, aeGain_) != previousGain)
++		pushSensorControls();
+ 
+ 	LOG(QcomPipeline, Debug) << "AE luma " << luma << " target " << target
+ 				 << " index " << *luxIndex_ << " exposure "
+ 				 << aeExposure_ << " gain " << aeGain_;
+-	return false;
++	return result.settled;
+ }
+ 
+ void QcomCameraData::updateCcm(double r, double g, double b)
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
+index 732f6e0..2d158fe 100644
+--- a/src/libcamera/pipeline/qcom/s5k3m5.h
++++ b/src/libcamera/pipeline/qcom/s5k3m5.h
+@@ -34,11 +34,6 @@ struct CctReference {
+ constexpr double kAeTargetScale = 4.0;
+ constexpr double kLgAfLowLightLuma8 = 17.0;
+ 
+-inline bool aeWithinTolerance(double ratio, double indexScale, double tolerance)
+-{
+-	return std::abs(indexScale * std::log10(ratio)) < tolerance;
+-}
+-
+ inline bool lgAfLowLight(double luma10)
+ {
+ 	return luma10 < kLgAfLowLightLuma8 * kAeTargetScale;
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5_tuning.h b/src/libcamera/pipeline/qcom/s5k3m5_tuning.h
+index 29d5437..ef69630 100644
+--- a/src/libcamera/pipeline/qcom/s5k3m5_tuning.h
++++ b/src/libcamera/pipeline/qcom/s5k3m5_tuning.h
+@@ -20,6 +20,7 @@ constexpr double kAeLuxReferenceLuma8 = 50.0;
+ constexpr double kAeLuxLumaMinimum8 = 0.1;
+ constexpr double kAeLuxLogScale = 77.89852905273438;
+ constexpr double kAeToleranceSteps = 2.0;
++constexpr double kAeUnitStep = 0.500000000;
+ constexpr double kAeRgbWeights[] = { 0.298799992, 0.586899996, 0.113700002 };
+ struct AeLuxZone {
+ 	double start;
