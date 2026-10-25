@@ -1,0 +1,25 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] debian: use build-architecture tools when cross-compiling
+
+Run Python and Vala tools on the build architecture. Keep the sensor
+libraries and the introspection cross-tool wrappers on the target
+architecture.
+
+diff --git a/debian/control b/debian/control
+--- a/debian/control
++++ b/debian/control
+@@ -13,10 +13,10 @@ Build-Depends:
+  pkgconf,
+  protobuf-c-compiler,
+  protobuf-compiler,
+- python3-dev,
+- python3-gi <!nocheck>,
+- python3-protobuf <!nocheck>,
+- valac,
++ python3-dev:native,
++ python3-gi:native <!nocheck>,
++ python3-protobuf:native <!nocheck>,
++ valac:native,
+ Standards-Version: 4.7.4
+ Section: libs
+ Vcs-Browser: https://salsa.debian.org/DebianOnMobile-team/libssc

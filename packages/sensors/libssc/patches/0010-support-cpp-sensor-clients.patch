@@ -1,0 +1,126 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] sensors: declare sensor APIs with C linkage
+
+Wrap each sensor API in G_BEGIN_DECLS and G_END_DECLS so C++ camera
+clients can include the public headers and link to the C library.
+
+diff --git a/src/libssc-sensor-accelerometer.h b/src/libssc-sensor-accelerometer.h
+index 7890650..61e335a 100644
+--- a/src/libssc-sensor-accelerometer.h
++++ b/src/libssc-sensor-accelerometer.h
+@@ -23,6 +23,8 @@
+ #include <gio/gio.h>
+ #include "libssc-sensor.h"
+ 
++G_BEGIN_DECLS
++
+ #define SSC_TYPE_SENSOR_ACCELEROMETER (ssc_sensor_accelerometer_get_type())
+ 
+ typedef struct _SSCSensorAccelerometer {
+@@ -41,4 +43,6 @@ void			 ssc_sensor_accelerometer_close (SSCSensorAccelerometer *self, GCancellab
+ gboolean		 ssc_sensor_accelerometer_close_finish (SSCSensorAccelerometer *self, GAsyncResult *result, GError **error);
+ gboolean                 ssc_sensor_accelerometer_close_sync (SSCSensorAccelerometer *self, GCancellable *cancellable, GError **error);
+ 
++G_END_DECLS
++
+ #endif /* _LIBSSC_SENSOR_ACCELEROMETER_H_ */
+diff --git a/src/libssc-sensor-compass.h b/src/libssc-sensor-compass.h
+index 85cebca..2b0bb32 100644
+--- a/src/libssc-sensor-compass.h
++++ b/src/libssc-sensor-compass.h
+@@ -23,6 +23,8 @@
+ #include <gio/gio.h>
+ #include "libssc-sensor.h"
+ 
++G_BEGIN_DECLS
++
+ #define SSC_TYPE_SENSOR_COMPASS (ssc_sensor_compass_get_type())
+ 
+ typedef struct _SSCSensorCompass {
+@@ -41,4 +43,6 @@ void			 ssc_sensor_compass_close (SSCSensorCompass *self, GCancellable *cancella
+ gboolean		 ssc_sensor_compass_close_finish (SSCSensorCompass *self, GAsyncResult *result, GError **error);
+ gboolean                 ssc_sensor_compass_close_sync (SSCSensorCompass *self, GCancellable *cancellable, GError **error);
+ 
++G_END_DECLS
++
+ #endif /* _LIBSSC_SENSOR_COMPASS_H_ */
+diff --git a/src/libssc-sensor-gyroscope.h b/src/libssc-sensor-gyroscope.h
+index 389fce1..f8e154f 100644
+--- a/src/libssc-sensor-gyroscope.h
++++ b/src/libssc-sensor-gyroscope.h
+@@ -23,6 +23,8 @@
+ #include <gio/gio.h>
+ #include "libssc-sensor.h"
+ 
++G_BEGIN_DECLS
++
+ #define SSC_TYPE_SENSOR_GYROSCOPE (ssc_sensor_gyroscope_get_type())
+ 
+ typedef struct _SSCSensorGyroscope {
+@@ -41,4 +43,6 @@ void			 ssc_sensor_gyroscope_close (SSCSensorGyroscope *self, GCancellable *canc
+ gboolean		 ssc_sensor_gyroscope_close_finish (SSCSensorGyroscope *self, GAsyncResult *result, GError **error);
+ gboolean                 ssc_sensor_gyroscope_close_sync (SSCSensorGyroscope *self, GCancellable *cancellable, GError **error);
+ 
++G_END_DECLS
++
+ #endif /* _LIBSSC_SENSOR_GYROSCOPE_H_ */
+diff --git a/src/libssc-sensor-light.h b/src/libssc-sensor-light.h
+index c83e0e1..f883b45 100644
+--- a/src/libssc-sensor-light.h
++++ b/src/libssc-sensor-light.h
+@@ -23,6 +23,8 @@
+ #include <gio/gio.h>
+ #include "libssc-sensor.h"
+ 
++G_BEGIN_DECLS
++
+ #define SSC_TYPE_SENSOR_LIGHT (ssc_sensor_light_get_type())
+ 
+ typedef struct _SSCSensorLight {
+@@ -41,4 +43,6 @@ void		 ssc_sensor_light_close (SSCSensorLight *self, GCancellable *cancellable,
+ gboolean	 ssc_sensor_light_close_finish (SSCSensorLight *self, GAsyncResult *result, GError **error);
+ gboolean         ssc_sensor_light_close_sync (SSCSensorLight *self, GCancellable *cancellable, GError **error);
+ 
++G_END_DECLS
++
+ #endif /* _LIBSSC_SENSOR_LIGHT_H_ */
+diff --git a/src/libssc-sensor-magnetometer.h b/src/libssc-sensor-magnetometer.h
+index e3cdfb6..55e0abd 100644
+--- a/src/libssc-sensor-magnetometer.h
++++ b/src/libssc-sensor-magnetometer.h
+@@ -23,6 +23,8 @@
+ #include <gio/gio.h>
+ #include "libssc-sensor.h"
+ 
++G_BEGIN_DECLS
++
+ #define SSC_TYPE_SENSOR_MAGNETOMETER (ssc_sensor_magnetometer_get_type())
+ 
+ typedef struct _SSCSensorMagnetometer {
+@@ -41,4 +43,6 @@ void			 ssc_sensor_magnetometer_close (SSCSensorMagnetometer *self, GCancellable
+ gboolean		 ssc_sensor_magnetometer_close_finish (SSCSensorMagnetometer *self, GAsyncResult *result, GError **error);
+ gboolean                 ssc_sensor_magnetometer_close_sync (SSCSensorMagnetometer *self, GCancellable *cancellable, GError **error);
+ 
++G_END_DECLS
++
+ #endif /* _LIBSSC_SENSOR_MAGNETOMETER_H_ */
+diff --git a/src/libssc-sensor-proximity.h b/src/libssc-sensor-proximity.h
+index fed9363..43fa28b 100644
+--- a/src/libssc-sensor-proximity.h
++++ b/src/libssc-sensor-proximity.h
+@@ -23,6 +23,8 @@
+ #include <gio/gio.h>
+ #include "libssc-sensor.h"
+ 
++G_BEGIN_DECLS
++
+ #define SSC_TYPE_SENSOR_PROXIMITY (ssc_sensor_proximity_get_type())
+ 
+ typedef struct _SSCSensorProximity {
+@@ -41,4 +43,6 @@ void			 ssc_sensor_proximity_close (SSCSensorProximity *self, GCancellable *canc
+ gboolean		 ssc_sensor_proximity_close_finish (SSCSensorProximity *self, GAsyncResult *result, GError **error);
+ gboolean		 ssc_sensor_proximity_close_sync (SSCSensorProximity *self, GCancellable *cancellable, GError **error);
+ 
++G_END_DECLS
++
+ #endif /* _LIBSSC_SENSOR_PROXIMITY_H_ */

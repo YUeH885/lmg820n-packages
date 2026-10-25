@@ -1,0 +1,364 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] sensors: keep SSC operations in their owning main context
+
+Bind deferred measurement signals and discovery timeouts to the sensor's
+construction context. Wait for synchronous operations in the calling
+thread's context instead of dispatching the process-wide default context.
+This allows camera clients to collect accelerometer samples in a dedicated
+worker without dispatching application callbacks from that worker.
+
+diff --git a/src/libssc-common-private.h b/src/libssc-common-private.h
+index e427c11..b6264df 100644
+--- a/src/libssc-common-private.h
++++ b/src/libssc-common-private.h
+@@ -73,6 +73,7 @@
+ #define SSC_STREAM_TYPE_ON_CHANGE			1
+ 
+ typedef struct {
++	GMainContext *context;
+ 	GMutex mutex;
+ 	GCond condition;
+ 	GAsyncResult *result;
+diff --git a/src/libssc-common.c b/src/libssc-common.c
+index 3648f47..2a4e20c 100644
+--- a/src/libssc-common.c
++++ b/src/libssc-common.c
+@@ -42,6 +42,7 @@ ssc_common_dump_protobuf (GArray *protobuf)
+ 
+ void
+ ssc_common_init_sync_context (SyncContext *ctx) {
++	ctx->context = g_main_context_ref_thread_default ();
+ 	g_mutex_init (&ctx->mutex);
+ 	g_cond_init (&ctx->condition);
+ 	ctx->finished = FALSE;
+@@ -53,7 +54,7 @@ ssc_common_wait_sync_context (SyncContext *ctx) {
+ 	g_mutex_lock (&ctx->mutex);
+ 	while (!ctx->finished) {
+ 		g_mutex_unlock (&ctx->mutex);
+-		g_main_context_iteration (g_main_context_default (), FALSE);
++		g_main_context_iteration (ctx->context, FALSE);
+ 		g_mutex_lock (&ctx->mutex);
+ 	}
+ 	g_mutex_unlock (&ctx->mutex);
+@@ -73,6 +74,7 @@ ssc_common_callback_sync_context (GObject *source, GAsyncResult *result, gpointe
+ 
+ void
+ ssc_common_clear_sync_context (SyncContext *ctx) {
++	g_main_context_unref (ctx->context);
+ 	g_mutex_clear (&ctx->mutex);
+ 	g_cond_clear (&ctx->condition);
+ 	g_object_unref (ctx->result);
+diff --git a/src/libssc-sensor-accelerometer.c b/src/libssc-sensor-accelerometer.c
+index 9238ab9..f0cd197 100644
+--- a/src/libssc-sensor-accelerometer.c
++++ b/src/libssc-sensor-accelerometer.c
+@@ -21,6 +21,7 @@
+ #include "ssc-common.pb-c.h"
+ #include "ssc-sensor-accelerometer.pb-c.h"
+ #include "libssc-sensor-accelerometer.h"
++#include "libssc-sensor-private.h"
+ 
+ enum {
+ 	SIGNAL_MEASUREMENT,
+@@ -101,7 +102,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			ctx->y = mount_matrix[1][0] * x + mount_matrix[1][1] * y + mount_matrix[1][2] * z;
+ 			ctx->z = mount_matrix[2][0] * x + mount_matrix[2][1] * y + mount_matrix[2][2] * z;
+ 
+-			g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
++			ssc_sensor_queue_signal (SSC_SENSOR (sensor), emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 		}
+ 
+ 		ssc_accelerometer_response__free_unpacked (msg, NULL);
+diff --git a/src/libssc-sensor-compass.c b/src/libssc-sensor-compass.c
+index 0f623b7..804411c 100644
+--- a/src/libssc-sensor-compass.c
++++ b/src/libssc-sensor-compass.c
+@@ -21,6 +21,7 @@
+ #include "libssc-common-private.h"
+ #include "ssc-sensor-rotationvector.pb-c.h"
+ #include "libssc-sensor-compass.h"
++#include "libssc-sensor-private.h"
+ 
+ enum {
+ 	SIGNAL_MEASUREMENT,
+@@ -128,7 +129,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			ctx = g_slice_new0 (SignalContext);
+ 			ctx->sensor = g_object_ref (sensor);
+ 			ctx->azimuth = azimuth;
+-			g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
++			ssc_sensor_queue_signal (SSC_SENSOR (sensor), emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 		}
+ 
+ 		ssc_rotationvector_response__free_unpacked (msg, NULL);
+diff --git a/src/libssc-sensor-gyroscope.c b/src/libssc-sensor-gyroscope.c
+index 90469db..4d23a78 100644
+--- a/src/libssc-sensor-gyroscope.c
++++ b/src/libssc-sensor-gyroscope.c
+@@ -22,6 +22,7 @@
+ #include "ssc-common.pb-c.h"
+ #include "ssc-sensor-gyroscope.pb-c.h"
+ #include "libssc-sensor-gyroscope.h"
++#include "libssc-sensor-private.h"
+ 
+ enum {
+ 	SIGNAL_MEASUREMENT,
+@@ -104,7 +105,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			ctx->x = x;
+ 			ctx->y = y;
+ 			ctx->z = z;
+-			g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
++			ssc_sensor_queue_signal (SSC_SENSOR (sensor), emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 		}
+ 
+ 		ssc_gyroscope_response__free_unpacked (msg, NULL);
+diff --git a/src/libssc-sensor-light.c b/src/libssc-sensor-light.c
+index ec502fd..ee5f28f 100644
+--- a/src/libssc-sensor-light.c
++++ b/src/libssc-sensor-light.c
+@@ -21,6 +21,7 @@
+ #include "ssc-common.pb-c.h"
+ #include "ssc-sensor-light.pb-c.h"
+ #include "libssc-sensor-light.h"
++#include "libssc-sensor-private.h"
+ 
+ enum {
+ 	SIGNAL_MEASUREMENT,
+@@ -90,7 +91,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 				ctx = g_slice_new0 (SignalContext);
+ 				ctx->sensor = g_object_ref (sensor);
+ 				ctx->intensity = intensity;
+-				g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
++				ssc_sensor_queue_signal (SSC_SENSOR (sensor), emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 			}
+ 		}
+ 
+diff --git a/src/libssc-sensor-magnetometer.c b/src/libssc-sensor-magnetometer.c
+index ecb7037..49c9e55 100644
+--- a/src/libssc-sensor-magnetometer.c
++++ b/src/libssc-sensor-magnetometer.c
+@@ -22,6 +22,7 @@
+ #include "ssc-common.pb-c.h"
+ #include "ssc-sensor-magnetometer.pb-c.h"
+ #include "libssc-sensor-magnetometer.h"
++#include "libssc-sensor-private.h"
+ 
+ enum {
+ 	SIGNAL_MEASUREMENT,
+@@ -104,7 +105,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			ctx->x = x;
+ 			ctx->y = y;
+ 			ctx->z = z;
+-			g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
++			ssc_sensor_queue_signal (SSC_SENSOR (sensor), emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 		}
+ 
+ 		ssc_magnetometer_response__free_unpacked (msg, NULL);
+diff --git a/src/libssc-sensor-private.h b/src/libssc-sensor-private.h
+new file mode 100644
+index 0000000..72eb031
+--- /dev/null
++++ b/src/libssc-sensor-private.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef _LIBSSC_SENSOR_PRIVATE_H_
++#define _LIBSSC_SENSOR_PRIVATE_H_
++
++#include "libssc-sensor.h"
++
++#define SSC_SENSOR_MAIN_CONTEXT "ssc-main-context"
++
++static inline GMainContext *
++ssc_sensor_get_context (SSCSensor *self)
++{
++	return g_object_get_data (G_OBJECT (self), SSC_SENSOR_MAIN_CONTEXT);
++}
++
++static inline void
++ssc_sensor_queue_signal (SSCSensor *self, GSourceFunc callback,
++                         gpointer data, GDestroyNotify destroy)
++{
++	GSource *source = g_idle_source_new ();
++
++	g_source_set_callback (source, callback, data, destroy);
++	g_source_attach (source, ssc_sensor_get_context (self));
++	g_source_unref (source);
++}
++
++#endif
+diff --git a/src/libssc-sensor-proximity.c b/src/libssc-sensor-proximity.c
+index 0cb5e98..ed4883b 100644
+--- a/src/libssc-sensor-proximity.c
++++ b/src/libssc-sensor-proximity.c
+@@ -21,6 +21,7 @@
+ #include "libssc-client-private.h"
+ #include "libssc-common-private.h"
+ #include "libssc-sensor-proximity.h"
++#include "libssc-sensor-private.h"
+ #include "libssc-sensor-proximity-private.h"
+ 
+ #define SSC_SENSOR_PROXIMITY_NEAR	1
+@@ -159,7 +160,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			ctx = g_slice_new0 (SignalContext);
+ 			ctx->sensor = g_object_ref (sensor);
+ 			ctx->near = near;
+-			g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, emit_signal, ctx, (GDestroyNotify)signal_context_free);
++			ssc_sensor_queue_signal (SSC_SENSOR (sensor), emit_signal, ctx, (GDestroyNotify)signal_context_free);
+ 		}
+ 	}
+ }
+diff --git a/src/libssc-sensor.c b/src/libssc-sensor.c
+index 32ce3dd..893a882 100644
+--- a/src/libssc-sensor.c
++++ b/src/libssc-sensor.c
+@@ -22,6 +22,7 @@
+ #include "ssc-common.pb-c.h"
+ #include "ssc-sensor-suid.pb-c.h"
+ #include "libssc-sensor.h"
++#include "libssc-sensor-private.h"
+ 
+ #define MAX_RETRIES 100
+ #define SENSOR_SERVICE_TIMEOUT_S 30
+@@ -63,7 +64,7 @@ typedef struct _SSCSensorPrivate {
+ 	gboolean attr_populated;
+ 	gboolean service_available;
+ 	guint service_retries;
+-	guint discovery_timeout_id;
++	GSource *discovery_timeout;
+ } SSCSensorPrivate;
+ 
+ static void async_initable_iface_init (GAsyncInitableIface *iface);
+@@ -72,13 +73,22 @@ G_DEFINE_TYPE_WITH_CODE (SSCSensor, ssc_sensor, G_TYPE_OBJECT,
+ 			 G_ADD_PRIVATE (SSCSensor)
+ 			 G_IMPLEMENT_INTERFACE (G_TYPE_ASYNC_INITABLE, async_initable_iface_init))
+ 
++static void
++clear_discovery_timeout (SSCSensorPrivate *priv)
++{
++	if (!priv->discovery_timeout)
++		return;
++	g_source_destroy (priv->discovery_timeout);
++	g_clear_pointer (&priv->discovery_timeout, g_source_unref);
++}
++
+ static void
+ wait_for_sensor_service (SSCSensor *self, GTask *task);
+ 
+ static void
+ discover (SSCSensor *self, GTask *task);
+ 
+-static void
++static gboolean
+ sensor_service_discovery_timeout (gpointer user_data);
+ 
+ static void
+@@ -306,7 +316,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			ssc_suid_response__free_unpacked (suid_msg, NULL);
+ 			g_debug ("'registry' sensor available, discovering sensor now");
+ 
+-			g_clear_handle_id (&priv->discovery_timeout_id, g_source_remove);
++			clear_discovery_timeout (priv);
+ 
+ 			discover(ctx->sensor, ctx->task);
+ 			return;
+@@ -319,7 +329,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			/* Fail to discover when service is not available after 100s */
+ 			if (priv->service_retries >= MAX_RETRIES) {
+ 				g_clear_signal_handler (&priv->report_id, self);
+-				g_clear_handle_id (&priv->discovery_timeout_id, g_source_remove);
++				clear_discovery_timeout (priv);
+ 
+ 				g_set_error (&error, ssc_sensor_error_quark(), SSC_SENSOR_ERROR_NO_SERVICE,
+ 					     "Sensor service unavailable");
+@@ -360,7 +370,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 			ssc_suid_response__free_unpacked (suid_msg, NULL);
+ 
+ 			g_clear_signal_handler (&priv->report_id, self);
+-			g_clear_handle_id (&priv->discovery_timeout_id, g_source_remove);
++			clear_discovery_timeout (priv);
+ 
+ 			g_task_return_boolean (ctx->task, FALSE);
+ 			g_clear_object (&ctx->task);
+@@ -449,7 +459,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 		/* Sensor initialized, complete task and stop listening */
+ 		if (ctx->task) {
+ 			g_clear_signal_handler (&priv->report_id, self);
+-			g_clear_handle_id (&priv->discovery_timeout_id, g_source_remove);
++			clear_discovery_timeout (priv);
+ 			g_task_return_boolean (ctx->task, attributes_populated);
+ 			g_clear_object (&ctx->task);
+ 			g_slice_free (ReportReceivedContext, ctx);
+@@ -477,7 +487,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 		/* Configuration updated, complete task and stop listening */
+ 		if (ctx->task) {
+ 			g_clear_signal_handler (&priv->report_id, self);
+-			g_clear_handle_id (&priv->discovery_timeout_id, g_source_remove);
++			clear_discovery_timeout (priv);
+ 			g_task_return_boolean (ctx->task, TRUE);
+ 			g_clear_object (&ctx->task);
+ 			g_slice_free (ReportReceivedContext, ctx);
+@@ -496,7 +506,7 @@ report_received (SSCClient *self, guint32 msg_id, guint64 uid_high, guint64 uid_
+ 
+ 		if (ctx->task) {
+ 			g_clear_signal_handler (&priv->report_id, self);
+-			g_clear_handle_id (&priv->discovery_timeout_id, g_source_remove);
++			clear_discovery_timeout (priv);
+ 			g_task_return_boolean (ctx->task, TRUE);
+ 			g_clear_object (&ctx->task);
+ 			g_slice_free (ReportReceivedContext, ctx);
+@@ -603,15 +613,14 @@ discover (SSCSensor *self, GTask *task)
+ 
+ /*****************************************************************************/
+ 
+-static void
++static gboolean
+ sensor_service_discovery_timeout (gpointer user_data)
+ {
+ 	ReportReceivedContext *ctx = user_data;
+ 	SSCSensorPrivate *priv = ssc_sensor_get_instance_private (ctx->sensor);
+ 	GError *error = NULL;
+ 
+-	g_return_if_fail (priv->discovery_timeout_id);
+-	priv->discovery_timeout_id = 0;
++	g_clear_pointer (&priv->discovery_timeout, g_source_unref);
+ 
+ 	g_clear_signal_handler (&priv->report_id, priv->client);
+ 
+@@ -622,6 +631,7 @@ sensor_service_discovery_timeout (gpointer user_data)
+ 	g_task_return_error (ctx->task, error);
+ 	g_clear_object (&ctx->task);
+ 	g_slice_free (ReportReceivedContext, ctx);
++	return G_SOURCE_REMOVE;
+ }
+ 
+ /*****************************************************************************/
+@@ -714,9 +724,9 @@ client_ready (SSCClient *client, GAsyncResult *result, gpointer user_data)
+ 	/* Wait for sensor service before discovering sensor */
+ 	priv->service_available = FALSE;
+ 	priv->service_retries = 0;
+-	priv->discovery_timeout_id = g_timeout_add_seconds_once (SENSOR_SERVICE_TIMEOUT_S,
+-								 sensor_service_discovery_timeout,
+-								 ctx);
++	priv->discovery_timeout = g_timeout_source_new_seconds (SENSOR_SERVICE_TIMEOUT_S);
++	g_source_set_callback (priv->discovery_timeout, sensor_service_discovery_timeout, ctx, NULL);
++	g_source_attach (priv->discovery_timeout, ssc_sensor_get_context (self));
+ 	wait_for_sensor_service (self, task);
+ }
+ 
+@@ -820,7 +830,7 @@ sensor_dispose (GObject *object)
+ 	SSCSensor *self = SSC_SENSOR (object);
+ 	SSCSensorPrivate *priv = ssc_sensor_get_instance_private (self);
+ 
+-	g_clear_handle_id (&priv->discovery_timeout_id, g_source_remove);
++	clear_discovery_timeout (priv);
+ 
+ 	if (priv->name)
+ 		g_free (priv->name);
+@@ -940,6 +950,8 @@ ssc_sensor_init (SSCSensor *self)
+ 
+ 	priv = ssc_sensor_get_instance_private (self);
+ 
++	g_object_set_data_full (G_OBJECT (self), SSC_SENSOR_MAIN_CONTEXT,
++			       g_main_context_ref_thread_default (), (GDestroyNotify)g_main_context_unref);
+ 	/* Use identity matrix in case no mount matrix is exposed */
+ 	memset(priv->mount_matrix, 0, sizeof(priv->mount_matrix));
+ 	priv->mount_matrix[0][0] = 1.0;
