@@ -1,0 +1,59 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: use the IMX363 factory analogue gain conversion
+
+IMX363 uses 512 / (512 - code), with the factory analogue range
+limited to 1..8x (codes 0..448). Quantize its requests toward zero
+as the sensor library does, and keep the shared IPA helper aligned.
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 064167d..72e1f02 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -634,7 +634,7 @@ public:
+ 	CameraSensorHelperImx363()
+ 	{
+ 		blackLevel_ = 4096;
+-		gain_ = AnalogueGainLinear{ 0, 1024, -1, 1024 };
++		gain_ = AnalogueGainLinear{ 0, 512, -1, 512 };
+ 	}
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx363", CameraSensorHelperImx363)
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index f0ba38f..87e30bb 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -95,6 +95,7 @@ using namespace qcom;
+ 
+ enum class GainModel {
+ 	Linear32,
++	SonyInverse512,
+ 	SonyInverse1024,
+ };
+ 
+@@ -163,7 +164,7 @@ constexpr SensorProfile kImx363Profile = {
+ 	.outputSizes = kOutputSizes,
+ 	.outputSizeCount = std::size(kOutputSizes),
+ 	.defaultOutputSize = kNativeSize,
+-	.gainModel = GainModel::SonyInverse1024,
++	.gainModel = GainModel::SonyInverse512,
+ 	.ccmEntries = kImx363CcmEntries,
+ 	.ccmEntryCount = std::size(kImx363CcmEntries),
+ 	.cctReferences = kImx363CctReferences,
+@@ -242,6 +243,8 @@ double gainFromCode(const SensorProfile &profile, int32_t code)
+ {
+ 	if (profile.gainModel == GainModel::Linear32)
+ 		return code / 32.0;
++	if (profile.gainModel == GainModel::SonyInverse512)
++		return 512.0 / (512.0 - code);
+ 
+ 	return 1024.0 / (1024.0 - code);
+ }
+@@ -250,6 +253,8 @@ int32_t gainToCode(const SensorProfile &profile, double gain)
+ {
+ 	if (profile.gainModel == GainModel::Linear32)
+ 		return static_cast<int32_t>(gain * 32.0);
++	if (profile.gainModel == GainModel::SonyInverse512)
++		return static_cast<int32_t>(512.0 - 512.0 / gain);
+ 
+ 	return std::lround(1024.0 - 1024.0 / gain);
+ }

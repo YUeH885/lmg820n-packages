@@ -1,0 +1,117 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: decode CAMSS statistics in their hardware luma domains
+
+Reconstruct the Titan 175 nonuniform BHIST bins in the factory 12-bit
+domain before converting their mean to the AE 10-bit domain. BG statistics
+already include IFE black-level correction, so use their channel means
+directly for spatial metering and white balance.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 75eab9a..f0ba38f 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -108,7 +108,6 @@ struct SensorProfile {
+ 	std::size_t outputSizeCount;
+ 	Size defaultOutputSize;
+ 	GainModel gainModel;
+-	double blackLevel;
+ 	const CcmEntry *ccmEntries;
+ 	std::size_t ccmEntryCount;
+ 	const CctReference *cctReferences;
+@@ -137,7 +136,6 @@ constexpr SensorProfile kS5k3m5Profile = {
+ 	.outputSizeCount = std::size(kOutputSizes),
+ 	.defaultOutputSize = kNativeSize,
+ 	.gainModel = GainModel::Linear32,
+-	.blackLevel = 64.0,
+ 	.ccmEntries = kCcmEntries,
+ 	.ccmEntryCount = std::size(kCcmEntries),
+ 	.cctReferences = kCctReferences,
+@@ -166,7 +164,6 @@ constexpr SensorProfile kImx363Profile = {
+ 	.outputSizeCount = std::size(kOutputSizes),
+ 	.defaultOutputSize = kNativeSize,
+ 	.gainModel = GainModel::SonyInverse1024,
+-	.blackLevel = 64.0,
+ 	.ccmEntries = kImx363CcmEntries,
+ 	.ccmEntryCount = std::size(kImx363CcmEntries),
+ 	.cctReferences = kImx363CctReferences,
+@@ -195,7 +192,6 @@ constexpr SensorProfile kImx351Profile = {
+ 	.outputSizeCount = std::size(kOutputSizes) - 1,
+ 	.defaultOutputSize = kNativeSize,
+ 	.gainModel = GainModel::SonyInverse1024,
+-	.blackLevel = 64.0,
+ 	.ccmEntries = kImx351CcmEntries,
+ 	.ccmEntryCount = std::size(kImx351CcmEntries),
+ 	.cctReferences = kImx351CctReferences,
+@@ -224,7 +220,6 @@ constexpr SensorProfile kImx520Profile = {
+ 	.outputSizeCount = std::size(kImx520OutputSizes),
+ 	.defaultOutputSize = { 1632, 924 },
+ 	.gainModel = GainModel::SonyInverse1024,
+-	.blackLevel = 64.0,
+ 	.ccmEntries = kImx520CcmEntries,
+ 	.ccmEntryCount = std::size(kImx520CcmEntries),
+ 	.cctReferences = kImx520CctReferences,
+@@ -267,8 +262,8 @@ std::optional<double> aeRegionLuma(const SensorProfile &profile,
+ 	for (unsigned int c = 0; c < 4; c++) {
+ 		if (!counts[c])
+ 			return std::nullopt;
+-		values[c] = std::max(0.0, static_cast<double>(sums[c]) /
+-				     counts[c] - profile.blackLevel);
++		/* BG statistics already include hardware black-level correction. */
++		values[c] = static_cast<double>(sums[c]) / counts[c];
+ 	}
+ 
+ 	return profile.aeRgbWeights[0] * values[0] +
+@@ -1399,14 +1394,14 @@ std::optional<double> QcomCameraData::measuredLuma() const
+ 	uint64_t histWeighted = 0;
+ 	uint64_t histTotal = 0;
+ 	for (unsigned int i = 0; i < hist_.size(); i++) {
+-		histWeighted += static_cast<uint64_t>(i) * hist_[i];
++		histWeighted += static_cast<uint64_t>(bhistBinValue12(i)) * hist_[i];
+ 		histTotal += hist_[i];
+ 	}
+ 	if (!histTotal)
+ 		return std::nullopt;
+ 
+-	/* Use BG only for spatial weighting; BHIST supplies the 10-bit level. */
+-	double histMean = static_cast<double>(histWeighted) / histTotal;
++	/* Convert the 12-bit BHIST level to the AE 10-bit domain. */
++	double histMean = static_cast<double>(histWeighted) / (4.0 * histTotal);
+ 	return *global > 0.0 ? histMean * *metered / *global : histMean;
+ }
+ 
+@@ -1513,10 +1508,10 @@ void QcomCameraData::updateAwb()
+ 			[](uint64_t count) { return !count; }))
+ 		return;
+ 
+-	double r = static_cast<double>(sums[0]) / counts[0] - profile_.blackLevel;
+-	double b = static_cast<double>(sums[1]) / counts[1] - profile_.blackLevel;
+-	double gr = static_cast<double>(sums[2]) / counts[2] - profile_.blackLevel;
+-	double gb = static_cast<double>(sums[3]) / counts[3] - profile_.blackLevel;
++	double r = static_cast<double>(sums[0]) / counts[0];
++	double b = static_cast<double>(sums[1]) / counts[1];
++	double gr = static_cast<double>(sums[2]) / counts[2];
++	double gb = static_cast<double>(sums[3]) / counts[3];
+ 	double g = (gr + gb) * 0.5;
+ 
+ 	if (r <= 4.0 || b <= 4.0 || g <= 4.0)
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
+index 732f6e0..41307cd 100644
+--- a/src/libcamera/pipeline/qcom/s5k3m5.h
++++ b/src/libcamera/pipeline/qcom/s5k3m5.h
+@@ -34,6 +34,16 @@ struct CctReference {
+ constexpr double kAeTargetScale = 4.0;
+ constexpr double kLgAfLowLightLuma8 = 17.0;
+ 
++/* Titan 175 nonuniform BHIST bins encode the upper edge in the 12-bit domain. */
++constexpr unsigned int bhistBinValue12(unsigned int bin)
++{
++	if (bin < 512)
++		return bin;
++	if (bin < 640)
++		return 4 * bin - 1533;
++	return 8 * bin - 4089;
++}
++
+ inline bool aeWithinTolerance(double ratio, double indexScale, double tolerance)
+ {
+ 	return std::abs(indexScale * std::log10(ratio)) < tolerance;

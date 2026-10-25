@@ -1,0 +1,122 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: power ancillary lenses only while streaming
+
+Release focus and OIS subdevice handles after camera discovery and after
+streaming stops. Reopen them before starting capture, with scoped cleanup
+on startup failure, so an idle CameraManager does not keep the motors and
+OIS DSP powered.
+
+diff --git a/include/libcamera/internal/camera_lens.h b/include/libcamera/internal/camera_lens.h
+index 3dfe8f0..43f8e05 100644
+--- a/include/libcamera/internal/camera_lens.h
++++ b/include/libcamera/internal/camera_lens.h
+@@ -27,6 +27,8 @@ public:
+ 	~CameraLens();
+ 
+ 	int init();
++	int open();
++	void close();
+ 	int setFocusPosition(int32_t position);
+ 	int getFocusPosition(int32_t *position);
+ 
+diff --git a/src/libcamera/camera_lens.cpp b/src/libcamera/camera_lens.cpp
+index b2e6fa9..7c1d273 100644
+--- a/src/libcamera/camera_lens.cpp
++++ b/src/libcamera/camera_lens.cpp
+@@ -76,6 +76,25 @@ int CameraLens::init()
+ 	return 0;
+ }
+ 
++/**
++ * \brief Open an initialized lens for focus control
++ * \return 0 on success or a negative error code otherwise
++ */
++int CameraLens::open()
++{
++	return subdev_->open();
++}
++
++/**
++ * \brief Close the lens device to release its runtime power reference
++ *
++ * Call open() before accessing focus controls again.
++ */
++void CameraLens::close()
++{
++	subdev_->close();
++}
++
+ /**
+  * \brief This function sets the focal point of the lens to a specific position.
+  * \param[in] position The focal point of the lens
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 621027f..b5704d2 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -504,6 +504,7 @@ public:
+ 	}
+ 
+ 	int init(MediaEntity *sensorEntity);
++	void closeAncillaryDevices();
+ 	int setFormats(const Size &size);
+ 	int refreshSensorInfo();
+ 	void frameStart(uint32_t sequence);
+@@ -957,10 +958,19 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 
+ 	controlInfo_ = ControlInfoMap(std::move(ctrls), controls::controls);
+ 	properties_ = sensor_->properties();
++	closeAncillaryDevices();
+ 
+ 	return 0;
+ }
+ 
++void QcomCameraData::closeAncillaryDevices()
++{
++	if (V4L2Subdevice *ois = sensor_->ois())
++		ois->close();
++	if (lens_)
++		lens_->close();
++}
++
+ int QcomCameraData::refreshSensorInfo()
+ {
+ 	IPACameraSensorInfo info;
+@@ -1887,6 +1897,20 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	QcomCameraData *data = cameraData(camera);
+ 	int ret;
+ 
++	auto errorCleanup = utils::scope_exit{ [&]() { data->closeAncillaryDevices(); } };
++	CameraLens *lens = data->sensor_->focusLens();
++	if (lens) {
++		ret = lens->open();
++		if (ret < 0)
++			return ret;
++	}
++	V4L2Subdevice *ois = data->sensor_->ois();
++	if (ois) {
++		ret = ois->open();
++		if (ret < 0)
++			return ret;
++	}
++
+ 	data->delayedCtrls_->reset();
+ 	data->lastStatsSequence_ = UINT32_MAX;
+ 	data->statsTimestamp_ = 0;
+@@ -1937,8 +1961,8 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 		return ret;
+ 	}
+ 	activeCamera_ = camera;
++	errorCleanup.release();
+ 
+-	V4L2Subdevice *ois = data->sensor_->ois();
+ 	if (ois) {
+ 		ControlList ctrls(ois->controls());
+ 		ctrls.set(V4L2_CID_IMAGE_STABILIZATION, 1);
+@@ -1972,6 +1996,7 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ 	data->video_->releaseBuffers();
+ 	data->delayedCtrls_->reset();
+ 	data->lastStatsSequence_ = UINT32_MAX;
++	data->closeAncillaryDevices();
+ 	if (activeCamera_ == camera)
+ 		activeCamera_ = nullptr;
+ }

@@ -1,0 +1,396 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: calculate the factory histogram exposure targets
+
+Use each sensor's default Metering v8 histogram zones, percentile
+means and temporal bounds to adjust the lux target. The single Y
+histogram follows the factory path with ADRC and dark boost disabled.
+Keep histogram decoding and target calculation in their own module.
+
+diff --git a/src/libcamera/pipeline/qcom/ae_histogram.h b/src/libcamera/pipeline/qcom/ae_histogram.h
+new file mode 100644
+index 0000000..f906621
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ae_histogram.h
+@@ -0,0 +1,173 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <numeric>
++#include <optional>
++#include <span>
++
++namespace libcamera::qcom {
++
++/* Titan 175 nonuniform BHIST bins encode the upper edge in the 12-bit domain. */
++constexpr unsigned int bhistBinValue12(unsigned int bin)
++{
++	if (bin < 512)
++		return bin;
++	if (bin < 640)
++		return 4 * bin - 1533;
++	return 8 * bin - 4089;
++}
++
++struct AeHistogramParams {
++	float minTargetRatio;
++	float maxTargetRatio;
++	float brightLow;
++	float brightHigh;
++	float darkLow;
++	float darkHigh;
++	std::array<float, 2> pushupRange;
++	std::array<float, 2> pushdownRange;
++	std::array<float, 2> darkRange;
++};
++
++struct AeHistogramZone {
++	float start;
++	float end;
++	AeHistogramParams params;
++};
++
++struct AeHistogramTuning {
++	bool enabled;
++	float filterFactor;
++	std::array<AeHistogramZone, 5> zones;
++};
++
++inline AeHistogramParams aeHistogramParams(const AeHistogramTuning &tuning, float lux)
++{
++	const auto &zones = tuning.zones;
++	for (unsigned int i = 0; i + 1 < zones.size(); i++) {
++		if (lux < zones[i].end)
++			return zones[i].params;
++		if (lux >= zones[i + 1].start)
++			continue;
++		float t = (lux - zones[i].end) / (zones[i + 1].start - zones[i].end);
++		const auto &a = zones[i].params;
++		const auto &b = zones[i + 1].params;
++		auto mix = [t](float x, float y) { return std::fma(y - x, t, x); };
++		auto range = [&mix](const auto &x, const auto &y) {
++			return std::array{ mix(x[0], y[0]), mix(x[1], y[1]) };
++		};
++		return { mix(a.minTargetRatio, b.minTargetRatio),
++			 mix(a.maxTargetRatio, b.maxTargetRatio),
++			 mix(a.brightLow, b.brightLow), mix(a.brightHigh, b.brightHigh),
++			 mix(a.darkLow, b.darkLow), mix(a.darkHigh, b.darkHigh),
++			 range(a.pushupRange, b.pushupRange),
++			 range(a.pushdownRange, b.pushdownRange),
++			 range(a.darkRange, b.darkRange) };
++	}
++	return zones.back().params;
++}
++
++class BhistDistribution
++{
++public:
++	BhistDistribution(std::span<const uint32_t, 1024> bins, uint64_t total)
++	{
++		uint64_t count = 0;
++		float moment = 0.0f;
++		for (unsigned int i = 0; i < bins.size(); i++) {
++			count += bins[i];
++			moment = std::fma(static_cast<float>(bins[i]),
++					  static_cast<float>(bhistBinValue12(i)), moment);
++			cdf_[i] = static_cast<float>(count) / static_cast<float>(total);
++			moment_[i] = moment / static_cast<float>(total);
++		}
++	}
++
++	float mean8(float lower, float upper) const
++	{
++		return (integral(upper) - integral(lower)) / (upper - lower) / 16.0f;
++	}
++
++private:
++	float integral(float percentile) const
++	{
++		if (percentile == 0.0f)
++			return 0.0f;
++		unsigned int i = std::lower_bound(cdf_.begin(), cdf_.end(), percentile) -
++				 cdf_.begin();
++		float previous = i ? cdf_[i - 1] : 0.0f;
++		float previousMoment = i ? moment_[i - 1] : 0.0f;
++		float t = (percentile - previous) / (cdf_[i] - previous);
++		return std::fma(moment_[i] - previousMoment, t, previousMoment);
++	}
++
++	std::array<float, 1024> cdf_;
++	std::array<float, 1024> moment_;
++};
++
++class AeHistogramTarget
++{
++public:
++	void reset() { bounds_.reset(); }
++
++	float process(const AeHistogramTuning &tuning,
++		      std::span<const uint32_t, 1024> bins,
++		      float lux, float reference, float target)
++	{
++		if (!tuning.enabled)
++			return target;
++		uint64_t total = std::accumulate(bins.begin(), bins.end(), uint64_t{ 0 });
++		if (!total)
++			return target;
++
++		AeHistogramParams params = aeHistogramParams(tuning, lux);
++		BhistDistribution histogram(bins, total);
++		float up = std::max(0.1f, histogram.mean8(1.0f - params.pushupRange[1],
++							1.0f - params.pushupRange[0]));
++		float down = std::max(0.1f, histogram.mean8(1.0f - params.pushdownRange[1],
++							  1.0f - params.pushdownRange[0]));
++		float dark = std::max(0.1f, histogram.mean8(params.darkRange[0],
++							  params.darkRange[1]));
++		std::array<float, 4> bounds = { reference * (params.brightLow / up),
++					       reference * (params.brightHigh / down),
++					       reference * (params.darkLow / dark),
++					       reference * (params.darkHigh / dark) };
++		if (bounds[0] > bounds[1])
++			std::swap(bounds[0], bounds[1]);
++		if (bounds_) {
++			for (unsigned int i = 0; i < bounds.size(); i++)
++				bounds[i] = std::fma((*bounds_)[i] - bounds[i],
++						     tuning.filterFactor, bounds[i]);
++		}
++		bounds_ = bounds;
++
++		float lower, upper;
++		if (bounds[1] < bounds[2]) {
++			lower = bounds[1];
++			upper = bounds[2];
++		} else if (bounds[0] < bounds[2]) {
++			lower = bounds[2];
++			upper = std::min(bounds[1], bounds[3]);
++		} else if (bounds[1] < bounds[3]) {
++			lower = bounds[0];
++			upper = bounds[1];
++		} else if (bounds[0] < bounds[3]) {
++			lower = bounds[0];
++			upper = bounds[3];
++		} else {
++			lower = bounds[3];
++			upper = bounds[0];
++		}
++		return std::clamp(std::clamp(target, lower, upper),
++				  params.minTargetRatio * target, params.maxTargetRatio * target);
++	}
++
++private:
++	std::optional<std::array<float, 4>> bounds_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/ae_histogram_tuning.h b/src/libcamera/pipeline/qcom/ae_histogram_tuning.h
+new file mode 100644
+index 0000000..635bbe5
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ae_histogram_tuning.h
+@@ -0,0 +1,85 @@
++/* Generated by tools/gen-qcom-histogram-tuning.py. */
++
++namespace libcamera::qcom {
++
++constexpr AeHistogramTuning kS5k3m5HistogramTuning = {
++	true, 0.500000000f, {{
++		{ 0.000000000f, 100.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 200.000000000f, 265.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.045000002f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 280.000000000f, 310.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 230.000000000f, 5.000000000f, 118.000000000f,
++		    { 0.010000000f, 0.045000002f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 345.000000000f, 400.000000000f,
++		  { 1.000000000f, 1.000000000f, 120.000000000f, 190.000000000f, 5.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.029999999f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 450.000000000f, 1000.000000000f,
++		  { 1.000000000f, 1.000000000f, 120.000000000f, 190.000000000f, 5.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++	}}
++};
++
++constexpr AeHistogramTuning kImx363HistogramTuning = {
++	true, 0.500000000f, {{
++		{ 0.000000000f, 100.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 166.000000000f, 235.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 295.000000000f, 325.000000000f,
++		  { 0.699999988f, 1.500000000f, 130.000000000f, 170.000000000f, 2.000000000f, 118.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 362.000000000f, 400.000000000f,
++		  { 0.699999988f, 1.000000000f, 120.000000000f, 170.000000000f, 2.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 450.000000000f, 1000.000000000f,
++		  { 0.800000012f, 1.000000000f, 110.000000000f, 160.000000000f, 2.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++	}}
++};
++
++constexpr AeHistogramTuning kImx351HistogramTuning = {
++	true, 0.500000000f, {{
++		{ 0.000000000f, 100.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 200.000000000f, 265.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 190.000000000f, 5.000000000f, 255.000000000f,
++		    { 0.010000000f, 0.045000002f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 280.000000000f, 310.000000000f,
++		  { 1.000000000f, 1.500000000f, 150.000000000f, 230.000000000f, 5.000000000f, 118.000000000f,
++		    { 0.010000000f, 0.045000002f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 345.000000000f, 400.000000000f,
++		  { 1.000000000f, 1.000000000f, 120.000000000f, 190.000000000f, 5.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.029999999f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 450.000000000f, 1000.000000000f,
++		  { 1.000000000f, 1.000000000f, 120.000000000f, 190.000000000f, 5.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++	}}
++};
++
++constexpr AeHistogramTuning kImx520HistogramTuning = {
++	false, 0.500000000f, {{
++		{ 0.000000000f, 100.000000000f,
++		  { 0.899999976f, 2.000000000f, 150.000000000f, 210.000000000f, 0.000000000f, 149.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 166.000000000f, 265.000000000f,
++		  { 0.899999976f, 2.430000067f, 150.000000000f, 210.000000000f, 0.000000000f, 149.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 290.000000000f, 320.000000000f,
++		  { 0.899999976f, 2.430000067f, 150.000000000f, 210.000000000f, 0.000000000f, 149.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 362.000000000f, 400.000000000f,
++		  { 0.800000012f, 1.200000048f, 120.000000000f, 190.000000000f, 0.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++		{ 450.000000000f, 1000.000000000f,
++		  { 0.800000012f, 1.200000048f, 120.000000000f, 190.000000000f, 0.000000000f, 110.000000000f,
++		    { 0.010000000f, 0.050000001f }, { 0.010000000f, 0.050000001f }, { 0.000000000f, 0.150000006f } } },
++	}}
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 87e30bb..b8d91f1 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -18,6 +18,7 @@
+ #include <iterator>
+ #include <limits>
+ #include <map>
++#include <iomanip>
+ #include <memory>
+ #include <optional>
+ #include <set>
+@@ -57,6 +58,8 @@
+ #include "libcamera/internal/v4l2_videodevice.h"
+ 
+ #include "qcom_camss.h"
++#include "ae_histogram.h"
++#include "ae_histogram_tuning.h"
+ #include "s5k3m5.h"
+ #include "ssc_accelerometer.h"
+ #include "imx351_tuning.h"
+@@ -125,6 +128,7 @@ struct SensorProfile {
+ 	double aeLuxLogScale;
+ 	double aeToleranceSteps;
+ 	const double *aeRgbWeights;
++	const AeHistogramTuning *aeHistogram;
+ };
+ 
+ constexpr SensorProfile kS5k3m5Profile = {
+@@ -153,6 +157,7 @@ constexpr SensorProfile kS5k3m5Profile = {
+ 	.aeLuxLogScale = kAeLuxLogScale,
+ 	.aeToleranceSteps = kAeToleranceSteps,
+ 	.aeRgbWeights = kAeRgbWeights,
++	.aeHistogram = &kS5k3m5HistogramTuning,
+ };
+ 
+ constexpr SensorProfile kImx363Profile = {
+@@ -181,6 +186,7 @@ constexpr SensorProfile kImx363Profile = {
+ 	.aeLuxLogScale = kImx363AeLuxLogScale,
+ 	.aeToleranceSteps = kImx363AeToleranceSteps,
+ 	.aeRgbWeights = kAeRgbWeights,
++	.aeHistogram = &kImx363HistogramTuning,
+ };
+ 
+ constexpr SensorProfile kImx351Profile = {
+@@ -209,6 +215,7 @@ constexpr SensorProfile kImx351Profile = {
+ 	.aeLuxLogScale = kImx351AeLuxLogScale,
+ 	.aeToleranceSteps = kImx351AeToleranceSteps,
+ 	.aeRgbWeights = kAeRgbWeights,
++	.aeHistogram = &kImx351HistogramTuning,
+ };
+ 
+ constexpr SensorProfile kImx520Profile = {
+@@ -237,6 +244,7 @@ constexpr SensorProfile kImx520Profile = {
+ 	.aeLuxLogScale = kImx520AeLuxLogScale,
+ 	.aeToleranceSteps = kImx520AeToleranceSteps,
+ 	.aeRgbWeights = kAeRgbWeights,
++	.aeHistogram = &kImx520HistogramTuning,
+ };
+ 
+ double gainFromCode(const SensorProfile &profile, int32_t code)
+@@ -576,6 +584,7 @@ public:
+ 	double aeExposure_ = 1000.0;
+ 	double aeGain_ = 1.0;
+ 	std::optional<double> luxIndex_;
++	AeHistogramTarget histogramTarget_;
+ 	std::optional<double> aecLuma_;
+ 
+ 	/* AWB state. */
+@@ -1421,7 +1430,18 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma)
+ 	double index = aeLuxIndex(profile_, aeExposureIndex(profile_, total), luma);
+ 	luxIndex_ = luxIndex_ ? *luxIndex_ * profile_.aeLuxFilterFactor +
+ 			       index * (1.0 - profile_.aeLuxFilterFactor) : index;
+-	double target = aeTargetForLux(profile_, *luxIndex_) * kAeTargetScale;
++	float luxTarget = aeTargetForLux(profile_, *luxIndex_);
++	float reference = luma / kAeTargetScale;
++	float histogramTarget = histogramTarget_.process(
++		*profile_.aeHistogram, std::span<const uint32_t, 1024>(hist_.data(), hist_.size()),
++		*luxIndex_, reference, luxTarget);
++	double target = histogramTarget * kAeTargetScale;
++
++	LOG(QcomPipeline, Debug) << std::setprecision(9)
++				 << "AE histogram frame " << sequence
++				 << " lux " << static_cast<float>(*luxIndex_)
++				 << " reference " << reference << " base " << luxTarget
++				 << " target " << histogramTarget;
+ 
+ 	double ratio = target / std::max(luma, profile_.aeLuxLumaMinimum8 * kAeTargetScale);
+ 	if (aeWithinTolerance(ratio, profile_.aeLuxLogScale, profile_.aeToleranceSteps))
+@@ -1985,6 +2005,7 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->statsTimestamp_ = 0;
+ 	data->awbCounter_ = 0;
+ 	data->luxIndex_.reset();
++	data->histogramTarget_.reset();
+ 	data->aecLuma_.reset();
+ 	data->frameStates_.clear();
+ 	data->nextIfe_.reset();
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
+index 41307cd..732f6e0 100644
+--- a/src/libcamera/pipeline/qcom/s5k3m5.h
++++ b/src/libcamera/pipeline/qcom/s5k3m5.h
+@@ -34,16 +34,6 @@ struct CctReference {
+ constexpr double kAeTargetScale = 4.0;
+ constexpr double kLgAfLowLightLuma8 = 17.0;
+ 
+-/* Titan 175 nonuniform BHIST bins encode the upper edge in the 12-bit domain. */
+-constexpr unsigned int bhistBinValue12(unsigned int bin)
+-{
+-	if (bin < 512)
+-		return bin;
+-	if (bin < 640)
+-		return 4 * bin - 1533;
+-	return 8 * bin - 4089;
+-}
+-
+ inline bool aeWithinTolerance(double ratio, double indexScale, double tolerance)
+ {
+ 	return std::abs(indexScale * std::log10(ratio)) < tolerance;

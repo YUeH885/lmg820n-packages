@@ -1,0 +1,519 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: use factory main-camera AF geometry and SSC gravity
+
+Separate the IMX363 calibration distance from its near search distance,
+apply the factory Q baseline and gravity projection, and compute the
+pose-dependent search endpoints. Acquire SSC acceleration only while the
+main camera streams and track focused-lens gravity changes at the factory
+fine-step threshold.
+
+diff --git a/src/libcamera/pipeline/qcom/meson.build b/src/libcamera/pipeline/qcom/meson.build
+index 58b6f69..0e77620 100644
+--- a/src/libcamera/pipeline/qcom/meson.build
++++ b/src/libcamera/pipeline/qcom/meson.build
+@@ -1,5 +1,8 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
++libcamera_deps += [dependency('libssc')]
++
+ libcamera_internal_sources += files([
+     'qcom.cpp',
++    'ssc_accelerometer.cpp',
+ ])
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index b5704d2..75eab9a 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -58,6 +58,7 @@
+ 
+ #include "qcom_camss.h"
+ #include "s5k3m5.h"
++#include "ssc_accelerometer.h"
+ #include "imx351_tuning.h"
+ #include "imx363_tuning.h"
+ #include "imx520_tuning.h"
+@@ -504,6 +505,7 @@ public:
+ 	}
+ 
+ 	int init(MediaEntity *sensorEntity);
++	int openAncillaryDevices();
+ 	void closeAncillaryDevices();
+ 	int setFormats(const Size &size);
+ 	int refreshSensorInfo();
+@@ -626,11 +628,14 @@ private:
+ 	void updateCcm(double r, double g, double b);
+ 	void updateAf(uint64_t timestamp, bool aeSettled);
+ 	void completeAfScan(bool success);
++	void refreshAfModel();
++	bool trackAfGravity();
+ 	double focusScore() const;
+ 	void updateMetadata(Request *request, uint32_t sequence);
+ 	uint64_t lensReadyTimestamp() const;
+ 
+ 	CameraLens *lens_ = nullptr;
++	std::unique_ptr<SscAccelerometer> accelerometer_;
+ 	std::optional<LgAfModel> afModel_;
+ };
+ 
+@@ -839,6 +844,8 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 		afOriginalPosition_ = afPosition_;
+ 		afBestStep_ = afStep_;
+ 		afFineEndStep_ = afModel_->nearStep();
++		if (afModel_->cameraId() == 0)
++			accelerometer_ = std::make_unique<SscAccelerometer>();
+ 		LOG(QcomPipeline, Info)
+ 			<< "Loaded LG camera ID " << afModel_->cameraId()
+ 			<< " AF calibration from " << eepromPath
+@@ -963,8 +970,32 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 	return 0;
+ }
+ 
++int QcomCameraData::openAncillaryDevices()
++{
++	int ret;
++	if (lens_) {
++		ret = lens_->open();
++		if (ret < 0)
++			return ret;
++	}
++	if (V4L2Subdevice *ois = sensor_->ois()) {
++		ret = ois->open();
++		if (ret < 0)
++			return ret;
++	}
++	if (accelerometer_) {
++		ret = accelerometer_->start();
++		if (ret < 0)
++			return ret;
++		refreshAfModel();
++	}
++	return 0;
++}
++
+ void QcomCameraData::closeAncillaryDevices()
+ {
++	if (accelerometer_)
++		accelerometer_->stop();
+ 	if (V4L2Subdevice *ois = sensor_->ois())
+ 		ois->close();
+ 	if (lens_)
+@@ -1188,6 +1219,46 @@ int QcomCameraData::applyIfe(uint32_t sequence)
+ 	return 0;
+ }
+ 
++void QcomCameraData::refreshAfModel()
++{
++	if (!accelerometer_)
++		return;
++	const auto sample = accelerometer_->sample();
++	afModel_->setAcceleration(sample[0], sample[1], sample[2]);
++	LOG(QcomPipeline, Debug) << "AF acceleration " << sample[0] << " "
++				 << sample[1] << " " << sample[2]
++				 << " offset " << afModel_->gravityOffset()
++				 << " bounds " << afModel_->nearPosition()
++				 << " " << afModel_->farPosition();
++}
++
++bool QcomCameraData::trackAfGravity()
++{
++	if (!accelerometer_ || afPaused_ || afState_ != controls::AfStateFocused)
++		return false;
++	LgAfModel updated = *afModel_;
++	const auto sample = accelerometer_->sample();
++	updated.setAcceleration(sample[0], sample[1], sample[2]);
++	int delta = updated.gravityOffset() - afModel_->gravityOffset();
++	if (std::abs(delta) < afModel_->gravityTrackingThreshold())
++		return false;
++	*afModel_ = updated;
++	int ret = setLensPosition(afPosition_ + 2 * delta);
++	if (ret) {
++		afState_ = controls::AfStateFailed;
++		LOG(QcomPipeline, Error) << "AF gravity move failed: " << ret;
++	} else {
++		afStep_ = afModel_->afCodeToStep(afPosition_);
++		afBestStep_ = afStep_;
++		afOriginalPosition_ = std::clamp(afOriginalPosition_ + 2 * delta,
++						 afModel_->codeMin(), afModel_->codeMax());
++		afSceneChange_.reset();
++		LOG(QcomPipeline, Debug) << "AF gravity tracked " << delta
++					 << " P at code " << afPosition_;
++	}
++	return true;
++}
++
+ int QcomCameraData::setLensPosition(int position)
+ {
+ 	if (!lens_ || !afModel_)
+@@ -1491,6 +1562,8 @@ void QcomCameraData::startAfScan(uint64_t timestamp)
+ void QcomCameraData::completeAfScan(bool success)
+ {
+ 	if (success) {
++		refreshAfModel();
++		afBestStep_ = afModel_->afCodeToStep(afPosition_);
+ 		afStep_ = afBestStep_;
+ 		afStage_ = AfStage::Idle;
+ 		afState_ = controls::AfStateFocused;
+@@ -1531,6 +1604,8 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 	}
+ 
+ 	if (afStage_ == AfStage::Idle) {
++		if (timestamp < lensReadyTimestamp() || trackAfGravity())
++			return;
+ 		if (afMode_ == controls::AfModeContinuous && !afPaused_) {
+ 			if (afSceneChange_.update(focusScore())) {
+ 				LOG(QcomPipeline, Debug)
+@@ -1554,6 +1629,7 @@ void QcomCameraData::updateAf(uint64_t timestamp, bool aeSettled)
+ 	if (afStage_ == AfStage::Warmup) {
+ 		if (!aeSettled)
+ 			return;
++		refreshAfModel();
+ 		afLowLight_ = aecLuma_ && lgAfLowLight(*aecLuma_);
+ 		LOG(QcomPipeline, Debug) << "AF search luma "
+ 					 << aecLuma_.value_or(0.0)
+@@ -1709,6 +1785,7 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 
+ 	if (afEnabled_ && afMode_ == controls::AfModeManual &&
+ 	    controls.contains(controls::LensPosition.id())) {
++		refreshAfModel();
+ 		double position = *controls.get(controls::LensPosition);
+ 		int ret = setLensPosition(lensPositionToCode(position));
+ 		if (ret)
+@@ -1898,18 +1975,10 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	int ret;
+ 
+ 	auto errorCleanup = utils::scope_exit{ [&]() { data->closeAncillaryDevices(); } };
+-	CameraLens *lens = data->sensor_->focusLens();
+-	if (lens) {
+-		ret = lens->open();
+-		if (ret < 0)
+-			return ret;
+-	}
++	ret = data->openAncillaryDevices();
++	if (ret < 0)
++		return ret;
+ 	V4L2Subdevice *ois = data->sensor_->ois();
+-	if (ois) {
+-		ret = ois->open();
+-		if (ret < 0)
+-			return ret;
+-	}
+ 
+ 	data->delayedCtrls_->reset();
+ 	data->lastStatsSequence_ = UINT32_MAX;
+diff --git a/src/libcamera/pipeline/qcom/s5k3m5.h b/src/libcamera/pipeline/qcom/s5k3m5.h
+index 4c3691e..732f6e0 100644
+--- a/src/libcamera/pipeline/qcom/s5k3m5.h
++++ b/src/libcamera/pipeline/qcom/s5k3m5.h
+@@ -246,15 +246,20 @@ public:
+ 		model.rawMacroDac_ = macroDac;
+ 		if (cameraId == 0) {
+ 			model.focalLengthMm_ = 4.230000019073486;
+-			model.referenceDistanceMm_ = 80.0;
++			model.calibrationDistanceMm_ = 100.0;
++			model.nearDistanceMm_ = 80.0;
+ 			model.stepFraction_ = 0.023399999365210533f;
++			infinityQ -= 30;
++			macroQ -= 30;
+ 		} else if (cameraId == 1) {
+ 			model.focalLengthMm_ = 2.9200000762939453;
+-			model.referenceDistanceMm_ = 150.0;
++			model.calibrationDistanceMm_ = 150.0;
++			model.nearDistanceMm_ = 150.0;
+ 			model.stepFraction_ = 0.023399999365210533f;
+ 		} else {
+ 			model.focalLengthMm_ = 5.849999904632568;
+-			model.referenceDistanceMm_ = 400.0;
++			model.calibrationDistanceMm_ = 400.0;
++			model.nearDistanceMm_ = 400.0;
+ 			model.stepFraction_ = 0.029999999329447746f;
+ 			/* Camera ID 3 uses the factory type-3 infinity extension. */
+ 			infinityQ = std::max(0, static_cast<int>(
+@@ -263,11 +268,7 @@ public:
+ 		}
+ 		model.infinityPosition_ = 1024 - infinityQ;
+ 		model.macroPosition_ = 1024 - macroQ;
+-		model.nearPosition_ = model.positionForDistance(model.referenceDistanceMm_);
+-		int farTarget = model.positionForDistance(kFarDistanceMm);
+-		int farMargin = static_cast<int>(
+-			static_cast<float>(farTarget - model.nearPosition_) * 0.08f);
+-		model.farPosition_ = std::min(1023, farTarget + farMargin);
++		model.updateBounds();
+ 
+ 		int span = macroQ - infinityQ;
+ 		model.coarseStepNormal_ = static_cast<unsigned int>(
+@@ -291,13 +292,33 @@ public:
+ 	uint16_t checksum() const { return checksum_; }
+ 	int rawInfinityDac() const { return rawInfinityDac_; }
+ 	int rawMacroDac() const { return rawMacroDac_; }
+-	int infinityPosition() const { return infinityPosition_; }
++	int infinityPosition() const
++	{
++		return std::clamp(infinityPosition_ - gravityOffset_, 0, 1023);
++	}
+ 	int nearPosition() const { return nearPosition_; }
+ 	int farPosition() const { return farPosition_; }
+ 	int codeMin() const { return positionToCode(farPosition_); }
+ 	int codeMax() const { return positionToCode(nearPosition_); }
+-	int infinityCode() const { return positionToCode(infinityPosition_); }
+-	double lensPositionMax() const { return 1000.0 / referenceDistanceMm_; }
++	int infinityCode() const { return positionToCode(infinityPosition()); }
++	double lensPositionMax() const { return 1000.0 / nearDistanceMm_; }
++	int gravityOffset() const { return gravityOffset_; }
++	int gravityTrackingThreshold() const
++	{
++		return static_cast<int>(static_cast<double>(
++			static_cast<float>(infinityPosition_ - macroPosition_) * stepFraction_) + 0.5);
++	}
++
++	void setAcceleration(float x, float y, float z)
++	{
++		double norm = std::sqrt(static_cast<double>(
++			std::fma(z, z, std::fma(x, x, y * y))));
++		double reference = norm >= 9.0 && norm <= 11.0 ? norm : 9.80665;
++		/* LG maps the SSC vector to (-x, y, -z) before projecting gravity. */
++		gravityOffset_ = cameraId_ == 0
++			? static_cast<int>(-static_cast<double>(z) / reference * 30) : 0;
++		updateBounds();
++	}
+ 	unsigned int nearStep() const { return 0; }
+ 	unsigned int farStep() const { return farPosition_ - nearPosition_; }
+ 	unsigned int stepCount() const { return farStep() + 1; }
+@@ -315,13 +336,13 @@ public:
+ 		int position = codeToPosition(std::clamp(code, codeMin(), codeMax()));
+ 		if (position <= nearPosition_)
+ 			return lensPositionMax();
+-		if (position >= infinityPosition_)
++		if (position >= infinityPosition())
+ 			return kLensPositionMin;
+ 
+ 		double distance = focalLengthMm_ +
+-			(referenceDistanceMm_ - focalLengthMm_) *
+-			(infinityPosition_ - nearPosition_) /
+-			(infinityPosition_ - position);
++			(calibrationDistanceMm_ - focalLengthMm_) *
++			(infinityPosition_ - macroPosition_) /
++			(infinityPosition_ - position - gravityOffset_);
+ 		return std::clamp(1000.0 / distance,
+ 				  kLensPositionMin, lensPositionMax());
+ 	}
+@@ -335,7 +356,7 @@ public:
+ 			return codeMax();
+ 
+ 		double distance = 1000.0 / position;
+-		if (distance <= referenceDistanceMm_)
++		if (distance <= nearDistanceMm_)
+ 			return codeMax();
+ 
+ 		return positionToCode(positionForDistance(distance));
+@@ -356,17 +377,29 @@ public:
+ 
+ 	int positionForDistance(double distance) const
+ 	{
+-		double ratio = (referenceDistanceMm_ - focalLengthMm_) /
+-			       (distance - focalLengthMm_);
+-		return std::clamp(static_cast<int>(
+-			infinityPosition_ -
+-			(infinityPosition_ - macroPosition_) * ratio),
+-			0, 1023);
++		double displacement = focalLengthMm_ * focalLengthMm_ /
++				      (distance - focalLengthMm_);
++		double reference = focalLengthMm_ * focalLengthMm_ /
++				   (calibrationDistanceMm_ - focalLengthMm_);
++		return std::clamp(static_cast<int>(std::fma(
++			-static_cast<double>(infinityPosition_ - macroPosition_),
++			displacement / reference, static_cast<double>(infinityPosition_))) -
++			gravityOffset_, 0, 1023);
+ 	}
+ 
+ private:
+ 	static constexpr double kFarDistanceMm = 10000.0;
+ 
++	void updateBounds()
++	{
++		nearPosition_ = std::max(1, positionForDistance(nearDistanceMm_));
++		int farTarget = positionForDistance(kFarDistanceMm);
++		int farMargin = static_cast<int>(static_cast<float>(farTarget - nearPosition_) * 0.08f);
++		int candidate = farTarget + farMargin;
++		/* The factory endpoint allows 1024 and maps overflow to 1023. */
++		farPosition_ = candidate > 1024 ? 1023 : candidate;
++	}
++
+ 	static int codeToPosition(int code)
+ 	{
+ 		return 1024 - (code + 1023) / 2;
+@@ -382,7 +415,9 @@ private:
+ 	int rawInfinityDac_ = 0;
+ 	int rawMacroDac_ = 0;
+ 	double focalLengthMm_ = 0.0;
+-	double referenceDistanceMm_ = 0.0;
++	double calibrationDistanceMm_ = 0.0;
++	double nearDistanceMm_ = 0.0;
++	int gravityOffset_ = 0;
+ 	float stepFraction_ = 0.0f;
+ 	int infinityPosition_ = 0;
+ 	int macroPosition_ = 0;
+diff --git a/src/libcamera/pipeline/qcom/ssc_accelerometer.cpp b/src/libcamera/pipeline/qcom/ssc_accelerometer.cpp
+new file mode 100644
+index 0000000..761dcb4
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ssc_accelerometer.cpp
+@@ -0,0 +1,116 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#include "ssc_accelerometer.h"
++
++#include <cerrno>
++#include <pthread.h>
++#include <utility>
++#include <libssc-sensor-accelerometer.h>
++
++#include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
++
++namespace libcamera::qcom {
++
++LOG_DEFINE_CATEGORY(QcomAccelerometer)
++
++struct SscAccelerometer::State {
++	SscAccelerometer *owner;
++	std::promise<int> *ready;
++	GSource *timeout;
++};
++
++SscAccelerometer::SscAccelerometer()
++	: context_(g_main_context_new()), loop_(g_main_loop_new(context_, false))
++{
++}
++
++SscAccelerometer::~SscAccelerometer()
++{
++	stop();
++	g_main_loop_unref(loop_);
++	g_main_context_unref(context_);
++}
++
++int SscAccelerometer::start()
++{
++	std::promise<int> ready;
++	auto result = ready.get_future();
++	thread_ = std::thread(&SscAccelerometer::run, this, std::move(ready));
++	int ret = result.get();
++	if (ret)
++		stop();
++	return ret;
++}
++
++void SscAccelerometer::stop()
++{
++	if (!thread_.joinable())
++		return;
++	g_main_loop_quit(loop_);
++	thread_.join();
++}
++
++std::array<float, 3> SscAccelerometer::sample() const
++{
++	std::lock_guard lock(mutex_);
++	return sample_;
++}
++
++void SscAccelerometer::measured(void *, float x, float y, float z, void *data)
++{
++	State *state = static_cast<State *>(data);
++	{
++		std::lock_guard lock(state->owner->mutex_);
++		state->owner->sample_ = { x, y, z };
++	}
++	if (state->ready) {
++		g_source_destroy(state->timeout);
++		state->ready->set_value(0);
++		state->ready = nullptr;
++	}
++}
++
++int SscAccelerometer::timedOut(void *data)
++{
++	State *state = static_cast<State *>(data);
++	LOG(QcomAccelerometer, Error) << "Timed out waiting for the first acceleration sample";
++	state->ready->set_value(-ETIMEDOUT);
++	state->ready = nullptr;
++	g_main_loop_quit(state->owner->loop_);
++	return G_SOURCE_REMOVE;
++}
++
++void SscAccelerometer::run(std::promise<int> ready)
++{
++	pthread_setname_np(pthread_self(), "qcom-accel");
++	g_main_context_push_thread_default(context_);
++	auto contextGuard = utils::scope_exit{ [&]() { g_main_context_pop_thread_default(context_); } };
++	g_autoptr(GError) error = nullptr;
++	g_autoptr(SSCSensorAccelerometer) sensor = ssc_sensor_accelerometer_new_sync(nullptr, &error);
++	if (!sensor) {
++		LOG(QcomAccelerometer, Error) << "Failed to discover accelerometer: "
++					    << (error ? error->message : "sensor unavailable");
++		ready.set_value(-ENODEV);
++		return;
++	}
++	if (!ssc_sensor_accelerometer_open_sync(sensor, nullptr, &error)) {
++		LOG(QcomAccelerometer, Error) << "Failed to open accelerometer: " << error->message;
++		ready.set_value(-EIO);
++		return;
++	}
++
++	GSource *timeout = g_timeout_source_new(1000);
++	State state{ this, &ready, timeout };
++	g_source_set_callback(timeout, timedOut, &state, nullptr);
++	g_source_attach(timeout, context_);
++	gulong handler = g_signal_connect(sensor, "measurement", G_CALLBACK(measured), &state);
++	g_main_loop_run(loop_);
++	g_signal_handler_disconnect(sensor, handler);
++	g_source_unref(timeout);
++	if (!ssc_sensor_accelerometer_close_sync(sensor, nullptr, &error))
++		LOG(QcomAccelerometer, Error) << "Failed to close accelerometer: " << error->message;
++	while (g_main_context_iteration(context_, false))
++		;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/ssc_accelerometer.h b/src/libcamera/pipeline/qcom/ssc_accelerometer.h
+new file mode 100644
+index 0000000..645e370
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ssc_accelerometer.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <future>
++#include <mutex>
++#include <thread>
++
++struct _GMainContext;
++struct _GMainLoop;
++
++namespace libcamera::qcom {
++
++class SscAccelerometer
++{
++public:
++	SscAccelerometer();
++	~SscAccelerometer();
++
++	int start();
++	void stop();
++	std::array<float, 3> sample() const;
++
++private:
++	struct State;
++	void run(std::promise<int> ready);
++	static void measured(void *sensor, float x, float y, float z, void *data);
++	static int timedOut(void *data);
++
++	_GMainContext *context_;
++	_GMainLoop *loop_;
++	std::thread thread_;
++	mutable std::mutex mutex_;
++	std::array<float, 3> sample_{};
++};
++
++} /* namespace libcamera::qcom */

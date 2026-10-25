@@ -1,0 +1,25 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] debian: require SSC support for Qcom AF gravity compensation
+
+Use the SSC library version that keeps sensor callbacks and synchronous
+operations in the camera worker main context.
+
+diff --git a/debian/control b/debian/control
+--- a/debian/control
++++ b/debian/control
+@@ -19,6 +19,7 @@
+                libpisp-dev [arm64 armel armhf],
+                libpython3-dev <!pkg.libcamera.nopython>,
+                libsdl2-dev <!pkg.libcamera.nosdl>,
++               libssc-dev (>= 0.4.4-2+lmg820n2),
+                libtensorflow-lite-dev [arm64 armhf],
+                libtiff-dev,
+                libudev-dev [linux-any],
+@@ -81,6 +82,7 @@
+ Architecture: linux-any
+ Multi-Arch: same
+ Depends: ${misc:Depends},
++         libssc2 (>= 0.4.4-2+lmg820n2),
+          ${shlibs:Depends}
+ Recommends: libcamera-ipa (= ${binary:Version})
+ Pre-Depends: ${misc:Pre-Depends}
