@@ -1,0 +1,135 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: expose factory EV compensation controls
+
+Map ExposureValue to the shared factory 1/6 EV table and add its index
+offset after histogram target calculation. Ignore EV changes in manual
+exposure mode and report the active EV with the frame AE mode.
+
+diff --git a/src/libcamera/pipeline/qcom/ae_exposure_compensation.h b/src/libcamera/pipeline/qcom/ae_exposure_compensation.h
+new file mode 100644
+index 0000000..147ff5d
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/ae_exposure_compensation.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++
++namespace libcamera::qcom {
++
++/* Shared Metering v8 EV tuning from all four factory Chromatix files. */
++constexpr int kAeStepsPerEv = 6;
++constexpr float kAeMinEv = -2.0f;
++constexpr float kAeMaxEv = 2.0f;
++constexpr std::array<float, 25> kAeEvMultipliers = {
++	0.25f, 0.2806f, 0.315f, 0.3536f, 0.3969f, 0.4454f,
++	0.5f, 0.5612f, 0.6299f, 0.7071f, 0.7937f, 0.8909f,
++	1.0f, 1.1225f, 1.2599f, 1.4142f, 1.5874f, 1.7818f,
++	2.0f, 2.2449f, 2.5198f, 2.8284f, 3.1748f, 3.5636f, 4.0f,
++};
++
++inline int aeEvStep(float ev)
++{
++	return std::lround(std::clamp(ev, kAeMinEv, kAeMaxEv) * kAeStepsPerEv);
++}
++
++inline float aeEvValue(int step)
++{
++	return static_cast<float>(step) / kAeStepsPerEv;
++}
++
++inline float aeEvOffset(int step, double logScale)
++{
++	unsigned int index = step - static_cast<int>(kAeMinEv * kAeStepsPerEv);
++	return logScale * std::log10(static_cast<double>(kAeEvMultipliers[index]));
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 91db82f..0ae3b75 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -59,6 +59,7 @@
+ 
+ #include "qcom_camss.h"
+ #include "ae_convergence.h"
++#include "ae_exposure_compensation.h"
+ #include "ae_histogram.h"
+ #include "ae_histogram_tuning.h"
+ #include "s5k3m5.h"
+@@ -593,6 +594,8 @@ public:
+ 		int afState;
+ 		int afPauseState;
+ 		bool awbEnabled;
++		bool aeEnabled;
++		float exposureValue;
+ 	};
+ 	IfeState appliedIfe_;
+ 	std::optional<std::pair<uint32_t, IfeState>> nextIfe_;
+@@ -604,6 +607,7 @@ public:
+ 
+ 	/* AE state. */
+ 	bool aeEnabled_ = true;
++	int aeEvStep_ = 0;
+ 	double aeExposure_ = 1000.0;
+ 	double aeGain_ = 1.0;
+ 	std::optional<double> luxIndex_;
+@@ -968,6 +972,7 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 
+ 	ControlInfoMap::Map ctrls;
+ 	ctrls[&controls::AeEnable] = ControlInfo(false, true, true);
++	ctrls[&controls::ExposureValue] = ControlInfo(kAeMinEv, kAeMaxEv, 0.0f);
+ 	ctrls[&controls::ExposureTime] = ControlInfo(
+ 		static_cast<int32_t>(exposureMin_ * lineDurationNs_ / 1000.0),
+ 		static_cast<int32_t>(exposureMax_ * lineDurationNs_ / 1000.0),
+@@ -1081,7 +1086,8 @@ void QcomCameraData::frameStart(uint32_t sequence)
+ 	}
+ 	frameStates_[sequence] = { appliedIfe_,
+ 				   lens_ ? static_cast<float>(lensPosition()) : 0.0f,
+-				   afMode_, afState_, afPauseState_, awbEnabled_ };
++				   afMode_, afState_, afPauseState_, awbEnabled_,
++				   aeEnabled_, aeEnabled_ ? aeEvValue(aeEvStep_) : 0.0f };
+ 	while (frameStates_.size() > 64)
+ 		frameStates_.erase(frameStates_.begin());
+ 	if (ifePending_) {
+@@ -1469,6 +1475,8 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma)
+ 
+ 	double ratio = target / std::max(luma, profile_.aeLuxLumaMinimum8 * kAeTargetScale);
+ 	float targetIndex = appliedIndex + profile_.aeLuxLogScale * std::log10(ratio);
++	float evOffset = aeEvOffset(aeEvStep_, profile_.aeLuxLogScale);
++	targetIndex += evOffset;
+ 	int32_t previousExposure = std::lround(aeExposure_);
+ 	int32_t previousGain = gainToCode(profile_, aeGain_);
+ 	double requested = previousExposure * lineDurationNs_ *
+@@ -1490,7 +1498,8 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma)
+ 		<< " applied " << appliedIndex << " target " << targetIndex
+ 		<< " bounds " << minimumIndex << " " << maximumIndex
+ 		<< " latency " << latency << " output " << result.index
+-		<< " settled " << result.settled;
++		<< " settled " << result.settled << " ev " << aeEvValue(aeEvStep_)
++		<< " ev offset " << evOffset;
+ 	double corrected = aeExposureForIndex(profile_, result.index);
+ 	/* Preserve exact control limits when their float indices are rounded. */
+ 	if (result.index == minimumIndex)
+@@ -1822,6 +1831,9 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 		}
+ 	}
+ 
++	if (aeEnabled_ && controls.contains(controls::ExposureValue.id()))
++		aeEvStep_ = aeEvStep(*controls.get(controls::ExposureValue));
++
+ 	if (controls.contains(controls::AwbEnable.id())) {
+ 		awbEnabled_ = *controls.get(controls::AwbEnable);
+ 		if (!awbEnabled_ && controls.contains(controls::ColourGains.id())) {
+@@ -1928,6 +1940,8 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 	metadata.set(controls::ColourCorrectionMatrix,
+ 		     Span<const float, 9>(state.ife.ccm));
+ 	metadata.set(controls::AwbEnable, state.awbEnabled);
++	metadata.set(controls::AeEnable, state.aeEnabled);
++	metadata.set(controls::ExposureValue, state.exposureValue);
+ 	if (afEnabled_) {
+ 		metadata.set(controls::AfMode, state.afMode);
+ 		metadata.set(controls::AfState, state.afState);
