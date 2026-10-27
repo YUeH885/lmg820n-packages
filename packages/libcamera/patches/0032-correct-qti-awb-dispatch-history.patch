@@ -1,0 +1,37 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: preserve factory AWB dispatch counts and sample totals
+
+Accept frame-end dispatcher counts in MLC so exclusion cannot change the
+history used by the next frame. Pass the full sampled-region count to
+scene metrics independently of the regions admitted to AGW.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_mlc.h b/src/libcamera/pipeline/qcom/awb_mlc.h
+--- a/src/libcamera/pipeline/qcom/awb_mlc.h
++++ b/src/libcamera/pipeline/qcom/awb_mlc.h
+@@ -36 +35,0 @@
+-		detected_ = 0;
+@@ -39 +38,4 @@
+-	QtiAwbMlcRegion process(float rg, float bg, float cct, uint32_t valid)
++	/* The dispatcher supplies counts collected before MLC exclusion. */
++	void finishFrame(unsigned int detected) { detected_ = detected; }
++
++	QtiAwbMlcRegion process(float rg, float bg, float cct, uint32_t valid) const
+@@ -45,2 +46,0 @@
+-		if (qtiAwbZoneContains(QtiAwbGeometry::Cct, detectionCoordinates_, rg, bg, cct, valid))
+-			detected_++;
+@@ -52 +51,0 @@
+-	unsigned int detected() const { return detected_; }
+diff --git a/src/libcamera/pipeline/qcom/awb_scenes.h b/src/libcamera/pipeline/qcom/awb_scenes.h
+--- a/src/libcamera/pipeline/qcom/awb_scenes.h
++++ b/src/libcamera/pipeline/qcom/awb_scenes.h
+@@ -65 +65,2 @@
+-					       const QtiAwbAgwStatistics &agw, const QtiAwbLocus &locus)
++					       const QtiAwbAgwStatistics &agw, uint32_t samples,
++					       const QtiAwbLocus &locus)
+@@ -67 +68,2 @@
+-	metrics[2] = qtiAwbCountRatio(agw.valid, agw.total);
++	/* Screening removes callbacks but preserves the sampled-region denominator. */
++	metrics[2] = qtiAwbCountRatio(agw.valid, samples);
+@@ -73 +75 @@
+-		metrics[7 + i] = qtiAwbCountRatio(groups[i].count, agw.total);
++		metrics[7 + i] = qtiAwbCountRatio(groups[i].count, samples);
