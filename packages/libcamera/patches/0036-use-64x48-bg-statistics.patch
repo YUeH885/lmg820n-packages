@@ -1,0 +1,36 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: use 64x48 BG statistics and stats ABI version 2
+
+Match the kernel DMA layout required by the factory AWB sampler. Map the
+whole BG grid to the 16x16 AE metering table using the grid dimensions.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom_camss.h b/src/libcamera/pipeline/qcom/qcom_camss.h
+--- a/src/libcamera/pipeline/qcom/qcom_camss.h
++++ b/src/libcamera/pipeline/qcom/qcom_camss.h
+@@ -34,3 +34,3 @@
+-#define QCOM_CAMSS_STATS_VERSION 1
+-#define QCOM_CAMSS_AWB_BG_H_NUM 32
+-#define QCOM_CAMSS_AWB_BG_V_NUM 24
++#define QCOM_CAMSS_STATS_VERSION 2
++#define QCOM_CAMSS_AWB_BG_H_NUM 64
++#define QCOM_CAMSS_AWB_BG_V_NUM 48
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -1385,2 +1385,2 @@
+-		double rowStart = y * 1.5;
+-		double rowEnd = (y + 1) * 1.5;
++		double rowStart = y * (QCOM_CAMSS_AWB_BG_V_NUM / 16.0);
++		double rowEnd = (y + 1) * (QCOM_CAMSS_AWB_BG_V_NUM / 16.0);
+@@ -1400,2 +1400,2 @@
+-				for (unsigned int column = 2 * x;
+-				     column < 2 * x + 2; column++) {
++				for (unsigned int column = x * (QCOM_CAMSS_AWB_BG_H_NUM / 16);
++				     column < (x + 1) * (QCOM_CAMSS_AWB_BG_H_NUM / 16); column++) {
+@@ -1564,2 +1564,4 @@
+-			unsigned int weight = x >= 8 && x < 24 && y >= 6 && y < 18
+-						? 4 : 1;
++			unsigned int weight = x >= QCOM_CAMSS_AWB_BG_H_NUM / 4 &&
++				x < 3 * QCOM_CAMSS_AWB_BG_H_NUM / 4 &&
++				y >= QCOM_CAMSS_AWB_BG_V_NUM / 4 &&
++				y < 3 * QCOM_CAMSS_AWB_BG_V_NUM / 4 ? 4 : 1;
