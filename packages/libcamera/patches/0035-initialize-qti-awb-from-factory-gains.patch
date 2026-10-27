@@ -1,0 +1,44 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: initialize front AWB from factory RGB gains
+
+Carry the Chromatix initial gains and CCT into the front configuration.
+Derive the unit-calibrated initial white point on construction and reset.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_front_configuration.h b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+--- a/src/libcamera/pipeline/qcom/awb_front_configuration.h
++++ b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+@@ -25,0 +26,13 @@
++struct QtiAwbInitialConfiguration {
++	std::array<float, 3> gains;
++	float cct;
++};
++
++inline QtiAwbPoint qtiAwbInitialPoint(const QtiAwbInitialConfiguration &config,
++				    QtiAwbPoint calibration)
++{
++	float red = config.gains[0] / calibration.rg;
++	float blue = config.gains[2] / calibration.bg;
++	return { config.gains[1] / red, config.gains[1] / blue };
++}
++
+@@ -27,0 +41 @@
++	QtiAwbInitialConfiguration initial;
+diff --git a/src/libcamera/pipeline/qcom/awb_front.h b/src/libcamera/pipeline/qcom/awb_front.h
+--- a/src/libcamera/pipeline/qcom/awb_front.h
++++ b/src/libcamera/pipeline/qcom/awb_front.h
+@@ -44 +44 @@
+-	QtiAwbFront(QtiAwbFrontConfiguration config, QtiAwbPoint initial)
++	explicit QtiAwbFront(QtiAwbFrontConfiguration config)
+@@ -49 +49 @@
+-		reset(initial);
++		reset();
+@@ -52 +52 @@
+-	void reset(QtiAwbPoint initial)
++	void reset()
+@@ -53,0 +54 @@
++		QtiAwbPoint initial = qtiAwbInitialPoint(config_.initial, { 1, 1 });
+diff --git a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+@@ -27,0 +28 @@
++	config.initial = { { 2.07330751f, 1.0f, 1.75892627f }, 5000.0f };
