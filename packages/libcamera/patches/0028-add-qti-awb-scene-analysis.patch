@@ -1,0 +1,293 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add factory AWB scene analysis and aggregation
+
+Share inclusive trigger interpolation across coordinates and scene outputs.
+Build scene statistics, combine configured confidence levels, select target
+white points and reproduce stable DAV1 ranking and reference blending.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_triggers.h b/src/libcamera/pipeline/qcom/awb_triggers.h
+new file mode 100644
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_triggers.h
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <vector>
++
++#include "awb_weights.h"
++
++namespace libcamera::qcom {
++
++template<std::size_t Width>
++std::array<float, Width> qtiAwbBlendValues(const std::array<float, Width> &first,
++					 const std::array<float, Width> &last, float coefficient)
++{
++	std::array<float, Width> result;
++	for (std::size_t i = 0; i < Width; i++)
++		result[i] = qtiAwbBlend(first[i], last[i], coefficient);
++	return result;
++}
++
++template<unsigned int Depth, std::size_t Width>
++struct QtiAwbTriggerTable {
++	using Value = QtiAwbTriggerTable<Depth - 1, Width>;
++	std::vector<QtiAwbWeightZone<Value>> zones;
++};
++
++template<std::size_t Width>
++struct QtiAwbTriggerTable<1, Width> {
++	using Value = std::array<float, Width>;
++	std::vector<QtiAwbWeightZone<Value>> zones;
++};
++
++template<unsigned int Depth, std::size_t Width>
++std::array<float, Width> qtiAwbEvaluateTrigger(const QtiAwbTriggerTable<Depth, Width> &table,
++					     const float *triggers)
++{
++	const auto &zones = table.zones;
++	auto evaluate = [triggers](const typename QtiAwbTriggerTable<Depth, Width>::Value &value) {
++		if constexpr (Depth == 1)
++			return value;
++		else
++			return qtiAwbEvaluateTrigger(value, triggers + 1);
++	};
++	/* Scene and coordinate tables include the upper endpoint, unlike weight curves. */
++	for (std::size_t i = 0; i + 1 < zones.size(); i++) {
++		if (*triggers <= zones[i].end)
++			return evaluate(zones[i].value);
++		if (*triggers < zones[i + 1].start) {
++			float coefficient = 1.0f - (*triggers - zones[i].end) /
++						  (zones[i + 1].start - zones[i].end);
++			return qtiAwbBlendValues(evaluate(zones[i].value),
++						evaluate(zones[i + 1].value), coefficient);
++		}
++	}
++	return evaluate(zones.back().value);
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_scenes.h b/src/libcamera/pipeline/qcom/awb_scenes.h
+new file mode 100644
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_scenes.h
+@@ -0,0 +1,168 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <vector>
++
++#include "awb_accumulator.h"
++#include "awb_triggers.h"
++
++namespace libcamera::qcom {
++
++using QtiAwbSceneMetrics = std::array<float, 37>;
++
++template<std::size_t Width>
++bool qtiAwbSceneValue(const QtiAwbTriggerTable<2, Width> &table,
++		     const std::array<uint32_t, 2> &indices, const QtiAwbSceneMetrics &metrics,
++		     std::array<float, Width> &result)
++{
++	/* Trigger 37 preserves the caller's existing output in the factory API. */
++	if (indices[0] == 37 || indices[1] == 37)
++		return false;
++	float triggers[] = { metrics[indices[0]], metrics[indices[1]] };
++	result = qtiAwbEvaluateTrigger(table, triggers);
++	return true;
++}
++
++struct QtiAwbSceneConfidence {
++	std::array<uint32_t, 2> indices;
++	float weight;
++	QtiAwbTriggerTable<2, 1> table;
++};
++
++struct QtiAwbSceneTarget {
++	unsigned int mode;
++	std::array<uint32_t, 2> indices;
++	QtiAwbTriggerTable<2, 2> table;
++};
++
++struct QtiAwbSceneConfiguration {
++	uint32_t type;
++	uint32_t id;
++	float weight;
++	unsigned int combination;
++	std::vector<QtiAwbSceneConfidence> confidences;
++	QtiAwbSceneTarget target;
++};
++
++struct QtiAwbDecision {
++	QtiAwbPoint point;
++	float confidence;
++	uint32_t type;
++	uint32_t id;
++	float weight;
++};
++
++inline float qtiAwbCountRatio(uint32_t numerator, uint32_t denominator)
++{
++	return denominator ? static_cast<float>(numerator) / denominator : 0;
++}
++
++inline QtiAwbSceneMetrics qtiAwbSceneStatistics(QtiAwbSceneMetrics metrics,
++					       const std::array<QtiAwbDetectionGroup, 4> &groups,
++					       const QtiAwbAgwStatistics &agw, const QtiAwbLocus &locus)
++{
++	metrics[2] = qtiAwbCountRatio(agw.valid, agw.total);
++	metrics[3] = agw.weightedMean.rg;
++	metrics[4] = agw.weightedMean.bg;
++	metrics[5] = groups[0].mean.rg;
++	metrics[6] = groups[0].mean.bg;
++	for (unsigned int i = 0; i < 4; i++)
++		metrics[7 + i] = qtiAwbCountRatio(groups[i].count, agw.total);
++	metrics[11] = qtiAwbCountRatio(agw.valid, agw.valid + groups[0].count);
++	unsigned int metric = 12;
++	for (unsigned int i = 0; i < 3; i++)
++		for (unsigned int j = i + 1; j < 4; j++)
++			metrics[metric++] = qtiAwbCountRatio(groups[i].count, groups[i].count + groups[j].count);
++	metrics[19] = locus.evaluate(groups[0].mean).cct;
++	return metrics;
++}
++
++template<typename Calibrate>
++QtiAwbDecision qtiAwbAnalyzeScene(const QtiAwbSceneConfiguration &config,
++				 const QtiAwbSceneMetrics &metrics, QtiAwbPoint global,
++				 const std::array<QtiAwbDetectionGroup, 4> &groups, Calibrate calibrate)
++{
++	float confidence = config.combination == 0 || config.combination == 2 ? 1.0f : 0.0f;
++	float totalWeight = 0;
++	for (const auto &level : config.confidences) {
++		std::array<float, 1> value{};
++		qtiAwbSceneValue(level.table, level.indices, metrics, value);
++		switch (config.combination) {
++		case 0:
++			confidence *= value[0];
++			break;
++		case 1:
++			confidence = std::fma(value[0], level.weight, confidence);
++			totalWeight += level.weight;
++			break;
++		case 2:
++			confidence = std::min(confidence, value[0]);
++			break;
++		case 3:
++			confidence = std::max(confidence, value[0]);
++			break;
++		}
++	}
++	if (config.combination == 1)
++		confidence = totalWeight ? confidence / totalWeight : 0;
++	std::array<float, 2> target{};
++	qtiAwbSceneValue(config.target.table, config.target.indices, metrics, target);
++	QtiAwbPoint point;
++	if (config.target.mode == 0) {
++		point = calibrate(QtiAwbPoint{ target[0], target[1] });
++	} else {
++		QtiAwbPoint source = config.target.mode == 1 ? global : groups[config.target.mode - 2].mean;
++		point = { source.rg * (1.0f / target[0]), source.bg * (1.0f / target[1]) };
++	}
++	return { point, confidence, config.type, config.id, config.weight };
++}
++
++struct QtiAwbAggregationConfiguration {
++	QtiAwbTriggerTable<1, 1> confidenceWeight;
++	QtiAwbTriggerTable<1, 1> rankWeight;
++	QtiAwbTriggerTable<1, 1> referenceWeight;
++};
++
++struct QtiAwbAggregatedTarget {
++	QtiAwbPoint point;
++	float confidence;
++};
++
++inline QtiAwbAggregatedTarget qtiAwbAggregate(const QtiAwbAggregationConfiguration &config,
++					     std::vector<QtiAwbDecision> decisions, QtiAwbPoint previous)
++{
++	const QtiAwbDecision &reference = decisions.front();
++	std::stable_sort(decisions.begin() + 1, decisions.end(),
++		[](const auto &a, const auto &b) { return a.confidence > b.confidence; });
++	auto curve = [](const QtiAwbTriggerTable<1, 1> &table, float value) {
++		return qtiAwbEvaluateTrigger(table, &value)[0];
++	};
++	float baseWeight = curve(config.referenceWeight, reference.confidence);
++	float sum = 0;
++	QtiAwbPoint weighted{};
++	unsigned int rank = 1;
++	for (std::size_t i = 1; i < decisions.size(); i++) {
++		const auto &scene = decisions[i];
++		if (i > 1 && scene.confidence < decisions[i - 1].confidence)
++			rank = i;
++		float probability = curve(config.rankWeight, rank) *
++				    (curve(config.confidenceWeight, scene.confidence) * scene.confidence);
++		float weight = probability * scene.weight;
++		float share = baseWeight * (1.0f - probability);
++		float rg = qtiAwbBlend(reference.point.rg, scene.point.rg, share);
++		float bg = qtiAwbBlend(reference.point.bg, scene.point.bg, share);
++		weighted.rg = std::fma(rg, weight, weighted.rg);
++		weighted.bg = std::fma(bg, weight, weighted.bg);
++		sum += weight;
++	}
++	QtiAwbAggregatedTarget result = sum ? QtiAwbAggregatedTarget{ { weighted.rg / sum, weighted.bg / sum }, 1 }
++					  : QtiAwbAggregatedTarget{ reference.point, reference.confidence != 0 ? 1.0f : 0.0f };
++	if (result.point.rg == 0 || result.point.bg == 0)
++		result = { previous, 0 };
++	return result;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_zones.h b/src/libcamera/pipeline/qcom/awb_zones.h
+--- a/src/libcamera/pipeline/qcom/awb_zones.h
++++ b/src/libcamera/pipeline/qcom/awb_zones.h
+@@ -5 +4,0 @@
+-#include <cstddef>
+@@ -7 +5,0 @@
+-#include <vector>
+@@ -9 +7 @@
+-#include "awb_weights.h"
++#include "awb_triggers.h"
+@@ -52,4 +50 @@
+-	QtiAwbCoordinates result;
+-	for (std::size_t i = 0; i < result.size(); i++)
+-		result[i] = qtiAwbBlend(first[i], last[i], coefficient);
+-	return result;
++	return qtiAwbBlendValues(first, last, coefficient);
+@@ -59,10 +54 @@
+-struct QtiAwbCoordinateTable {
+-	using Value = QtiAwbCoordinateTable<Depth - 1>;
+-	std::vector<QtiAwbWeightZone<Value>> zones;
+-};
+-
+-template<>
+-struct QtiAwbCoordinateTable<1> {
+-	using Value = QtiAwbCoordinates;
+-	std::vector<QtiAwbWeightZone<Value>> zones;
+-};
++using QtiAwbCoordinateTable = QtiAwbTriggerTable<Depth, 6>;
+@@ -74,19 +60 @@
+-	const auto &zones = table.zones;
+-	auto evaluate = [triggers](const typename QtiAwbCoordinateTable<Depth>::Value &value) {
+-		if constexpr (Depth == 1)
+-			return value;
+-		else
+-			return qtiAwbEvaluateCoordinates(value, triggers + 1);
+-	};
+-	/* Coordinate tables include the upper endpoint, unlike weight curves. */
+-	for (std::size_t i = 0; i + 1 < zones.size(); i++) {
+-		if (*triggers <= zones[i].end)
+-			return evaluate(zones[i].value);
+-		if (*triggers < zones[i + 1].start) {
+-			float coefficient = 1.0f - (*triggers - zones[i].end) /
+-						  (zones[i + 1].start - zones[i].end);
+-			return qtiAwbBlendCoordinates(evaluate(zones[i].value),
+-						     evaluate(zones[i + 1].value), coefficient);
+-		}
+-	}
+-	return evaluate(zones.back().value);
++	return qtiAwbEvaluateTrigger(table, triggers);
