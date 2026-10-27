@@ -1,0 +1,78 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add factory AWB statistics primitives
+
+Parse CAMSS BG means and counts in the QTI eight-bit reference domain,
+retain saturation screening precedence, and enumerate the factory 4x3
+subsampling order for the native AWB processing chain.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_statistics.h b/src/libcamera/pipeline/qcom/awb_statistics.h
+new file mode 100644
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_statistics.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++namespace libcamera::qcom {
++
++struct QtiAwbStatistics {
++	std::array<float, 3> rgb;
++	std::array<uint32_t, 3> counts;
++	float rg;
++	float bg;
++	float saturation;
++};
++
++struct QtiAwbScreening {
++	std::array<float, 3> minimumRgb;
++	float maximumSaturation;
++};
++
++enum class QtiAwbRegionStatus {
++	Valid,
++	Dark,
++	Saturated,
++};
++
++inline QtiAwbStatistics qtiAwbParseBg(const uint32_t *region,
++				     unsigned int bitDepth, unsigned int pixels)
++{
++	uint32_t red = region[4] & 0xffff;
++	uint32_t blue = region[4] >> 16;
++	uint32_t green = (region[5] & 0xffff) + (region[5] >> 16);
++	uint32_t scale = 1U << (bitDepth > 8 ? bitDepth - 8 : 0);
++	float r = red ? static_cast<float>(region[0] & 0x3fffffff) / (red * scale) : 0;
++	float b = blue ? static_cast<float>(region[1] & 0x3fffffff) / (blue * scale) : 0;
++	float g = green ? static_cast<float>((region[2] & 0x3fffffff) +
++					    (region[3] & 0x3fffffff)) / (green * scale) : 0;
++	float saturation = static_cast<float>(static_cast<int32_t>(pixels - red - blue - green)) *
++			   100.0f / pixels;
++
++	return { { r, g, b }, { red, green, blue },
++		 g ? r / g : 0, g ? b / g : 0, saturation };
++}
++
++inline QtiAwbRegionStatus qtiAwbScreen(const QtiAwbStatistics &stat,
++				      const QtiAwbScreening &tuning)
++{
++	if (stat.saturation >= tuning.maximumSaturation)
++		return QtiAwbRegionStatus::Saturated;
++	for (unsigned int i = 0; i < stat.rgb.size(); i++)
++		if (stat.rgb[i] <= tuning.minimumRgb[i])
++			return QtiAwbRegionStatus::Dark;
++	return QtiAwbRegionStatus::Valid;
++}
++
++inline unsigned int qtiAwbSampleIndex(unsigned int sample, unsigned int width)
++{
++	/* SFSubSmpV1 mode 0 selects the first column in each 4x3 tile. */
++	unsigned int tile = sample / 3;
++	unsigned int row = tile / (width / 4) * 3 + sample % 3;
++	unsigned int column = tile % (width / 4) * 4;
++	return row * width + column;
++}
++
++} /* namespace libcamera::qcom */
