@@ -1,0 +1,174 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add front AWB mixed-light classification
+
+Add factory region geometry and coordinate trigger interpolation. Track
+IMX520 mixed-light detection across frames and evaluate the exclusion
+tree using the previous count and the current sample denominator.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_zones.h b/src/libcamera/pipeline/qcom/awb_zones.h
+new file mode 100644
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_zones.h
+@@ -0,0 +1,95 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++#include "awb_weights.h"
++
++namespace libcamera::qcom {
++
++using QtiAwbCoordinates = std::array<float, 6>;
++
++enum class QtiAwbGeometry {
++	Rectangle,
++	Triangle,
++	Cct,
++};
++
++inline bool qtiAwbZoneContains(QtiAwbGeometry geometry, const QtiAwbCoordinates &c,
++			       float rg, float bg, float cct, uint32_t valid)
++{
++	switch (geometry) {
++	case QtiAwbGeometry::Rectangle:
++		return c[0] <= rg && rg <= c[2] && c[3] <= bg && bg <= c[1];
++	case QtiAwbGeometry::Triangle: {
++		float dx = c[2] - c[0];
++		float dy = c[3] - c[1];
++		float ex = c[4] - c[0];
++		float ey = c[5] - c[1];
++		/* Keep the factory cross-product order at strict triangle boundaries. */
++		float denominator = std::fma(dx, ey, -(dy * ex));
++		float first = std::fma(dy, rg, -(dx * bg));
++		float firstOrigin = std::fma(c[0], dy, -(dx * c[1]));
++		float v = -(first - firstOrigin) / denominator;
++		float second = std::fma(ey, rg, -(ex * bg));
++		float secondOrigin = std::fma(c[0], ey, -(c[1] * ex));
++		float u = (second - secondOrigin) / denominator;
++		return u > 0 && v > 0 && u + v < 1;
++	}
++	case QtiAwbGeometry::Cct:
++		return valid == 1 && c[0] <= cct && cct <= c[1];
++	}
++	return false;
++}
++
++inline QtiAwbCoordinates qtiAwbBlendCoordinates(const QtiAwbCoordinates &first,
++					       const QtiAwbCoordinates &last,
++					       float coefficient)
++{
++	QtiAwbCoordinates result;
++	for (std::size_t i = 0; i < result.size(); i++)
++		result[i] = qtiAwbBlend(first[i], last[i], coefficient);
++	return result;
++}
++
++template<unsigned int Depth>
++struct QtiAwbCoordinateTable {
++	using Value = QtiAwbCoordinateTable<Depth - 1>;
++	std::vector<QtiAwbWeightZone<Value>> zones;
++};
++
++template<>
++struct QtiAwbCoordinateTable<1> {
++	using Value = QtiAwbCoordinates;
++	std::vector<QtiAwbWeightZone<Value>> zones;
++};
++
++template<unsigned int Depth>
++QtiAwbCoordinates qtiAwbEvaluateCoordinates(const QtiAwbCoordinateTable<Depth> &table,
++					   const float *triggers)
++{
++	const auto &zones = table.zones;
++	auto evaluate = [triggers](const typename QtiAwbCoordinateTable<Depth>::Value &value) {
++		if constexpr (Depth == 1)
++			return value;
++		else
++			return qtiAwbEvaluateCoordinates(value, triggers + 1);
++	};
++	/* Coordinate tables include the upper endpoint, unlike weight curves. */
++	for (std::size_t i = 0; i + 1 < zones.size(); i++) {
++		if (*triggers <= zones[i].end)
++			return evaluate(zones[i].value);
++		if (*triggers < zones[i + 1].start) {
++			float coefficient = 1.0f - (*triggers - zones[i].end) /
++						  (zones[i + 1].start - zones[i].end);
++			return qtiAwbBlendCoordinates(evaluate(zones[i].value),
++						     evaluate(zones[i + 1].value), coefficient);
++		}
++	}
++	return evaluate(zones.back().value);
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_mlc.h b/src/libcamera/pipeline/qcom/awb_mlc.h
+new file mode 100644
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_mlc.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <cstdint>
++#include <utility>
++
++#include "awb_zones.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbMlcRegion {
++	uint32_t valid;
++	bool excluded;
++};
++
++class QtiAwbImx520Mlc
++{
++public:
++	QtiAwbImx520Mlc(QtiAwbCoordinateTable<1> detection,
++			QtiAwbCoordinateTable<3> exclusion)
++		: detection_(std::move(detection)), exclusion_(std::move(exclusion))
++	{
++	}
++
++	void reset()
++	{
++		detected_ = 0;
++	}
++
++	void startFrame(float lux, unsigned int samples, float trigger15)
++	{
++		detectionCoordinates_ = qtiAwbEvaluateCoordinates(detection_, &lux);
++		/* The exclusion tree uses trigger indices 0, 5, 15 in the front profile. */
++		float triggers[] = { lux, static_cast<float>(detected_) / samples, trigger15 };
++		exclusionCoordinates_ = qtiAwbEvaluateCoordinates(exclusion_, triggers);
++		detected_ = 0;
++	}
++
++	QtiAwbMlcRegion process(float rg, float bg, float cct, uint32_t valid)
++	{
++		bool excluded = qtiAwbZoneContains(QtiAwbGeometry::Rectangle,
++						 exclusionCoordinates_, rg, bg, cct, valid);
++		if (excluded)
++			valid = 0;
++		if (qtiAwbZoneContains(QtiAwbGeometry::Cct, detectionCoordinates_, rg, bg, cct, valid))
++			detected_++;
++		return { valid, excluded };
++	}
++
++	const QtiAwbCoordinates &detectionCoordinates() const { return detectionCoordinates_; }
++	const QtiAwbCoordinates &exclusionCoordinates() const { return exclusionCoordinates_; }
++	unsigned int detected() const { return detected_; }
++
++private:
++	QtiAwbCoordinateTable<1> detection_;
++	QtiAwbCoordinateTable<3> exclusion_;
++	QtiAwbCoordinates detectionCoordinates_{};
++	QtiAwbCoordinates exclusionCoordinates_{};
++	unsigned int detected_ = 0;
++};
++
++} /* namespace libcamera::qcom */
