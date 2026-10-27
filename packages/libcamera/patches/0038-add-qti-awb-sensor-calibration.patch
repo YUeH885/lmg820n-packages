@@ -1,0 +1,163 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add native QTI sensor calibration factors
+
+Generate the sensorCalV1 configuration and compute ten illuminant
+calibration slots, including missing-light propagation and fluorescent
+handling. Expose CCT-selected factors and sensor/golden ratio conversion.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_calibration.h b/src/libcamera/pipeline/qcom/awb_calibration.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_calibration.h
+@@ -0,0 +1,124 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <vector>
++
++#include "awb_output.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbCalibrationConfiguration {
++	bool enabled;
++	unsigned int illuminantCount;
++	std::array<float, 6> ccts;
++	std::array<QtiAwbPoint, 15> golden;
++};
++
++struct QtiAwbIlluminantCalibration {
++	uint32_t valid;
++	uint32_t cct;
++	QtiAwbPoint measured;
++};
++
++class QtiAwbCalibration
++{
++public:
++	QtiAwbCalibration()
++	{
++		factors_.fill({ 1, 1 });
++	}
++
++	bool configure(const QtiAwbCalibrationConfiguration &config,
++		       const std::vector<QtiAwbIlluminantCalibration> &measured)
++	{
++		if (!config.enabled || measured.empty()) {
++			factors_.fill({ 1, 1 });
++			return true;
++		}
++		/* Configure seeds the output slots with golden points before computing factors. */
++		std::copy_n(config.golden.begin(), factors_.size(), factors_.begin());
++		if (measured.size() != config.illuminantCount)
++			return false;
++
++		struct Entry {
++			bool valid = false;
++			QtiAwbPoint measured{}, golden{};
++		};
++		std::array<Entry, 10> entries{};
++		for (unsigned int i = 0; i < measured.size(); i++) {
++			unsigned int index = calibrationIndex(config.ccts[i]);
++			if (index < entries.size())
++				entries[index] = { bool(measured[i].valid), measured[i].measured, config.golden[i] };
++		}
++		bool fluorescent = entries[4].valid;
++		bool warmFluorescent = entries[6].valid;
++		bool incandescent = entries[7].valid;
++		bool horizon = entries[8].valid;
++		unsigned int first = 0;
++		while (first < entries.size() && !entries[first].valid)
++			first++;
++		if (first == entries.size())
++			return false;
++		for (unsigned int i = first + 1; i < entries.size(); i++)
++			if (!entries[i].valid)
++				entries[i] = entries[i - 1];
++		for (unsigned int i = first; i > 0; i--)
++			entries[i - 1] = entries[i];
++
++		/* Fluorescent slots share their nearest available calibrated illuminant. */
++		if (fluorescent && warmFluorescent)
++			entries[5] = entries[4];
++		else if (warmFluorescent)
++			entries[4] = entries[5] = entries[6];
++		else if (fluorescent)
++			entries[5] = entries[6] = entries[4];
++		if (incandescent && !horizon)
++			entries[8] = entries[7];
++		else if (!incandescent && horizon)
++			entries[7] = entries[8];
++		if (!fluorescent && !warmFluorescent && config.illuminantCount == 2) {
++			Entry middle{ true,
++				{ (entries[3].measured.rg + entries[7].measured.rg) * 0.5f,
++				  (entries[3].measured.bg + entries[7].measured.bg) * 0.5f },
++				{ (entries[3].golden.rg + entries[7].golden.rg) * 0.5f,
++				  (entries[3].golden.bg + entries[7].golden.bg) * 0.5f } };
++			entries[4] = entries[5] = entries[6] = middle;
++		}
++		for (unsigned int i = 0; i < entries.size(); i++)
++			factors_[i] = { entries[i].measured.rg / entries[i].golden.rg,
++					entries[i].measured.bg / entries[i].golden.bg };
++		return true;
++	}
++
++	const std::array<QtiAwbPoint, 10> &factors() const { return factors_; }
++
++	QtiAwbPoint forCct(float cct) const { return factors_[qtiAwbLightId(cct)]; }
++
++	QtiAwbPoint toSensor(QtiAwbPoint point, unsigned int lightId) const
++	{
++		return { point.rg * factors_[lightId].rg, point.bg * factors_[lightId].bg };
++	}
++
++	QtiAwbPoint toGolden(QtiAwbPoint point, unsigned int lightId) const
++	{
++		return { point.rg / factors_[lightId].rg, point.bg / factors_[lightId].bg };
++	}
++
++private:
++	static unsigned int calibrationIndex(float cct)
++	{
++		constexpr std::array<float, 5> thresholds{ 6000, 4500, 4000, 3425, 2575 };
++		constexpr std::array<unsigned int, 6> indices{ 2, 3, 4, 6, 7, 8 };
++		for (unsigned int i = 0; i < thresholds.size(); i++)
++			if (cct >= thresholds[i])
++				return indices[i];
++		return cct >= 0 ? indices.back() : 10;
++	}
++
++	std::array<QtiAwbPoint, 10> factors_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_front_configuration.h b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+--- a/src/libcamera/pipeline/qcom/awb_front_configuration.h
++++ b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+@@ -6,0 +7 @@
++#include "awb_calibration.h"
+@@ -41,0 +43 @@
++	QtiAwbCalibrationConfiguration calibration;
+diff --git a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+@@ -28,0 +29,17 @@
++	config.calibration = { true, 5, { 6500.0f, 3800.0f, 2850.0f, 5000.0f, 2300.0f, 5000.0f }, { {
++		{ 0.533203006f, 0.573242009f },
++		{ 0.533203006f, 0.573242009f },
++		{ 0.767578006f, 0.38964799f },
++		{ 0.533203006f, 0.573242009f },
++		{ 0.767578006f, 0.38964799f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 1.0f },
++	} } };
