@@ -1,0 +1,147 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: chain front AWB statistics and frame history
+
+Process factory-sized BG frames through screening, region weights,
+dispatch, MLC, scene analysis, aggregation, convergence and RGB output.
+Keep decision and filtered histories distinct and reset both with MLC.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_front.h b/src/libcamera/pipeline/qcom/awb_front.h
+new file mode 100644
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_front.h
+@@ -0,0 +1,135 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++#include "awb_front_configuration.h"
++#include "awb_output.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbBgFrame {
++	const uint32_t *regions;
++	unsigned int bitDepth;
++	unsigned int pixelsPerRegion;
++	int32_t number;
++	float lux;
++	float mlcTrigger15;
++};
++
++struct QtiAwbFrontResult {
++	uint32_t samples;
++	uint32_t admitted;
++	uint32_t mlcDetected;
++	QtiAwbAgwStatistics agw;
++	std::vector<QtiAwbDecision> scenes;
++	QtiAwbAggregatedTarget target;
++	QtiAwbTemporalResult filtered;
++	QtiAwbGainResult adjusted;
++	std::array<float, 3> gains;
++	uint32_t cct;
++	uint32_t lightId;
++};
++
++/* Normal streaming with unit calibration and SFSubSmpV1 mode 0. */
++class QtiAwbFront
++{
++public:
++	static constexpr unsigned int Width = 64;
++	static constexpr unsigned int Height = 48;
++
++	QtiAwbFront(QtiAwbFrontConfiguration config, QtiAwbPoint initial)
++		: config_(std::move(config)), locus_(config_.reference),
++		  mlc_(config_.mlcDetection, config_.mlcExclusion),
++		  temporal_(config_.temporal), gain_(config_.gain)
++	{
++		reset(initial);
++	}
++
++	void reset(QtiAwbPoint initial)
++	{
++		mlc_.reset();
++		temporal_.reset();
++		previousTarget_ = previousFiltered_ = retainedTarget_ = initial;
++	}
++
++	QtiAwbFrontResult process(const QtiAwbBgFrame &frame)
++	{
++		QtiAwbFrontResult result{};
++		/* The factory sampler fixes the tile offsets to a 64x48 grid. */
++		result.samples = Width * Height / 4;
++		mlc_.startFrame(frame.lux, result.samples, frame.mlcTrigger15);
++		std::vector<QtiAwbDetectionAccumulator> detectors(config_.scenes.size());
++		std::vector<std::vector<QtiAwbDetectionZone>> zones(config_.scenes.size());
++		for (unsigned int i = 0; i < config_.scenes.size(); i++)
++			for (const auto &zone : config_.scenes[i].zones)
++				zones[i].push_back({ zone.group, zone.geometry,
++					qtiAwbEvaluateCoordinates(zone.coordinates, &frame.lux) });
++		QtiAwbAgwAccumulator accumulator;
++		for (unsigned int i = 0; i < result.samples; i++) {
++			unsigned int index = qtiAwbSampleIndex(i, Width);
++			auto stat = qtiAwbParseBg(frame.regions + index * 6,
++						frame.bitDepth, frame.pixelsPerRegion);
++			if (qtiAwbScreen(stat, config_.screening) != QtiAwbRegionStatus::Valid)
++				continue;
++			result.admitted++;
++			auto reference = locus_.evaluate({ stat.rg, stat.bg });
++			QtiAwbRegion region{ stat.rg, stat.bg, reference.cct,
++				config_.regionWeights.distanceWeight(frame.lux, reference.cct, reference.distance),
++				config_.regionWeights.illuminantWeight(frame.lux, reference.cct), 1 };
++			qtiAwbFilterZeroWeights(region);
++			for (unsigned int s = 0; s < detectors.size(); s++)
++				detectors[s].add(zones[s], region);
++			result.mlcDetected += qtiAwbZoneContains(QtiAwbGeometry::Cct,
++				mlc_.detectionCoordinates(), region.rg, region.bg, region.cct, region.valid);
++			region.valid = mlc_.process(region.rg, region.bg, region.cct, region.valid).valid;
++			accumulator.add(region);
++		}
++		mlc_.finishFrame(result.mlcDetected);
++		result.agw = accumulator.result();
++		QtiAwbSceneMetrics metrics{};
++		metrics[0] = frame.lux;
++		metrics[1] = locus_.evaluate(result.agw.weightedMean).cct;
++		metrics[2] = qtiAwbCountRatio(result.agw.valid, result.samples);
++		std::array<float, 1> confidence{};
++		qtiAwbSceneValue(config_.agw.table, config_.agw.indices, metrics, confidence);
++		std::vector<QtiAwbDecision> decisions{
++			{ result.agw.weightedMean, confidence[0], 1, 1, 1 }
++		};
++		for (unsigned int i = 0; i < config_.scenes.size(); i++) {
++			auto groups = detectors[i].result();
++			auto sceneMetrics = qtiAwbSceneStatistics(metrics, groups, result.agw, result.samples, locus_);
++			result.scenes.push_back(qtiAwbAnalyzeScene(config_.scenes[i].analysis, sceneMetrics,
++				result.agw.weightedMean, groups, [](auto point) { return point; }));
++			decisions.push_back(result.scenes.back());
++		}
++		result.target = qtiAwbAggregate(config_.aggregation, std::move(decisions), previousTarget_);
++		if (result.target.confidence && result.target.point.rg && result.target.point.bg)
++			retainedTarget_ = result.target.point;
++		result.filtered = temporal_.run(frame.number, result.target.point, result.target.confidence,
++			previousFiltered_, retainedTarget_, locus_);
++		result.adjusted = gain_.run(frame.lux, result.filtered.point, result.filtered.point, locus_);
++		result.gains = qtiAwbRgbGains(result.adjusted.point);
++		/* Process publishes the filtered CCT before gain adjustment. */
++		result.cct = static_cast<uint32_t>(result.filtered.cct);
++		result.lightId = qtiAwbLightId(result.cct);
++		previousTarget_ = result.target.point;
++		previousFiltered_ = result.filtered.point;
++		return result;
++	}
++
++private:
++	QtiAwbFrontConfiguration config_;
++	QtiAwbLocus locus_;
++	QtiAwbImx520Mlc mlc_;
++	QtiAwbTemporalConvergence temporal_;
++	QtiAwbGainAdjustment gain_;
++	QtiAwbPoint previousTarget_{};
++	QtiAwbPoint previousFiltered_{};
++	QtiAwbPoint retainedTarget_{};
++};
++
++} /* namespace libcamera::qcom */
