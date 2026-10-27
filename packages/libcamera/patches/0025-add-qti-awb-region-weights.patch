@@ -1,0 +1,115 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add factory AWB region weight interpolation
+
+Evaluate the factory lux/CCT/distance and lux/CCT weight tables in their
+stored order. Scale distances by interpolated gray-zone limits when
+blending adjacent CCT curves and preserve single-precision arithmetic.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_weights.h b/src/libcamera/pipeline/qcom/awb_weights.h
+new file mode 100644
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_weights.h
+@@ -0,0 +1,103 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <cmath>
++#include <cstddef>
++#include <vector>
++
++namespace libcamera::qcom {
++
++template<typename T>
++struct QtiAwbWeightZone {
++	float start;
++	float end;
++	T value;
++};
++
++using QtiAwbWeightCurve = std::vector<QtiAwbWeightZone<float>>;
++using QtiAwbDistanceCctTable = std::vector<QtiAwbWeightZone<QtiAwbWeightCurve>>;
++using QtiAwbDistanceWeights = std::vector<QtiAwbWeightZone<QtiAwbDistanceCctTable>>;
++using QtiAwbIlluminantWeights = std::vector<QtiAwbWeightZone<QtiAwbWeightCurve>>;
++
++struct QtiAwbWeightSelection {
++	std::size_t first;
++	std::size_t last;
++	float coefficient;
++};
++
++inline float qtiAwbBlend(float first, float last, float coefficient)
++{
++	return std::fma(first, coefficient, (1.0f - coefficient) * last);
++}
++
++/* Tables are nonempty and retain the factory order, including overlapping zones. */
++template<typename T>
++QtiAwbWeightSelection qtiAwbSelectWeight(const std::vector<QtiAwbWeightZone<T>> &zones,
++				       float input)
++{
++	for (std::size_t i = 0; i + 1 < zones.size(); i++) {
++		if (input < zones[i].end)
++			return { i, i, 1 };
++		if (input < zones[i + 1].start) {
++			float coefficient = 1.0f - (input - zones[i].end) /
++						  (zones[i + 1].start - zones[i].end);
++			return { i, i + 1, coefficient };
++		}
++	}
++	return { zones.size() - 1, zones.size() - 1, 1 };
++}
++
++template<typename T, typename Evaluate>
++float qtiAwbInterpolateWeight(const std::vector<QtiAwbWeightZone<T>> &zones,
++			      float input, Evaluate evaluate)
++{
++	QtiAwbWeightSelection selection = qtiAwbSelectWeight(zones, input);
++	float first = evaluate(zones[selection.first].value);
++	if (selection.first == selection.last)
++		return first;
++	return qtiAwbBlend(first, evaluate(zones[selection.last].value), selection.coefficient);
++}
++
++inline float qtiAwbCurveWeight(const QtiAwbWeightCurve &curve, float input)
++{
++	return qtiAwbInterpolateWeight(curve, input, [](float value) { return value; });
++}
++
++inline float qtiAwbDistanceCctWeight(const QtiAwbDistanceCctTable &table,
++				    float cct, float distance)
++{
++	QtiAwbWeightSelection selection = qtiAwbSelectWeight(table, cct);
++	const auto &first = table[selection.first].value;
++	if (selection.first == selection.last)
++		return qtiAwbCurveWeight(first, distance);
++	const auto &last = table[selection.last].value;
++	/* Interpolate gray-zone limits before mapping distance into each CCT curve. */
++	float firstLimit = distance < 0 ? first[1].end : first.back().start;
++	float lastLimit = distance < 0 ? last[1].end : last.back().start;
++	float normalized = distance / qtiAwbBlend(firstLimit, lastLimit, selection.coefficient);
++	return qtiAwbBlend(qtiAwbCurveWeight(first, firstLimit * normalized),
++			   qtiAwbCurveWeight(last, lastLimit * normalized), selection.coefficient);
++}
++
++struct QtiAwbRegionWeights {
++	QtiAwbDistanceWeights distance;
++	QtiAwbIlluminantWeights illuminant;
++
++	float distanceWeight(float lux, float cct, float signedDistance) const
++	{
++		return qtiAwbInterpolateWeight(distance, lux,
++			[cct, signedDistance](const QtiAwbDistanceCctTable &table) {
++				return qtiAwbDistanceCctWeight(table, cct, signedDistance);
++			});
++	}
++
++	float illuminantWeight(float lux, float cct) const
++	{
++		return qtiAwbInterpolateWeight(illuminant, lux,
++			[cct](const QtiAwbWeightCurve &curve) {
++				return qtiAwbCurveWeight(curve, cct);
++			});
++	}
++};
++
++} /* namespace libcamera::qcom */
