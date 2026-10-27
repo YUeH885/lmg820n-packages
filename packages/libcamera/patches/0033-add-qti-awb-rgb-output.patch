@@ -1,0 +1,17 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: normalize final AWB RGB gains
+
+Convert the adjusted white-point ratios to RGB gains with the factory
+minimum-channel normalization used before PopulateOutput.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_output.h b/src/libcamera/pipeline/qcom/awb_output.h
+--- a/src/libcamera/pipeline/qcom/awb_output.h
++++ b/src/libcamera/pipeline/qcom/awb_output.h
+@@ -9,0 +10,7 @@
++
++inline std::array<float, 3> qtiAwbRgbGains(QtiAwbPoint point)
++{
++	float scale = std::fmax(point.rg, 1.0f);
++	scale = point.bg > scale ? point.bg : scale;
++	return { scale / point.rg, scale, scale / point.bg };
++}
