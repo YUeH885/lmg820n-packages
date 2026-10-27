@@ -1,0 +1,224 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: apply IMX520 module white-balance calibration
+
+Load verified module ratios through the sensor NVMEM provider. Apply
+calibration to the reference locus, initialization, detection zones and
+fixed scene targets. Query the unchanged gain mesh with the factory's
+reciprocal-multiply conversion. Publish calibrated startup gains and use
+the calibrated locus for manual white-balance color temperature.
+
+diff --git a/src/libcamera/pipeline/qcom/imx520_awb_calibration.h b/src/libcamera/pipeline/qcom/imx520_awb_calibration.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/imx520_awb_calibration.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <vector>
++
++#include "awb_calibration.h"
++
++namespace libcamera::qcom {
++
++inline std::optional<std::vector<QtiAwbIlluminantCalibration>>
++imx520AwbCalibration(const std::array<uint8_t, 16> &block)
++{
++	auto word = [&block](unsigned int offset) -> uint16_t {
++		return block[offset] | static_cast<uint16_t>(block[offset + 1]) << 8;
++	};
++	for (unsigned int offset : { 0U, 8U }) {
++		unsigned int sum = 0;
++		for (unsigned int i = 0; i < 6; i++)
++			sum += block[offset + i];
++		if (!sum || sum != word(offset + 6))
++			return std::nullopt;
++	}
++	constexpr std::array<unsigned int, 5> ccts{ 6500, 3800, 2850, 5000, 2300 };
++	constexpr std::array<unsigned int, 5> offsets{ 0, 0, 8, 0, 8 };
++	std::vector<QtiAwbIlluminantCalibration> result;
++	for (unsigned int i = 0; i < ccts.size(); i++) {
++		int16_t red = word(offsets[i]);
++		int16_t blue = word(offsets[i] + 2);
++		result.push_back({ 1, ccts[i], { red / 1024.0f, blue / 1024.0f } });
++	}
++	return result;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_front.h b/src/libcamera/pipeline/qcom/awb_front.h
+--- a/src/libcamera/pipeline/qcom/awb_front.h
++++ b/src/libcamera/pipeline/qcom/awb_front.h
+@@ -38 +38 @@
+-/* Normal streaming with unit calibration and SFSubSmpV1 mode 0. */
++/* Normal streaming with sensor calibration and SFSubSmpV1 mode 0. */
+@@ -45,2 +45,3 @@
+-	explicit QtiAwbFront(QtiAwbFrontConfiguration config)
+-		: config_(std::move(config)), locus_(config_.reference),
++	explicit QtiAwbFront(QtiAwbFrontConfiguration config, QtiAwbCalibration calibration = {})
++		: config_(std::move(config)), calibration_(std::move(calibration)),
++		  reference_(calibratedReference()), locus_(reference_),
+@@ -52,0 +54,7 @@
++	uint32_t colourTemperature(QtiAwbPoint point) const
++	{
++		return static_cast<uint32_t>(locus_.evaluate(point).cct);
++	}
++
++	std::array<float, 3> initialGains() const { return qtiAwbRgbGains(initialPoint()); }
++
+@@ -55 +63 @@
+-		QtiAwbPoint initial = qtiAwbInitialPoint(config_.initial, { 1, 1 });
++		QtiAwbPoint initial = initialPoint();
+@@ -66 +74,2 @@
+-		mlc_.startFrame(frame.lux, result.samples, frame.mlcTrigger15);
++		mlc_.startFrame(frame.lux, result.samples, frame.mlcTrigger15,
++			[this](auto geometry, auto coordinates) { return calibrateZone(geometry, coordinates); });
+@@ -72 +81 @@
+-					qtiAwbEvaluateCoordinates(zone.coordinates, &frame.lux) });
++					calibrateZone(zone.geometry, qtiAwbEvaluateCoordinates(zone.coordinates, &frame.lux)) });
+@@ -108 +117 @@
+-				result.agw.weightedMean, groups, [](auto point) { return point; }));
++				result.agw.weightedMean, groups, [this](auto point) { return calibratePoint(point); }));
+@@ -116 +125,4 @@
+-		result.adjusted = gain_.run(frame.lux, result.filtered.point, result.filtered.point, locus_);
++		auto factor = calibration_.factors()[locus_.evaluate(result.filtered.point).illuminant];
++		QtiAwbPoint gainReference{ result.filtered.point.rg * (1.0f / factor.rg),
++					   result.filtered.point.bg * (1.0f / factor.bg) };
++		result.adjusted = gain_.run(frame.lux, result.filtered.point, gainReference, locus_);
+@@ -126,0 +139,29 @@
++	QtiAwbPoint initialPoint() const
++	{
++		return qtiAwbInitialPoint(config_.initial, calibration_.forCct(config_.initial.cct));
++	}
++
++	std::array<QtiAwbPoint, 15> calibratedReference() const
++	{
++		auto reference = config_.reference;
++		for (unsigned int i = 0; i < calibration_.factors().size(); i++)
++			reference[i] = calibration_.toSensor(reference[i], i);
++		return reference;
++	}
++
++	QtiAwbPoint calibratePoint(QtiAwbPoint point) const
++	{
++		return calibration_.toSensor(point, locus_.evaluate(point).illuminant);
++	}
++
++	QtiAwbCoordinates calibrateZone(QtiAwbGeometry geometry, QtiAwbCoordinates coordinates) const
++	{
++		if (geometry != QtiAwbGeometry::Cct)
++			for (unsigned int i = 0; i < coordinates.size(); i += 2) {
++				auto point = calibratePoint({ coordinates[i], coordinates[i + 1] });
++				coordinates[i] = point.rg;
++				coordinates[i + 1] = point.bg;
++			}
++		return coordinates;
++	}
++
+@@ -127,0 +169,2 @@
++	QtiAwbCalibration calibration_;
++	std::array<QtiAwbPoint, 15> reference_;
+diff --git a/src/libcamera/pipeline/qcom/awb_mlc.h b/src/libcamera/pipeline/qcom/awb_mlc.h
+--- a/src/libcamera/pipeline/qcom/awb_mlc.h
++++ b/src/libcamera/pipeline/qcom/awb_mlc.h
+@@ -30 +30,2 @@
+-	void startFrame(float lux, unsigned int samples, float trigger15)
++	template<typename Calibrate>
++	void startFrame(float lux, unsigned int samples, float trigger15, Calibrate calibrate)
+@@ -35 +36,2 @@
+-		exclusionCoordinates_ = qtiAwbEvaluateCoordinates(exclusion_, triggers);
++		exclusionCoordinates_ = calibrate(QtiAwbGeometry::Rectangle,
++						qtiAwbEvaluateCoordinates(exclusion_, triggers));
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -62,0 +63 @@
++#include "imx520_awb_calibration.h"
+@@ -466,2 +467,2 @@
+-int loadAfModel(const std::string &sensorId, std::optional<LgAfModel> *model,
+-		std::string *eepromPath)
++int calibrationSource(const std::string &sensorId, unsigned int *cameraId,
++		      std::filesystem::path *nvmem)
+@@ -480 +481 @@
+-	unsigned int cameraId = readBe32(property);
++	*cameraId = readBe32(property);
+@@ -511,0 +513,7 @@
++	*nvmem = provider / "nvmem";
++	return 0;
++}
++
++int loadAfModel(unsigned int cameraId, const std::filesystem::path &nvmem,
++		std::optional<LgAfModel> *model)
++{
+@@ -513,2 +521 @@
+-	std::filesystem::path nvmem = provider / "nvmem";
+-	ret = readFile(nvmem, LgAfModel::eepromOffset(cameraId), &block);
++	int ret = readFile(nvmem, LgAfModel::eepromOffset(cameraId), &block);
+@@ -516,2 +523 @@
+-		LOG(QcomPipeline, Error)
+-			<< "Failed to read AF calibration from " << nvmem;
++		LOG(QcomPipeline, Error) << "Failed to read AF calibration from " << nvmem;
+@@ -520 +525,0 @@
+-
+@@ -527,2 +531,0 @@
+-
+-	*eepromPath = nvmem.string();
+@@ -541,2 +543,0 @@
+-		if (profile_.awbConfiguration)
+-			qtiAwb_ = std::make_unique<QtiAwbFront>(profile_.awbConfiguration());
+@@ -884,0 +886,7 @@
++	unsigned int cameraId;
++	std::filesystem::path nvmem;
++	if (afEnabled_ || profile_.awbConfiguration) {
++		ret = calibrationSource(sensor_->id(), &cameraId, &nvmem);
++		if (ret)
++			return ret;
++	}
+@@ -886,2 +894 @@
+-		std::string eepromPath;
+-		ret = loadAfModel(sensor_->id(), &afModel_, &eepromPath);
++		ret = loadAfModel(cameraId, nvmem, &afModel_);
+@@ -899 +906 @@
+-			<< " AF calibration from " << eepromPath
++			<< " AF calibration from " << nvmem
+@@ -902,0 +910,26 @@
++	}
++
++	if (profile_.awbConfiguration) {
++		std::array<uint8_t, 16> block;
++		ret = readFile(nvmem, 0, &block);
++		if (ret) {
++			LOG(QcomPipeline, Error) << "Failed to read AWB calibration from " << nvmem;
++			return ret;
++		}
++		auto measured = imx520AwbCalibration(block);
++		if (!measured) {
++			LOG(QcomPipeline, Error) << "Invalid IMX520 AWB calibration checksum";
++			return -EINVAL;
++		}
++		auto config = profile_.awbConfiguration();
++		QtiAwbCalibration calibration;
++		if (!calibration.configure(config.calibration, *measured)) {
++			LOG(QcomPipeline, Error) << "Invalid IMX520 AWB illuminant calibration";
++			return -EINVAL;
++		}
++		auto daylight = calibration.forCct(6500);
++		auto incandescent = calibration.forCct(2850);
++		LOG(QcomPipeline, Info) << "Loaded IMX520 AWB calibration from " << nvmem
++			<< std::setprecision(9) << ": daylight " << daylight.rg << " " << daylight.bg
++			<< ", incandescent " << incandescent.rg << " " << incandescent.bg;
++		qtiAwb_ = std::make_unique<QtiAwbFront>(std::move(config), std::move(calibration));
+@@ -1229 +1262,2 @@
+-			setIfeWb(initial.gains[0], initial.gains[1], initial.gains[2]);
++			auto gains = qtiAwb_->initialGains();
++			setIfeWb(gains[0], gains[1], gains[2]);
+@@ -1240,2 +1274,5 @@
+-	colourTemperature_ = estimateCct(profile_, 1.0 / awbGainR_,
+-					  1.0 / awbGainB_);
++	if (qtiAwb_)
++		colourTemperature_ = qtiAwb_->colourTemperature({ 1.0f / static_cast<float>(awbGainR_),
++							       1.0f / static_cast<float>(awbGainB_) });
++	else
++		colourTemperature_ = estimateCct(profile_, 1.0 / awbGainR_, 1.0 / awbGainB_);
