@@ -1,0 +1,126 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add factory AWB convergence and output conversion
+
+Implement normal startup/default temporal convergence with separate
+filtered and retained-target histories. Convert CCT to reference gains
+and Light ID with the factory interpolation and rounding order.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_temporal.h b/src/libcamera/pipeline/qcom/awb_temporal.h
+new file mode 100644
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_temporal.h
+@@ -0,0 +1,57 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++#include "awb_locus.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbTemporalConfiguration {
++	float startupSpeed;
++	int32_t startupFrames;
++	float defaultSpeed;
++};
++
++struct QtiAwbTemporalResult {
++	QtiAwbPoint point;
++	float cct;
++	float speed;
++	uint32_t startupActive;
++};
++
++class QtiAwbTemporalConvergence
++{
++public:
++	explicit QtiAwbTemporalConvergence(QtiAwbTemporalConfiguration config)
++		: config_(config)
++	{
++	}
++
++	void reset() { startupActive_ = true; }
++
++	QtiAwbTemporalResult run(int32_t frame, QtiAwbPoint target, float confidence,
++				 QtiAwbPoint previousFiltered, QtiAwbPoint previousTarget,
++				 const QtiAwbLocus &locus)
++	{
++		if (startupActive_ && frame > config_.startupFrames)
++			startupActive_ = false;
++		float speed = startupActive_ ? config_.startupSpeed : std::min(config_.defaultSpeed, 1.0f);
++		/* Invalid decisions retain the prior target while filtering continues. */
++		if (target.rg == 0 || target.bg == 0 || confidence == 0)
++			target = previousTarget;
++		QtiAwbPoint point{
++			std::fma(speed, target.rg, (1.0f - speed) * previousFiltered.rg),
++			std::fma(speed, target.bg, (1.0f - speed) * previousFiltered.bg),
++		};
++		return { point, locus.evaluate(point).cct, speed, startupActive_ };
++	}
++
++private:
++	QtiAwbTemporalConfiguration config_;
++	bool startupActive_ = true;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_output.h b/src/libcamera/pipeline/qcom/awb_output.h
+new file mode 100644
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_output.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cmath>
++
++#include "awb_locus.h"
++
++namespace libcamera::qcom {
++
++class QtiAwbReferenceGains
++{
++public:
++	explicit QtiAwbReferenceGains(const std::array<QtiAwbPoint, 15> &reference)
++	{
++		constexpr std::array<unsigned int, 8> indices{ 0, 1, 2, 3, 5, 7, 8, 9 };
++		for (unsigned int i = 0; i < indices.size(); i++)
++			gains_[i] = { 1.0f / reference[indices[i]].rg, 1.0f / reference[indices[i]].bg };
++	}
++
++	QtiAwbPoint fromCct(float cct) const
++	{
++		if (cct >= ccts_.front())
++			return gains_.front();
++		for (unsigned int i = 0; i + 1 < ccts_.size(); i++) {
++			if (cct < ccts_[i + 1])
++				continue;
++			float cold = 1.0f - (cct - ccts_[i]) / (ccts_[i + 1] - ccts_[i]);
++			/* The factory rounds the complementary coefficient before the FMA. */
++			float warm = 1.0f - cold;
++			return { std::fma(gains_[i].rg, cold, gains_[i + 1].rg * warm),
++				 std::fma(gains_[i].bg, cold, gains_[i + 1].bg * warm) };
++		}
++		return gains_.back();
++	}
++
++private:
++	static constexpr std::array<float, 8> ccts_{ 12000, 7500, 6500, 5000, 4000, 2850, 2300, 1500 };
++	std::array<QtiAwbPoint, 8> gains_;
++};
++
++inline unsigned int qtiAwbLightId(float cct)
++{
++	constexpr std::array<float, 7> thresholds{ 8750, 7000, 6000, 4500, 3425, 2575, 1900 };
++	constexpr std::array<unsigned int, 8> ids{ 0, 1, 2, 3, 5, 7, 8, 9 };
++	for (unsigned int i = 0; i < thresholds.size(); i++)
++		if (cct > thresholds[i])
++			return ids[i];
++	return ids.back();
++}
++
++} /* namespace libcamera::qcom */
