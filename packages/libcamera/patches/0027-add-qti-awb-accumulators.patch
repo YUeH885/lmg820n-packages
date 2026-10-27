@@ -1,0 +1,147 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add factory AWB detection and AGW statistics
+
+Accumulate per-scene detection groups with overlap suppression and keep
+raw and weighted gray-world statistics in separate sums. Preserve the
+dispatcher zero-weight filter and the distinct geometry validity rules.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_accumulator.h b/src/libcamera/pipeline/qcom/awb_accumulator.h
+new file mode 100644
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_accumulator.h
+@@ -0,0 +1,135 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <vector>
++
++#include "awb_locus.h"
++#include "awb_zones.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbRegion {
++	float rg;
++	float bg;
++	float cct;
++	float distanceWeight;
++	float illuminantWeight;
++	uint32_t valid;
++};
++
++inline void qtiAwbFilterZeroWeights(QtiAwbRegion &region)
++{
++	if (region.distanceWeight == 0 || region.illuminantWeight == 0)
++		region.valid = 0;
++}
++
++struct QtiAwbDetectionZone {
++	unsigned int group;
++	QtiAwbGeometry geometry;
++	QtiAwbCoordinates coordinates;
++};
++
++struct QtiAwbDetectionGroup {
++	uint32_t count;
++	QtiAwbPoint mean;
++};
++
++class QtiAwbDetectionAccumulator
++{
++public:
++	void reset() { groups_ = {}; }
++
++	void add(const std::vector<QtiAwbDetectionZone> &zones, const QtiAwbRegion &region)
++	{
++		std::array<bool, 4> hit{};
++		for (const auto &zone : zones) {
++			/* Overlap counts once per group, independently for each scene. */
++			if (hit[zone.group] || !qtiAwbZoneContains(zone.geometry, zone.coordinates,
++								region.rg, region.bg, region.cct, region.valid))
++				continue;
++			hit[zone.group] = true;
++			auto &group = groups_[zone.group];
++			group.count++;
++			group.sum.rg += region.rg;
++			group.sum.bg += region.bg;
++		}
++	}
++
++	std::array<QtiAwbDetectionGroup, 4> result() const
++	{
++		std::array<QtiAwbDetectionGroup, 4> result{};
++		for (std::size_t i = 0; i < groups_.size(); i++) {
++			const auto &group = groups_[i];
++			result[i].count = group.count;
++			if (group.count) {
++				result[i].mean.rg = group.sum.rg / group.count;
++				result[i].mean.bg = group.sum.bg / group.count;
++			}
++		}
++		return result;
++	}
++
++private:
++	struct Group {
++		uint32_t count;
++		QtiAwbPoint sum;
++	};
++	std::array<Group, 4> groups_{};
++};
++
++struct QtiAwbAgwStatistics {
++	uint32_t valid;
++	uint32_t total;
++	QtiAwbPoint weightedMean;
++	QtiAwbPoint mean;
++	float weight;
++};
++
++class QtiAwbAgwAccumulator
++{
++public:
++	void reset() { statistics_ = {}; }
++
++	void add(const QtiAwbRegion &region)
++	{
++		statistics_.total++;
++		statistics_.sum.rg += region.rg;
++		statistics_.sum.bg += region.bg;
++		if (region.valid) {
++			float weight = region.distanceWeight * region.illuminantWeight;
++			statistics_.weightedSum.rg = std::fma(region.rg, weight, statistics_.weightedSum.rg);
++			statistics_.weightedSum.bg = std::fma(region.bg, weight, statistics_.weightedSum.bg);
++			statistics_.weight += weight;
++			statistics_.valid++;
++		}
++	}
++
++	QtiAwbAgwStatistics result() const
++	{
++		QtiAwbAgwStatistics result{ statistics_.valid, statistics_.total, {}, {}, statistics_.weight };
++		if (result.weight) {
++			result.weightedMean.rg = statistics_.weightedSum.rg / result.weight;
++			result.weightedMean.bg = statistics_.weightedSum.bg / result.weight;
++		}
++		if (result.total) {
++			result.mean.rg = statistics_.sum.rg / result.total;
++			result.mean.bg = statistics_.sum.bg / result.total;
++		}
++		return result;
++	}
++
++private:
++	struct Accumulation {
++		uint32_t valid;
++		uint32_t total;
++		QtiAwbPoint weightedSum;
++		QtiAwbPoint sum;
++		float weight;
++	};
++	Accumulation statistics_{};
++};
++
++} /* namespace libcamera::qcom */
