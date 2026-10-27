@@ -1,0 +1,156 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: run native factory AWB for the IMX520 profile
+
+Bind the front frame processor to hardware BG statistics and live lux.
+Keep lux available with manual exposure, reset the processor on stream
+start and automatic-mode entry, and apply all three RGB gains to IFE.
+Publish relative ColourGains and their common DigitalGain from applied IFE
+state so metadata describes the quantized hardware gains.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -60,0 +61,2 @@
++#include "awb_front.h"
++#include "imx520_awb_tuning.h"
+@@ -120,0 +123 @@
++	QtiAwbFrontConfiguration (*awbConfiguration)() = nullptr;
+@@ -240,0 +244 @@
++	.awbConfiguration = imx520AwbConfiguration,
+@@ -536,0 +541,2 @@
++		if (profile_.awbConfiguration)
++			qtiAwb_ = std::make_unique<QtiAwbFront>(profile_.awbConfiguration());
+@@ -543,0 +550 @@
++	void resetAwb();
+@@ -582,0 +590 @@
++		double green = 1.0;
+@@ -620,0 +629,4 @@
++	double awbGainG_ = 1.0;
++	std::unique_ptr<QtiAwbFront> qtiAwb_;
++	int32_t awbFrame_ = 0;
++	Size statsInputSize_;
+@@ -657 +669 @@
+-	void setIfeWb(double gainR, double gainB);
++	void setIfeWb(double gainR, double gainG, double gainB);
+@@ -660 +672 @@
+-	bool updateAe(uint32_t sequence, double luma);
++	bool updateAe(uint32_t sequence, double luma, float appliedIndex);
+@@ -984,0 +997 @@
++	ctrls[&controls::DigitalGain] = ControlInfo(1.0f, 4095.0f / 128, 1.0f);
+@@ -1048,0 +1062 @@
++	statsInputSize_ = info.outputSize;
+@@ -1199 +1213 @@
+-void QcomCameraData::setIfeWb(double gainR, double gainB)
++void QcomCameraData::setIfeWb(double gainR, double gainG, double gainB)
+@@ -1201,0 +1216 @@
++	awbGainG_ = gainG;
+@@ -1203,0 +1219,15 @@
++}
++
++void QcomCameraData::resetAwb()
++{
++	awbCounter_ = 0;
++	if (qtiAwb_) {
++		qtiAwb_->reset();
++		awbFrame_ = 0;
++		if (awbEnabled_) {
++			auto initial = profile_.awbConfiguration().initial;
++			setIfeWb(initial.gains[0], initial.gains[1], initial.gains[2]);
++			colourTemperature_ = initial.cct;
++			interpolateCcm(profile_, initial.cct, ccmQ7_);
++		}
++	}
+@@ -1213 +1243 @@
+-	setIfeWb(awbGainR_, awbGainB_);
++	setIfeWb(awbGainR_, 1.0, awbGainB_);
+@@ -1227,2 +1257,2 @@
+-	config.wb_gain_q7[1] = 128;
+-	config.wb_gain_q7[2] = 128;
++	config.wb_gain_q7[1] = std::clamp<int>(std::lround(awbGainG_ * 128), 0, 0xfff);
++	config.wb_gain_q7[2] = config.wb_gain_q7[1];
+@@ -1246,0 +1277 @@
++	state.green = config.wb_gain_q7[1] / 128.0;
+@@ -1256 +1287 @@
+-				 << state.red << " " << state.blue;
++				 << state.red << " " << state.green << " " << state.blue;
+@@ -1371,2 +1402,12 @@
+-	if (aeEnabled_ && aecLuma_)
+-		aeSettled = updateAe(qcom::inputSequence(request.sequence), *aecLuma_);
++	if (aecLuma_) {
++		uint32_t sequence = qcom::inputSequence(request.sequence);
++		ControlList applied = delayedCtrls_->get(sequence);
++		double exposure = applied.get(V4L2_CID_EXPOSURE).get<int32_t>() * lineDurationNs_;
++		double gain = gainFromCode(profile_, applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>());
++		float appliedIndex = aeExposureIndex(profile_, exposure * gain);
++		double lux = aeLuxIndex(profile_, appliedIndex, *aecLuma_);
++		luxIndex_ = luxIndex_ ? *luxIndex_ * profile_.aeLuxFilterFactor +
++				       lux * (1.0 - profile_.aeLuxFilterFactor) : lux;
++		if (aeEnabled_)
++			aeSettled = updateAe(sequence, *aecLuma_, appliedIndex);
++	}
+@@ -1451,12 +1492,2 @@
+-bool QcomCameraData::updateAe(uint32_t sequence, double luma)
+-{
+-	ControlList applied = delayedCtrls_->get(sequence);
+-	double exposure = applied.get(V4L2_CID_EXPOSURE).get<int32_t>() *
+-			  lineDurationNs_;
+-	double gain = gainFromCode(
+-		profile_, applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>());
+-	double total = exposure * gain;
+-	float appliedIndex = aeExposureIndex(profile_, total);
+-	double index = aeLuxIndex(profile_, appliedIndex, luma);
+-	luxIndex_ = luxIndex_ ? *luxIndex_ * profile_.aeLuxFilterFactor +
+-			       index * (1.0 - profile_.aeLuxFilterFactor) : index;
++bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex)
++{
+@@ -1544,0 +1576,21 @@
++	if (qtiAwb_) {
++		if (!luxIndex_)
++			return;
++		unsigned int width = (statsInputSize_.width / QtiAwbFront::Width) & ~1U;
++		unsigned int height = (statsInputSize_.height / QtiAwbFront::Height) & ~1U;
++		float lux = *luxIndex_;
++		auto result = qtiAwb_->process({ awb_.data(), 14, width * height, awbFrame_++, lux, 0 });
++		colourTemperature_ = result.cct;
++		interpolateCcm(profile_, colourTemperature_, ccmQ7_);
++		setIfeWb(result.gains[0], result.gains[1], result.gains[2]);
++		LOG(QcomPipeline, Debug) << std::setprecision(9)
++			<< "QTI AWB stats " << lastStatsSequence_ << " frame " << awbFrame_ - 1
++			<< " lux " << lux << " pixels " << width * height
++			<< " admitted " << result.admitted << " detected " << result.mlcDetected
++			<< " target " << result.target.point.rg << " " << result.target.point.bg
++			<< " confidence " << result.target.confidence
++			<< " filtered " << result.filtered.point.rg << " " << result.filtered.point.bg
++			<< " gains " << result.gains[0] << " " << result.gains[1] << " " << result.gains[2]
++			<< " cct " << result.cct;
++		return;
++	}
+@@ -1607 +1659 @@
+-	setIfeWb(awbGainR_, awbGainB_);
++	setIfeWb(awbGainR_, 1.0, awbGainB_);
+@@ -1840 +1892,6 @@
+-		awbEnabled_ = *controls.get(controls::AwbEnable);
++		bool enabled = *controls.get(controls::AwbEnable);
++		if (enabled && !awbEnabled_ && qtiAwb_) {
++			qtiAwb_->reset();
++			awbFrame_ = 0;
++		}
++		awbEnabled_ = enabled;
+@@ -1938,2 +1995,3 @@
+-		     { static_cast<float>(state.ife.red),
+-		       static_cast<float>(state.ife.blue) });
++		     { static_cast<float>(state.ife.red / state.ife.green),
++		       static_cast<float>(state.ife.blue / state.ife.green) });
++	metadata.set(controls::DigitalGain, static_cast<float>(state.ife.green));
+@@ -2067 +2124,0 @@
+-	data->awbCounter_ = 0;
+@@ -2086,0 +2144 @@
++	data->resetAwb();
+diff --git a/src/libcamera/pipeline/qcom/awb_front.h b/src/libcamera/pipeline/qcom/awb_front.h
+--- a/src/libcamera/pipeline/qcom/awb_front.h
++++ b/src/libcamera/pipeline/qcom/awb_front.h
+@@ -13,0 +14 @@
++/* CAMSS BG regions contain six normal and six saturated-statistics words. */
+@@ -75 +76 @@
+-			auto stat = qtiAwbParseBg(frame.regions + index * 6,
++			auto stat = qtiAwbParseBg(frame.regions + index * 12,
