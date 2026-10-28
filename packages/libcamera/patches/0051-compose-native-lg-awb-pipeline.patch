@@ -1,0 +1,188 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: compose native LG AWB streaming pipeline
+
+Combine calibrated RGB preprocessing, gray aggregation, target selection,
+OHE/DTB/SCD/FOE corrections, optional DNN fusion, convergence and limits.
+Save final output into native history and retain unclipped filter state.
+Preserve processed-frame DTB reset, independent gray flags, latest gray
+coordinates and LED-dependent gain-offset updates across skipped frames.
+
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_pipeline.h b/src/libcamera/pipeline/qcom/lg_awb_pipeline.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_pipeline.h
+@@ -0,0 +1,143 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <optional>
++
++#include "lg_awb_dnn.h"
++#include "lg_awb_exceptions.h"
++#include "lg_awb_gray_core.h"
++
++namespace libcamera::qcom {
++
++struct LgAwbPipelineConfiguration {
++	LgAwbGrayCoreConfiguration gray;
++	LgAwbHistoryConfiguration history;
++	LgAwbGainConfiguration gain;
++	LgAwbOheConfiguration ohe;
++	LgAwbDtbConfiguration dtb;
++	LgAwbScdConfiguration scd;
++	LgAwbFoeConfiguration foe;
++};
++
++struct LgAwbPipelineControls {
++	LgAwbGrayFrameControls gray;
++	bool startup, skipped, aeSettled, fastRequest, afRequest, dtbBlocked;
++	unsigned int usecase;
++	float flatMetric;
++	std::optional<std::array<float, 4>> iqm;
++};
++
++struct LgAwbPipelineResult {
++	LgAwbRgb rgb{};
++	LgAwbGainTarget target;
++	LgAwbConvergenceResult filtered{};
++	uint32_t grayValid = 0, dtbGrayValid = 0;
++	unsigned int dtbSelection = 20;
++	float latestGrayX = 0, oheWeight = 0, foeWeight = 0;
++	LgAwbScdStatus scdStatus = LgAwbScdStatus::InvalidHistoryGain;
++};
++
++class LgAwbPipeline
++{
++public:
++	LgAwbPipeline(const LgAwbPipelineConfiguration &config,
++		      const LgAwbWhiteBalanceCalibration &calibration = {},
++		      const std::optional<std::array<LgAwbDnnPolicy, 2>> &policies = std::nullopt)
++		: gray_(config.gray, calibration), history_(config.history), gain_(config.gain),
++		  convergence_(config.gain.filterFactors), ohe_(config.ohe), dtb_(config.dtb),
++		  scd_(config.scd), foe_(config.foe)
++	{
++		if (policies)
++			dnn_.emplace(*policies, config.gain.limits);
++	}
++
++	void reset()
++	{
++		gray_.reset();
++		history_.reset();
++		target_.reset();
++		convergence_.reset();
++		ohe_.reset();
++		dtb_.reset();
++		foe_.reset();
++		if (dnn_)
++			dnn_->reset();
++		offsets_ = {};
++		grayResult_ = {};
++		result_ = {};
++	}
++
++	const LgAwbPipelineResult &process(const std::array<LgAwbRgb, 3072> &rgb,
++					 const LgAwbPipelineControls &controls)
++	{
++		const auto &frameControls = controls.gray;
++		if (!controls.skipped) {
++			dtb_.reset();
++			offsets_ = gain_.offsets(frameControls.led == 3, frameControls.lux);
++			grayResult_ = gray_.process(rgb, frameControls);
++			result_.dtbGrayValid = grayResult_.grayValid;
++			if (grayResult_.grayValid)
++				result_.latestGrayX = controls.startup ? 0 : grayResult_.gray.colour.x;
++		}
++		result_.grayValid = controls.skipped ? 0 : grayResult_.grayValid;
++		uint32_t beforeTarget = result_.grayValid;
++		result_.target = target_.select(gray_.colour(), history_, grayResult_.gray.colour,
++			grayResult_.gray.cct, result_.grayValid, controls.skipped, frameControls.flashState);
++		if (beforeTarget && !result_.grayValid)
++			result_.dtbGrayValid = 0;
++		result_.target.rgb = gain_.apply(result_.target.rgb, result_.target.cct,
++			offsets_);
++		ohe_.apply(result_.target, gray_.colour(), frameControls.lux, grayResult_.grayCount);
++		dtb_.apply(result_.target, gray_.colour(), gray_.frame().references,
++			gray_.frame().regionCounters.dtb, frameControls.lux, gray_.frame().validFraction,
++			result_.latestGrayX, result_.dtbGrayValid, controls.dtbBlocked);
++		std::optional<float> iqmSecond = controls.iqm ? std::optional((*controls.iqm)[1]) : std::nullopt;
++		result_.scdStatus = scd_.apply(result_.target, history_, gray_.frame().references,
++			{ grayResult_.gray.colour.x, grayResult_.gray.colour.y },
++			{ frameControls.lux, frameControls.flashState, 0, controls.usecase,
++			  grayResult_.gray.cct, grayResult_.gray.illuminant, controls.aeSettled,
++			  controls.flatMetric, iqmSecond }).status;
++		foe_.apply(result_.target, gray_.colour(), { frameControls.lux, frameControls.led,
++			frameControls.outdoor, frameControls.flashOn, iqmSecond });
++		if (dnn_)
++			dnn_->apply(result_.target, controls.iqm, frameControls.lux, controls.startup, frameControls.flashState);
++		std::optional<LgAwbGainTiming> timing = dnn_ ? std::optional(dnn_->timing()) : std::nullopt;
++		result_.filtered = convergence_.update(result_.target.rgb, result_.target.cct,
++			{ static_cast<unsigned int>(result_.target.source), 1, frameControls.flashState,
++			  controls.fastRequest, controls.startup, controls.afRequest, timing }, gray_.colour());
++		result_.rgb = gain_.limit(result_.filtered.rgb);
++		unsigned int source = static_cast<unsigned int>(result_.target.source);
++		if (source <= 9 && source != 2 && source != 3 &&
++		    (frameControls.flashState == 0 || frameControls.flashState == 5))
++			history_.update(result_.rgb, result_.filtered.cct,
++				{ controls.startup, static_cast<bool>(result_.grayValid), controls.aeSettled,
++				  frameControls.flashState, controls.flatMetric });
++		result_.dtbSelection = dtb_.selection();
++		result_.oheWeight = ohe_.weight();
++		result_.foeWeight = foe_.weight();
++		return result_;
++	}
++
++	const LgAwbHistory &history() const { return history_; }
++	const LgAwbGrayCore &grayCore() const { return gray_; }
++	const LgAwbGainFilterState &filterHistory() const { return convergence_.history(); }
++
++private:
++	LgAwbGrayCore gray_;
++	LgAwbHistory history_;
++	LgAwbGain gain_;
++	LgAwbTarget target_;
++	LgAwbConvergence convergence_;
++	LgAwbOhe ohe_;
++	LgAwbDtb dtb_;
++	LgAwbScd scd_;
++	LgAwbFoe foe_;
++	std::optional<LgAwbDnn> dnn_;
++	LgAwbGainOffsets offsets_{};
++	LgAwbGrayResult grayResult_;
++	LgAwbPipelineResult result_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_tuning.h b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -10,0 +11 @@
++#include "lg_awb_pipeline.h"
+@@ -943,0 +945,8 @@
++inline LgAwbPipelineConfiguration imx363LgAwbPipelineConfiguration()
++{
++	return { imx363LgAwbGrayCoreConfiguration(), imx363LgAwbHistoryConfiguration(),
++		 imx363LgAwbGainConfiguration(), imx363LgAwbOheConfiguration(),
++		 imx363LgAwbDtbConfiguration(), imx363LgAwbScdConfiguration(),
++		 imx363LgAwbFoeConfiguration() };
++}
++
+@@ -1861,0 +1871,8 @@
++inline LgAwbPipelineConfiguration imx351LgAwbPipelineConfiguration()
++{
++	return { imx351LgAwbGrayCoreConfiguration(), imx351LgAwbHistoryConfiguration(),
++		 imx351LgAwbGainConfiguration(), imx351LgAwbOheConfiguration(),
++		 imx351LgAwbDtbConfiguration(), imx351LgAwbScdConfiguration(),
++		 imx351LgAwbFoeConfiguration() };
++}
++
+@@ -2853,0 +2871,8 @@
++inline LgAwbPipelineConfiguration s5k3m5LgAwbPipelineConfiguration()
++{
++	return { s5k3m5LgAwbGrayCoreConfiguration(), s5k3m5LgAwbHistoryConfiguration(),
++		 s5k3m5LgAwbGainConfiguration(), s5k3m5LgAwbOheConfiguration(),
++		 s5k3m5LgAwbDtbConfiguration(), s5k3m5LgAwbScdConfiguration(),
++		 s5k3m5LgAwbFoeConfiguration() };
++}
++
