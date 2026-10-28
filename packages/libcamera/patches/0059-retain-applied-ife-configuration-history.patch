@@ -1,0 +1,83 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: retain applied IFE configuration history
+
+Record successful IFE updates by their effective input frame, independently
+of SOF delivery. Report AWB mode with the configuration it accompanies.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -572 +571,0 @@
+-	bool streaming_ = false;
+@@ -578,0 +578 @@
++		bool awbEnabled = true;
+@@ -586 +585,0 @@
+-		IfeState ife;
+@@ -591 +589,0 @@
+-		bool awbEnabled;
+@@ -595,2 +593 @@
+-	IfeState appliedIfe_;
+-	std::optional<std::pair<uint32_t, IfeState>> nextIfe_;
++	std::map<uint32_t, IfeState> ifeStates_;
+@@ -1022,2 +1018,0 @@
+-	for (unsigned int i = 0; i < appliedIfe_.ccm.size(); i++)
+-		appliedIfe_.ccm[i] = ccmQ7_[i] / 128.0f;
+@@ -1153,7 +1148,2 @@
+-	if (nextIfe_ && sequence >= nextIfe_->first) {
+-		appliedIfe_ = nextIfe_->second;
+-		nextIfe_.reset();
+-	}
+-	frameStates_[sequence] = { appliedIfe_,
+-				   lens_ ? static_cast<float>(lensPosition()) : 0.0f,
+-				   afMode_, afState_, afPauseState_, awbEnabled_,
++	frameStates_[sequence] = { lens_ ? static_cast<float>(lensPosition()) : 0.0f,
++				   afMode_, afState_, afPauseState_,
+@@ -1357,0 +1348 @@
++	state.awbEnabled = awbEnabled_;
+@@ -1360,4 +1351,3 @@
+-	if (streaming_)
+-		nextIfe_ = std::make_pair(sequence, state);
+-	else
+-		appliedIfe_ = state;
++	ifeStates_[sequence] = state;
++	while (ifeStates_.size() > 64)
++		ifeStates_.erase(ifeStates_.begin());
+@@ -1925,0 +1916 @@
++		ifePending_ |= enabled != awbEnabled_;
+@@ -2018,0 +2010,16 @@
++	auto ife = ifeStates_.upper_bound(sequence);
++	if (ife == ifeStates_.begin()) {
++		LOG(QcomPipeline, Error) << "Missing IFE configuration for frame " << sequence;
++		return;
++	}
++	const IfeState &appliedIfe = std::prev(ife)->second;
++	metadata.set(controls::ColourGains,
++		     { static_cast<float>(appliedIfe.red / appliedIfe.green),
++		       static_cast<float>(appliedIfe.blue / appliedIfe.green) });
++	metadata.set(controls::DigitalGain, static_cast<float>(appliedIfe.green));
++	metadata.set(controls::ColourTemperature,
++		     static_cast<int32_t>(std::lround(appliedIfe.cct)));
++	metadata.set(controls::ColourCorrectionMatrix,
++		     Span<const float, 9>(appliedIfe.ccm));
++	metadata.set(controls::AwbEnable, appliedIfe.awbEnabled);
++
+@@ -2025,9 +2031,0 @@
+-	metadata.set(controls::ColourGains,
+-		     { static_cast<float>(state.ife.red / state.ife.green),
+-		       static_cast<float>(state.ife.blue / state.ife.green) });
+-	metadata.set(controls::DigitalGain, static_cast<float>(state.ife.green));
+-	metadata.set(controls::ColourTemperature,
+-		     static_cast<int32_t>(std::lround(state.ife.cct)));
+-	metadata.set(controls::ColourCorrectionMatrix,
+-		     Span<const float, 9>(state.ife.ccm));
+-	metadata.set(controls::AwbEnable, state.awbEnabled);
+@@ -2160,2 +2158 @@
+-	data->nextIfe_.reset();
+-	data->streaming_ = false;
++	data->ifeStates_.clear();
+@@ -2195 +2191,0 @@
+-	data->streaming_ = true;
+@@ -2198 +2193,0 @@
+-		data->streaming_ = false;
+@@ -2233 +2227,0 @@
+-	data->streaming_ = false;
