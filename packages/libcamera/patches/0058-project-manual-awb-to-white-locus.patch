@@ -1,0 +1,68 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: constrain manual colour temperature to the white locus
+
+Project calibrated manual white points onto the configured ideal white
+locus before evaluating CCT. Advertise the existing positive manual gain
+minimum so clients see the actual supported range.
+
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_manual.h b/src/libcamera/pipeline/qcom/lg_awb_manual.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_manual.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <limits>
++
++#include "lg_awb_colour.h"
++#include "lg_awb_math.h"
++
++namespace libcamera::qcom {
++
++inline LgAwbPoint lgAwbProjectWhitePoint(const LgAwbColour &colour, LgAwbPoint point)
++{
++	const auto &references = colour.ideal();
++	LgAwbPoint selected = references.front();
++	double nearest = std::numeric_limits<double>::max();
++	for (unsigned int i = 0; i + 1 < references.size(); i++) {
++		auto a = references[i], b = references[i + 1];
++		double dx = static_cast<double>(b.x) - a.x;
++		double dy = static_cast<double>(b.y) - a.y;
++		double length = std::fma(dx, dx, dy * dy);
++		double numerator = std::fma(static_cast<double>(point.x) - a.x, dx,
++					    (static_cast<double>(point.y) - a.y) * dy);
++		double t = std::clamp(numerator / length, 0.0, 1.0);
++		double x = std::fma(t, dx, a.x), y = std::fma(t, dy, a.y);
++		double ex = point.x - x, ey = point.y - y;
++		double distance = std::fma(ex, ex, ey * ey);
++		if (distance < nearest) {
++			nearest = distance;
++			selected = { static_cast<float>(x), static_cast<float>(y) };
++		}
++	}
++	return selected;
++}
++
++inline int32_t lgAwbManualColourTemperature(const LgAwbColour &colour, LgAwbRatios ratios)
++{
++	auto point = colour.fromRgb(ratios);
++	/* Arbitrary manual gains can lie outside the temperature formula's white-point domain. */
++	return lgAwbColourTemperature(lgAwbProjectWhitePoint(colour, { point.x, point.y }));
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -67,0 +68 @@
++#include "lg_awb_manual.h"
+@@ -1051 +1052 @@
+-	ctrls[&controls::ColourGains] = ControlInfo(0.0f, 8.0f, 1.0f);
++	ctrls[&controls::ColourGains] = ControlInfo(0.25f, 8.0f, 1.0f);
+@@ -1317 +1318 @@
+-		auto colour = lgAwb_->grayCore().colour().fromRgb(
++		colourTemperature_ = lgAwbManualColourTemperature(lgAwb_->grayCore().colour(),
+@@ -1319 +1319,0 @@
+-		colourTemperature_ = lgAwbColourTemperature({ colour.x, colour.y });
