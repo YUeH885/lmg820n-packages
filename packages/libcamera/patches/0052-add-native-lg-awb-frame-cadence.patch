@@ -1,0 +1,140 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add native LG AWB startup and frame cadence
+
+Generate the four sensor cadence periods and reproduce startup counting,
+fps and lux selection, camera and input-mode rules, flash pauses and
+forced skips. Compute startup, skipped and gray-zone widening inside the
+streaming pipeline instead of accepting externally computed flags.
+
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_cadence.h b/src/libcamera/pipeline/qcom/lg_awb_cadence.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_cadence.h
+@@ -0,0 +1,67 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++
++namespace libcamera::qcom {
++
++struct LgAwbCadenceControls {
++	unsigned int fps, cameraId, mode, flashState;
++	int lux;
++	bool forceSkip;
++};
++
++struct LgAwbCadenceResult {
++	bool startup = true, skipped = false;
++	uint32_t counter = 0;
++};
++
++class LgAwbCadence
++{
++public:
++	explicit LgAwbCadence(const std::array<int16_t, 4> &periods)
++		: periods_(periods)
++	{
++	}
++
++	void reset() { state_ = {}; }
++
++	const LgAwbCadenceResult &update(const LgAwbCadenceControls &controls)
++	{
++		unsigned int index = controls.fps <= 44 ? 0 : controls.fps <= 89 ? 1 : controls.fps <= 179 ? 2 : 3;
++		unsigned int period = periods_[index];
++		if (controls.lux > 350)
++			period >>= 2;
++		unsigned int skip = period ? std::max(period - 1, 3U) : 3;
++		if (!controls.mode && controls.fps < 61)
++			skip = 2;
++		if (controls.cameraId == 1 || controls.cameraId == 4)
++			skip = 0;
++		state_.skipped = false;
++		if (controls.flashState == 0 || controls.flashState == 5) {
++			if (state_.startup) {
++				if (state_.counter <= 8) {
++					state_.counter++;
++				} else {
++					state_.counter = 0;
++					state_.startup = false;
++				}
++			} else if (state_.counter < skip) {
++				state_.counter++;
++				state_.skipped = true;
++			} else {
++				state_.counter = 0;
++			}
++		}
++		state_.skipped |= controls.forceSkip;
++		return state_;
++	}
++
++private:
++	std::array<int16_t, 4> periods_;
++	LgAwbCadenceResult state_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_pipeline.h b/src/libcamera/pipeline/qcom/lg_awb_pipeline.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_pipeline.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_pipeline.h
+@@ -7,0 +8 @@
++#include "lg_awb_cadence.h"
+@@ -21,0 +23 @@
++	std::array<int16_t, 4> periods;
+@@ -25,3 +27,3 @@
+-	LgAwbGrayFrameControls gray;
+-	bool startup, skipped, aeSettled, fastRequest, afRequest, dtbBlocked;
+-	unsigned int usecase;
++	int lux;
++	unsigned int minimumGrayCount, flashState, led, cameraId, fps, mode, usecase;
++	bool aeSettled, fastRequest, afRequest, dtbBlocked, outdoor, flashOn, forceSkip;
+@@ -32,0 +35 @@
++	LgAwbCadenceResult cadence;
+@@ -48 +51 @@
+-		: gray_(config.gray, calibration), history_(config.history), gain_(config.gain),
++		: cadence_(config.periods), gray_(config.gray, calibration), history_(config.history), gain_(config.gain),
+@@ -57,0 +61 @@
++		cadence_.reset();
+@@ -75,2 +79,5 @@
+-		const auto &frameControls = controls.gray;
+-		if (!controls.skipped) {
++		result_.cadence = cadence_.update({ controls.fps, controls.cameraId, controls.mode,
++			controls.flashState, controls.lux, controls.forceSkip });
++		LgAwbGrayFrameControls frameControls{ controls.lux, controls.flashState, controls.led,
++			controls.minimumGrayCount, controls.outdoor, controls.flashOn, result_.cadence.startup };
++		if (!result_.cadence.skipped) {
+@@ -82 +89 @@
+-				result_.latestGrayX = controls.startup ? 0 : grayResult_.gray.colour.x;
++				result_.latestGrayX = result_.cadence.startup ? 0 : grayResult_.gray.colour.x;
+@@ -84 +91 @@
+-		result_.grayValid = controls.skipped ? 0 : grayResult_.grayValid;
++		result_.grayValid = result_.cadence.skipped ? 0 : grayResult_.grayValid;
+@@ -87 +94 @@
+-			grayResult_.gray.cct, result_.grayValid, controls.skipped, frameControls.flashState);
++			grayResult_.gray.cct, result_.grayValid, result_.cadence.skipped, frameControls.flashState);
+@@ -105 +112 @@
+-			dnn_->apply(result_.target, controls.iqm, frameControls.lux, controls.startup, frameControls.flashState);
++			dnn_->apply(result_.target, controls.iqm, frameControls.lux, result_.cadence.startup, frameControls.flashState);
+@@ -109 +116 @@
+-			  controls.fastRequest, controls.startup, controls.afRequest, timing }, gray_.colour());
++			  controls.fastRequest, result_.cadence.startup, controls.afRequest, timing }, gray_.colour());
+@@ -115 +122 @@
+-				{ controls.startup, static_cast<bool>(result_.grayValid), controls.aeSettled,
++				{ result_.cadence.startup, static_cast<bool>(result_.grayValid), controls.aeSettled,
+@@ -127,0 +135 @@
++	LgAwbCadence cadence_;
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_tuning.h b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -950 +950 @@
+-		 imx363LgAwbFoeConfiguration() };
++		 imx363LgAwbFoeConfiguration(), { 4, 8, 12, 20 } };
+@@ -1876 +1876 @@
+-		 imx351LgAwbFoeConfiguration() };
++		 imx351LgAwbFoeConfiguration(), { 4, 8, 12, 20 } };
+@@ -2876 +2876 @@
+-		 s5k3m5LgAwbFoeConfiguration() };
++		 s5k3m5LgAwbFoeConfiguration(), { 4, 8, 12, 20 } };
