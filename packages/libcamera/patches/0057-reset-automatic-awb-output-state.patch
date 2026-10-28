@@ -1,0 +1,58 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: initialize automatic AWB independently of manual state
+
+Derive the rear initial CCT from calibrated fallback gains and apply it
+with those gains when automatic AWB starts. Share processing resets across
+stream start and automatic restoration while preserving the live AE
+flatness producer during in-stream mode switches.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -535,0 +536 @@
++	void resetAwbProcessing();
+@@ -620,0 +622,2 @@
++	LgAwbRgb awbInitialGains_{};
++	int32_t awbInitialCct_ = 0;
+@@ -943,0 +947,4 @@
++		awbInitialGains_ = LgAwbGain(config.gain).limit(config.gain.fallback);
++		auto initial = lgAwb_->grayCore().colour().fromRgb(
++			{ awbInitialGains_[1] / awbInitialGains_[0], awbInitialGains_[1] / awbInitialGains_[2] });
++		awbInitialCct_ = lgAwbColourTemperature({ initial.x, initial.y });
+@@ -1270,0 +1278,10 @@
++	if (lgFlat_) {
++		lgFlat_->reset();
++		awbFlatMetric_ = 0;
++	}
++	resetAwbProcessing();
++}
++
++void QcomCameraData::resetAwbProcessing()
++{
++	awbFrame_ = 0;
+@@ -1273 +1289,0 @@
+-		lgFlat_->reset();
+@@ -1275,2 +1291,5 @@
+-		awbFlatMetric_ = 0;
+-		awbFrame_ = 0;
++		if (awbEnabled_) {
++			setIfeWb(awbInitialGains_[0], awbInitialGains_[1], awbInitialGains_[2]);
++			colourTemperature_ = awbInitialCct_;
++			interpolateCcm(profile_, colourTemperature_, ccmQ7_);
++		}
+@@ -1280 +1298,0 @@
+-		awbFrame_ = 0;
+@@ -1907,9 +1925 @@
+-		if (enabled && !awbEnabled_) {
+-			if (qtiAwb_)
+-				qtiAwb_->reset();
+-			if (lgAwb_) {
+-				lgAwb_->reset();
+-				lgBg_ = {};
+-			}
+-			awbFrame_ = 0;
+-		}
++		bool restart = enabled && !awbEnabled_;
+@@ -1916,0 +1927,2 @@
++		if (restart)
++			resetAwbProcessing();
