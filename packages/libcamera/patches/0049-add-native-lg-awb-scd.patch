@@ -1,0 +1,153 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add native LG AWB SCD correction
+
+Generate per-sensor scene gates, history mixing weights and gain factors.
+Use gray CCT for gating and target CCT for mixing. Consume the native
+initial history, preserve factory gate order and expose conditional
+history-illuminant diagnostics. Share rounded RGB/CCT mixing with OHE
+and FOE.
+
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_target.h b/src/libcamera/pipeline/qcom/lg_awb_target.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_target.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_target.h
+@@ -12 +12 @@
+-	None = 0, Gray = 1, History = 2, Previous = 3, Dtb = 5, Ohe = 6, Foe = 9,
++	None = 0, Gray = 1, History = 2, Previous = 3, Scd = 4, Dtb = 5, Ohe = 6, Foe = 9,
+@@ -19,0 +20,9 @@
++
++inline void lgAwbBlendGain(LgAwbGainTarget &target, const LgAwbRgb &reference, int32_t cct, float weight)
++{
++	float retained = 1.0f - weight;
++	for (unsigned int channel = 0; channel < target.rgb.size(); channel++)
++		target.rgb[channel] = lgAwbProduct(weight, reference[channel]) +
++			lgAwbProduct(retained, target.rgb[channel]);
++	target.cct = static_cast<int32_t>(lgAwbProduct(weight, cct) + lgAwbProduct(retained, target.cct));
++}
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_exceptions.h b/src/libcamera/pipeline/qcom/lg_awb_exceptions.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_exceptions.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_exceptions.h
+@@ -9,0 +10 @@
++#include "lg_awb_gain.h"
+@@ -60,6 +61 @@
+-		float retained = 1.0f - weight_;
+-		for (unsigned int channel = 0; channel < target.rgb.size(); channel++)
+-			target.rgb[channel] = lgAwbProduct(weight_, reference[channel]) +
+-				lgAwbProduct(retained, target.rgb[channel]);
+-		target.cct = static_cast<int32_t>(lgAwbProduct(weight_, 5000.0f) +
+-			lgAwbProduct(retained, target.cct));
++		lgAwbBlendGain(target, reference, 5000, weight_);
+@@ -188,4 +184 @@
+-		float retained = 1.0f - weight_;
+-		for (unsigned int channel = 0; channel < target.rgb.size(); channel++)
+-			target.rgb[channel] = lgAwbProduct(weight_, reference[channel]) +
+-				lgAwbProduct(retained, target.rgb[channel]);
++		lgAwbBlendGain(target, reference, 5000, weight_);
+@@ -194,2 +186,0 @@
+-		target.cct = static_cast<int32_t>(lgAwbProduct(weight_, 5000.0f) +
+-			lgAwbProduct(retained, target.cct));
+@@ -217,0 +209,84 @@
++struct LgAwbScdConfiguration {
++	float minimumFlatMetric;
++	std::array<int16_t, 2> lux;
++	float historyWeight;
++	LgAwbRatios coefficients;
++};
++
++struct LgAwbScdControls {
++	int lux;
++	unsigned int flashState, faceCount, usecase;
++	int32_t grayCct;
++	uint32_t grayIlluminant;
++	bool aeSettled;
++	float flatMetric;
++	std::optional<float> iqmSecond;
++};
++
++enum class LgAwbScdStatus : uint32_t {
++	InvalidHistoryGain = 0, LuxOrFlash = 1, FlatMetric = 2, Faces = 3,
++	HistoryCount = 4, HistoryIlluminant = 5, AeUnsettled = 6, Usecase = 7,
++	LowGrayCct = 8, GrayGeometry = 9, Iqm = 10, GrayCctRange = 11, Applied = 12,
++};
++
++struct LgAwbScdResult {
++	LgAwbScdStatus status;
++	std::optional<uint32_t> historyIlluminant;
++};
++
++class LgAwbScd
++{
++public:
++	explicit LgAwbScd(const LgAwbScdConfiguration &config)
++		: config_(config)
++	{
++	}
++
++	LgAwbScdResult apply(LgAwbGainTarget &target, const LgAwbHistory &history,
++			     const LgAwbGrayReferences &references, LgAwbPoint gray,
++			     const LgAwbScdControls &controls) const
++	{
++		if (controls.grayCct >= 4301 && controls.grayCct <= 5499)
++			return { LgAwbScdStatus::GrayCctRange, std::nullopt };
++		if (controls.lux < config_.lux[0] || controls.lux > config_.lux[1] || controls.flashState)
++			return { LgAwbScdStatus::LuxOrFlash, std::nullopt };
++		if (controls.flatMetric < config_.minimumFlatMetric)
++			return { LgAwbScdStatus::FlatMetric, std::nullopt };
++		if (controls.faceCount)
++			return { LgAwbScdStatus::Faces, std::nullopt };
++		if (history.size(LgAwbHistoryKind::Initial) <= 2)
++			return { LgAwbScdStatus::HistoryCount, std::nullopt };
++		if (controls.iqmSecond && *controls.iqmSecond > 0.5f)
++			return { LgAwbScdStatus::Iqm, std::nullopt };
++		if (controls.flatMetric >= 1 && !controls.aeSettled)
++			return { LgAwbScdStatus::AeUnsettled, std::nullopt };
++		if (controls.usecase != 0 && controls.usecase != 2 && controls.usecase != 4)
++			return { LgAwbScdStatus::Usecase, std::nullopt };
++		if (controls.grayCct < 3000)
++			return { LgAwbScdStatus::LowGrayCct, std::nullopt };
++		auto sample = *history.lookup(LgAwbHistoryKind::Initial);
++		if (sample.illuminant != 2)
++			return { LgAwbScdStatus::HistoryIlluminant, sample.illuminant };
++		if (controls.grayIlluminant == 2) {
++			auto first = references.points[2], last = references.points[3], extra = references.points[6];
++			float dx = last.x - first.x;
++			float slope = (last.y - first.y) / dx;
++			float intercept = (lgAwbProduct(first.y, last.x) - lgAwbProduct(first.x, last.y)) / dx;
++			float floor = lgAwbProduct(extra.y - (lgAwbProduct(extra.x, slope) + intercept), 0.5f);
++			float distance = gray.y - (lgAwbProduct(gray.x, slope) + intercept);
++			if (!(gray.x > first.x) || !(gray.y > first.y) || distance <= floor || distance <= 0 || floor <= 0)
++				return { LgAwbScdStatus::GrayGeometry, sample.illuminant };
++		}
++		if (LgAwbGain::invalid(sample.rgb))
++			return { LgAwbScdStatus::InvalidHistoryGain, sample.illuminant };
++		lgAwbBlendGain(target, sample.rgb, sample.cct, config_.historyWeight);
++		target.rgb[0] = lgAwbProduct(target.rgb[0], config_.coefficients.red);
++		target.rgb[2] = lgAwbProduct(target.rgb[2], config_.coefficients.blue);
++		target.source = LgAwbGainSource::Scd;
++		return { LgAwbScdStatus::Applied, sample.illuminant };
++	}
++
++private:
++	LgAwbScdConfiguration config_;
++};
++
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_tuning.h b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -666,0 +667,5 @@
++}
++
++inline LgAwbScdConfiguration imx363LgAwbScdConfiguration()
++{
++	return { 0.75f, { 210, 325 }, 0.699999988f, { 0.970000029f, 1.0f } };
+@@ -1585,0 +1591,5 @@
++inline LgAwbScdConfiguration imx351LgAwbScdConfiguration()
++{
++	return { 0.850000024f, { 220, 380 }, 0.800000012f, { 1.0f, 0.980000019f } };
++}
++
+@@ -2541,0 +2552,5 @@
++inline LgAwbScdConfiguration s5k3m5LgAwbScdConfiguration()
++{
++	return { 1.0f, { 220, 380 }, 0.800000012f, { 1.0f, 0.980000019f } };
++}
++
