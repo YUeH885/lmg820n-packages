@@ -1,0 +1,1243 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add native LG AWB region preprocessing and gray core
+
+Generate RNC and DTB polygons, luma gates and lux participation scales.
+Convert all RGB regions, label exceptions before proportional RNC shifts,
+and classify the shifted coordinates. Share nearest-reference selection
+and keep the 29 category bins distinct from RNC counters. Compose this
+path with scene weights and aggregation into a stateful RGB-to-gray core.
+
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_gray.h b/src/libcamera/pipeline/qcom/lg_awb_gray.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_gray.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_gray.h
+@@ -36 +36 @@
+-	LgAwbGrayDecision classify(LgAwbPoint point) const
++	std::array<uint32_t, 2> nearestReferences(LgAwbPoint point) const
+@@ -49,0 +50,10 @@
++		return { nearest, additional };
++	}
++
++	LgAwbGrayDecision classify(LgAwbPoint point) const
++	{
++		std::array<LgAwbPoint, 6> primary;
++		std::copy_n(references_.points.begin(), primary.size(), primary.begin());
++		auto indices = nearestReferences(point);
++		unsigned int nearest = indices[0], additional = indices[1];
++		float additionalDistance = distance(point, references_.points[additional]);
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_scene_weights.h b/src/libcamera/pipeline/qcom/lg_awb_scene_weights.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_scene_weights.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_scene_weights.h
+@@ -12 +12 @@
+-using LgAwbCategoryCounts = std::array<int16_t, 30>;
++using LgAwbCategoryCounts = std::array<int16_t, 29>;
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_regions.h b/src/libcamera/pipeline/qcom/lg_awb_regions.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_regions.h
+@@ -0,0 +1,147 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++#include "lg_awb_aggregate.h"
++
++namespace libcamera::qcom {
++
++using LgAwbPolygon = std::array<LgAwbPoint, 8>;
++
++inline bool lgAwbContains(const LgAwbPolygon &points, LgAwbPoint point)
++{
++	for (unsigned int i = 0; i < 6; i++) {
++		auto a = points[i], b = points[i + 1], c = points[i + 2];
++		if (a.x < 0.01f || a.y < 0.01f || b.x < 0.01f || b.y < 0.01f || c.x < 0.01f || c.y < 0.01f)
++			break;
++		if (point.x < std::min({ a.x, b.x, c.x }) || point.x > std::max({ a.x, b.x, c.x }) ||
++		    point.y < std::min({ a.y, b.y, c.y }) || point.y > std::max({ a.y, b.y, c.y }))
++			continue;
++		float ux = b.x - a.x, uy = b.y - a.y, vx = c.x - a.x, vy = c.y - a.y;
++		float first = lgAwbProduct(ux, vy), second = lgAwbProduct(uy, vx);
++		if (second >= first - 1e-6f && second <= first + 1e-6f)
++			continue;
++		float dx = point.x - a.x, dy = point.y - a.y;
++		float v = (lgAwbProduct(dx, uy) - lgAwbProduct(dy, ux)) / (second - first);
++		float u = std::abs(ux) <= 1e-6f ? (dy - lgAwbProduct(vy, v)) / uy :
++			(dx - lgAwbProduct(vx, v)) / ux;
++		if (u > 0 && u < 1 && v > 0 && v < 1 && u + v < 1)
++			return true;
++	}
++	return false;
++}
++
++struct LgAwbRncRegion {
++	LgAwbPolygon points;
++	LgAwbPoint offset;
++	std::array<int16_t, 4> luxKnots;
++	bool lumaGate;
++	uint16_t lumaMode;
++	float lumaThreshold;
++};
++
++struct LgAwbDtbRegion {
++	LgAwbPolygon points;
++	int16_t luxBoundary;
++};
++
++struct LgAwbRegionConfiguration {
++	unsigned int rncCount;
++	std::array<LgAwbRncRegion, 20> rnc;
++	std::array<unsigned int, 2> dtbCount;
++	std::array<std::array<LgAwbDtbRegion, 10>, 2> dtb;
++};
++
++struct LgAwbRegionCounters {
++	std::array<uint16_t, 20> processed{}, shifted{}, dtb{};
++	uint16_t rejected = 0;
++};
++
++class LgAwbExceptionRegions
++{
++public:
++	explicit LgAwbExceptionRegions(const LgAwbRegionConfiguration &config)
++		: config_(config)
++	{
++	}
++
++	void setLux(int lux)
++	{
++		lux_ = lux;
++		counters_ = {};
++		for (unsigned int i = 0; i < config_.rncCount; i++) {
++			const auto &knots = config_.rnc[i].luxKnots;
++			if (lux <= knots[0] || (lux > knots[2] && lux >= knots[3]))
++				scales_[i] = 10000;
++			else if (lux < knots[1])
++				scales_[i] = 1.0f / (static_cast<float>(lux - knots[0]) / (knots[1] - knots[0]));
++			else if (lux <= knots[2])
++				scales_[i] = 1;
++			else
++				scales_[i] = 1.0f / (1.0f - static_cast<float>(lux - knots[2]) / (knots[3] - knots[2]));
++		}
++	}
++
++	uint16_t classify(LgAwbGraySample &sample)
++	{
++		LgAwbPoint original{ sample.colour.x, sample.colour.y };
++		uint16_t label = 20;
++		for (unsigned int i = 0; i < config_.rncCount; i++) {
++			const auto &region = config_.rnc[i];
++			if (scales_[i] > 3000 || (region.lumaGate &&
++			    ((region.lumaMode == 0 && sample.luma > region.lumaThreshold) ||
++			     (region.lumaMode == 1 && sample.luma < region.lumaThreshold))))
++				continue;
++			if (!lgAwbContains(region.points, original))
++				continue;
++			label = i;
++			if (sample.colour.x + region.offset.x < 0 || sample.colour.y + region.offset.y < 0) {
++				sample.colour = {};
++				sample.valid = 0;
++				label = 20;
++				counters_.rejected++;
++			}
++		}
++		for (unsigned int group = 0; group < config_.dtbCount.size(); group++)
++			for (unsigned int i = 0; i < config_.dtbCount[group]; i++) {
++				const auto &region = config_.dtb[group][i];
++				if ((group == 0 && lux_ < region.luxBoundary) || (group == 1 && lux_ > region.luxBoundary))
++					continue;
++				if (lgAwbContains(region.points, original)) {
++					counters_.dtb[10 * group + i]++;
++					return label;
++				}
++			}
++		return label;
++	}
++
++	bool shift(LgAwbGraySample &sample, unsigned int label)
++	{
++		if (label == 20 || scales_[label] >= 10000)
++			return false;
++		bool apply = static_cast<float>(counters_.processed[label]) / scales_[label] >
++			static_cast<float>(counters_.shifted[label]) - 1e-6f;
++		if (apply) {
++			sample.colour.x += config_.rnc[label].offset.x;
++			sample.colour.y += config_.rnc[label].offset.y;
++			counters_.shifted[label]++;
++		}
++		counters_.processed[label]++;
++		return apply;
++	}
++
++	const LgAwbRegionCounters &counters() const { return counters_; }
++	const std::array<float, 20> &scales() const { return scales_; }
++
++private:
++	LgAwbRegionConfiguration config_;
++	LgAwbRegionCounters counters_;
++	std::array<float, 20> scales_{};
++	int lux_ = 0;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_preprocess.h b/src/libcamera/pipeline/qcom/lg_awb_preprocess.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_preprocess.h
+@@ -0,0 +1,89 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++#include "lg_awb_colour.h"
++#include "lg_awb_gray_geometry.h"
++#include "lg_awb_regions.h"
++
++namespace libcamera::qcom {
++
++struct LgAwbPreprocessConfiguration {
++	LgAwbColourConfiguration colour;
++	LgAwbStatisticsConfiguration statistics;
++	LgAwbGrayConfiguration geometry;
++	LgAwbRegionConfiguration regions;
++};
++
++struct LgAwbPreparedFrame {
++	std::array<LgAwbGraySample, 3072> samples{};
++	std::array<uint16_t, 3072> rncLabels{};
++	LgAwbScreenCounters screenCounters{};
++	LgAwbCategoryCounts categoryCounts{};
++	LgAwbRegionCounters regionCounters{};
++	float validFraction = 0;
++	LgAwbGrayReferences references{};
++};
++
++class LgAwbPreprocess
++{
++public:
++	explicit LgAwbPreprocess(const LgAwbPreprocessConfiguration &config,
++				 const LgAwbWhiteBalanceCalibration &calibration = {})
++		: colour_(config.colour, calibration), statistics_(config.statistics),
++		  geometry_(config.geometry), regions_(config.regions)
++	{
++	}
++
++	void prepare(const std::array<LgAwbRgb, 3072> &rgb, int lux, LgAwbPreparedFrame &frame,
++		     bool widen4000KBelow = false)
++	{
++		colour_.setLux(lux);
++		regions_.setLux(lux);
++		frame.references = geometry_.references(lux, widen4000KBelow);
++		LgAwbGrayClassifier classifier(frame.references);
++		frame.screenCounters = {};
++		frame.categoryCounts = {};
++		for (unsigned int i = 0; i < rgb.size(); i++) {
++			auto &sample = frame.samples[i];
++			frame.rncLabels[i] = 20;
++			sample.decision.valid = sample.decision.weightGroup = sample.decision.category = 0;
++			if (rgb[i][0] <= 0 || rgb[i][1] <= 0 || rgb[i][2] <= 0) {
++				sample.colour = {};
++			} else {
++				sample.colour = colour_.fromRgb({ rgb[i][0] / rgb[i][1], rgb[i][2] / rgb[i][1] });
++				sample.luma = (lgAwbProduct(rgb[i][0], 0.299f) + lgAwbProduct(rgb[i][1], 0.587f)) +
++					lgAwbProduct(rgb[i][2], 0.114f);
++			}
++			sample.valid = statistics_.screen(sample.colour, rgb[i], frame.screenCounters);
++			if (sample.valid) {
++				auto indices = classifier.nearestReferences({ sample.colour.x, sample.colour.y });
++				sample.decision.nearest = indices[0];
++				sample.decision.additionalNearest = indices[1];
++				frame.rncLabels[i] = regions_.classify(sample);
++			}
++		}
++		frame.screenCounters[0] += regions_.counters().rejected;
++		frame.validFraction = static_cast<float>(3072 - frame.screenCounters[0] -
++			frame.screenCounters[1] - frame.screenCounters[2]) / 3072.0f;
++		for (unsigned int i = 0; i < frame.samples.size(); i++) {
++			auto &sample = frame.samples[i];
++			if (!sample.valid)
++				continue;
++			regions_.shift(sample, frame.rncLabels[i]);
++			sample.decision = classifier.classify({ sample.colour.x, sample.colour.y });
++			frame.categoryCounts[sample.decision.category]++;
++		}
++		frame.regionCounters = regions_.counters();
++	}
++
++private:
++	LgAwbColour colour_;
++	LgAwbStatistics statistics_;
++	LgAwbGrayGeometry geometry_;
++	LgAwbExceptionRegions regions_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_gray_core.h b/src/libcamera/pipeline/qcom/lg_awb_gray_core.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_gray_core.h
+@@ -0,0 +1,68 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include "lg_awb_preprocess.h"
++
++namespace libcamera::qcom {
++
++struct LgAwbGrayCoreConfiguration {
++	LgAwbPreprocessConfiguration preprocess;
++	LgAwbSceneWeightConfiguration sceneWeights;
++	LgAwbSceneReweightConfiguration reweight;
++};
++
++struct LgAwbGrayFrameControls {
++	int lux;
++	unsigned int flashState, led, minimumGrayCount;
++	bool outdoor, flashOn, widen4000KBelow;
++};
++
++class LgAwbGrayCore
++{
++public:
++	explicit LgAwbGrayCore(const LgAwbGrayCoreConfiguration &config,
++			       const LgAwbWhiteBalanceCalibration &calibration = {})
++		: preprocess_(config.preprocess, calibration), lookup_(config.preprocess.statistics),
++		  adjustment_(config.sceneWeights), aggregate_(config.reweight)
++	{
++	}
++
++	void reset()
++	{
++		frame_ = {};
++		result_ = {};
++		factors_ = { 10, 10, 10 };
++		boost_ = 0;
++		weights_ = {};
++	}
++
++	const LgAwbGrayResult &process(const std::array<LgAwbRgb, 3072> &rgb,
++				     const LgAwbGrayFrameControls &controls)
++	{
++		preprocess_.prepare(rgb, controls.lux, frame_, controls.widen4000KBelow);
++		weights_ = lookup_.weights(controls.lux);
++		adjustment_.reduce(weights_, controls.lux, controls.flashState, frame_.categoryCounts, factors_);
++		boost_ = adjustment_.boost(weights_, controls.lux, controls.outdoor, controls.flashOn, controls.led);
++		aggregate_.update(frame_.samples, weights_, frame_.categoryCounts, controls.lux, controls.flashState,
++			controls.minimumGrayCount, frame_.references.points, result_);
++		return result_;
++	}
++
++	const LgAwbPreparedFrame &frame() const { return frame_; }
++	const LgAwbRegionWeights &weights() const { return weights_; }
++	const std::array<float, 3> &factors() const { return factors_; }
++	float boost() const { return boost_; }
++
++private:
++	LgAwbPreprocess preprocess_;
++	LgAwbStatistics lookup_;
++	LgAwbSceneWeights adjustment_;
++	LgAwbGrayAggregate aggregate_;
++	LgAwbPreparedFrame frame_;
++	LgAwbGrayResult result_;
++	LgAwbRegionWeights weights_{};
++	std::array<float, 3> factors_{ 10, 10, 10 };
++	float boost_ = 0;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_tuning.h b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -5,0 +6 @@
++#include "lg_awb_gray_core.h"
+@@ -6,0 +8,2 @@
++#include "lg_awb_preprocess.h"
++#include "lg_awb_regions.h"
+@@ -386,0 +390,281 @@
++inline LgAwbRegionConfiguration imx363LgAwbRegionConfiguration()
++{
++	LgAwbRegionConfiguration config{};
++	config.rncCount = 13;
++	config.dtbCount = { 5, 1 };
++	config.rnc[0].points = { {
++		{ 0.30399999f, 0.331f },
++		{ 0.316000015f, 0.312999994f },
++		{ 0.273999989f, 0.293000013f },
++		{ 0.280999988f, 0.284000009f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[0].offset = { 0.0379999988f, 0.0439999998f };
++	config.rnc[0].luxKnots = { -1, 0, 140, 160 };
++	config.rnc[0].lumaGate = true;
++	config.rnc[0].lumaMode = 1;
++	config.rnc[0].lumaThreshold = 28.0f;
++	config.rnc[1].points = { {
++		{ 0.340000004f, 0.402999997f },
++		{ 0.351000011f, 0.381999999f },
++		{ 0.375999987f, 0.397000015f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[1].offset = { 0.0149999997f, -0.0199999996f };
++	config.rnc[1].luxKnots = { 95, 105, 125, 135 };
++	config.rnc[1].lumaGate = false;
++	config.rnc[1].lumaMode = 0;
++	config.rnc[1].lumaThreshold = 100.0f;
++	config.rnc[2].points = { {
++		{ 0.370999992f, 0.397000015f },
++		{ 0.35800001f, 0.409999996f },
++		{ 0.391000003f, 0.405999988f },
++		{ 0.377999991f, 0.421999991f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[2].offset = { -0.00600000005f, -0.0439999998f };
++	config.rnc[2].luxKnots = { 130, 140, 190, 210 };
++	config.rnc[2].lumaGate = false;
++	config.rnc[2].lumaMode = 0;
++	config.rnc[2].lumaThreshold = 100.0f;
++	config.rnc[3].points = { {
++		{ 0.344999999f, 0.426999986f },
++		{ 0.356999993f, 0.400000006f },
++		{ 0.374000013f, 0.442999989f },
++		{ 0.38499999f, 0.414000005f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[3].offset = { -0.00800000038f, -0.0439999998f };
++	config.rnc[3].luxKnots = { 170, 180, 230, 290 };
++	config.rnc[3].lumaGate = false;
++	config.rnc[3].lumaMode = 0;
++	config.rnc[3].lumaThreshold = 100.0f;
++	config.rnc[4].points = { {
++		{ 0.331f, 0.398000002f },
++		{ 0.324000001f, 0.38499999f },
++		{ 0.354999989f, 0.384000003f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[4].offset = { 0.00400000019f, -0.0320000015f };
++	config.rnc[4].luxKnots = { 195, 210, 285, 295 };
++	config.rnc[4].lumaGate = false;
++	config.rnc[4].lumaMode = 0;
++	config.rnc[4].lumaThreshold = 100.0f;
++	config.rnc[5].points = { {
++		{ 0.372999996f, 0.352999985f },
++		{ 0.381000012f, 0.342000008f },
++		{ 0.419f, 0.379999995f },
++		{ 0.428000003f, 0.367000014f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[5].offset = { -0.0390000008f, -0.0120000001f };
++	config.rnc[5].luxKnots = { 175, 185, 230, 240 };
++	config.rnc[5].lumaGate = false;
++	config.rnc[5].lumaMode = 0;
++	config.rnc[5].lumaThreshold = 100.0f;
++	config.rnc[6].points = { {
++		{ 0.352999985f, 0.375999987f },
++		{ 0.358999997f, 0.361000001f },
++		{ 0.370999992f, 0.381000012f },
++		{ 0.377999991f, 0.368999988f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[6].offset = { -0.0120000001f, -0.00700000022f };
++	config.rnc[6].luxKnots = { 130, 140, 175, 195 };
++	config.rnc[6].lumaGate = false;
++	config.rnc[6].lumaMode = 0;
++	config.rnc[6].lumaThreshold = 100.0f;
++	config.rnc[7].points = { {
++		{ 0.294999987f, 0.305000007f },
++		{ 0.312000006f, 0.294f },
++		{ 0.270000011f, 0.250999987f },
++		{ 0.284000009f, 0.244000003f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[7].offset = { 0.0160000008f, 0.0309999995f };
++	config.rnc[7].luxKnots = { 220, 240, 265, 285 };
++	config.rnc[7].lumaGate = true;
++	config.rnc[7].lumaMode = 1;
++	config.rnc[7].lumaThreshold = 40.0f;
++	config.rnc[8].points = { {
++		{ 0.386999995f, 0.425999999f },
++		{ 0.39199999f, 0.411000013f },
++		{ 0.409999996f, 0.433999985f },
++		{ 0.419f, 0.419999987f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[8].offset = { -0.0160000008f, -0.0289999992f };
++	config.rnc[8].luxKnots = { 230, 250, 300, 320 };
++	config.rnc[8].lumaGate = false;
++	config.rnc[8].lumaMode = 0;
++	config.rnc[8].lumaThreshold = 100.0f;
++	config.rnc[9].points = { {
++		{ 0.351999998f, 0.414999992f },
++		{ 0.377999991f, 0.426999986f },
++		{ 0.368999988f, 0.393999994f },
++		{ 0.389999986f, 0.405999988f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[9].offset = { -0.00999999978f, -0.00999999978f };
++	config.rnc[9].luxKnots = { 370, 390, 430, 500 };
++	config.rnc[9].lumaGate = false;
++	config.rnc[9].lumaMode = 0;
++	config.rnc[9].lumaThreshold = 100.0f;
++	config.rnc[10].points = { {
++		{ 0.472000003f, 0.430999994f },
++		{ 0.472000003f, 0.418000013f },
++		{ 0.5f, 0.42899999f },
++		{ 0.503000021f, 0.421999991f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[10].offset = { -0.0350000001f, -0.00300000003f };
++	config.rnc[10].luxKnots = { 225, 240, 295, 315 };
++	config.rnc[10].lumaGate = false;
++	config.rnc[10].lumaMode = 0;
++	config.rnc[10].lumaThreshold = 100.0f;
++	config.rnc[11].points = { {
++		{ 0.555999994f, 0.361000001f },
++		{ 0.556999981f, 0.351999998f },
++		{ 0.574999988f, 0.354000002f },
++		{ 0.573000014f, 0.340999991f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[11].offset = { -0.192000002f, 0.0160000008f };
++	config.rnc[11].luxKnots = { 190, 210, 260, 280 };
++	config.rnc[11].lumaGate = true;
++	config.rnc[11].lumaMode = 0;
++	config.rnc[11].lumaThreshold = 50.0f;
++	config.rnc[12].points = { {
++		{ 0.486000001f, 0.442000002f },
++		{ 0.486999989f, 0.40200001f },
++		{ 0.510999978f, 0.423000008f },
++		{ 0.501999974f, 0.407000005f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[12].offset = { -0.0370000005f, -0.00999999978f };
++	config.rnc[12].luxKnots = { 410, 430, 470, 500 };
++	config.rnc[12].lumaGate = true;
++	config.rnc[12].lumaMode = 1;
++	config.rnc[12].lumaThreshold = 3.0f;
++	config.dtb[0][0].points = { {
++		{ 0.497999996f, 0.414999992f },
++		{ 0.523999989f, 0.425999999f },
++		{ 0.490999997f, 0.404000014f },
++		{ 0.672999978f, 0.331f },
++		{ 0.700999975f, 0.289000005f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][0].luxBoundary = 250;
++	config.dtb[0][1].points = { {
++		{ 0.49000001f, 0.400000006f },
++		{ 0.467000008f, 0.298999995f },
++		{ 0.698000014f, 0.293000013f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][1].luxBoundary = 350;
++	config.dtb[0][2].points = { {
++		{ 0.273999989f, 0.280000001f },
++		{ 0.316000015f, 0.230000004f },
++		{ 0.35800001f, 0.333999991f },
++		{ 0.398999989f, 0.27700001f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][2].luxBoundary = 460;
++	config.dtb[0][3].points = { {
++		{ 0.637000024f, 0.340999991f },
++		{ 0.455000013f, 0.284000009f },
++		{ 0.495000005f, 0.405999988f },
++		{ 0.460999995f, 0.398000002f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][3].luxBoundary = 470;
++	config.dtb[0][4].points = { {
++		{ 0.256000012f, 0.280000001f },
++		{ 0.279000014f, 0.272000015f },
++		{ 0.192000002f, 0.0879999995f },
++		{ 0.214000002f, 0.0879999995f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][4].luxBoundary = 340;
++	config.dtb[1][0].points = { {
++		{ 0.319999993f, 0.398999989f },
++		{ 0.335000008f, 0.372999996f },
++		{ 0.377000004f, 0.42899999f },
++		{ 0.393000007f, 0.402999997f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[1][0].luxBoundary = 205;
++	return config;
++}
++
++inline LgAwbPreprocessConfiguration imx363LgAwbPreprocessConfiguration()
++{
++	return { imx363LgAwbColourConfiguration(), imx363LgAwbStatisticsConfiguration(),
++		 imx363LgAwbGrayConfiguration(), imx363LgAwbRegionConfiguration() };
++}
++
++inline LgAwbGrayCoreConfiguration imx363LgAwbGrayCoreConfiguration()
++{
++	return { imx363LgAwbPreprocessConfiguration(), imx363LgAwbSceneWeightConfiguration(),
++		 imx363LgAwbSceneReweightConfiguration() };
++}
++
+@@ -759,0 +1044,281 @@
++inline LgAwbRegionConfiguration imx351LgAwbRegionConfiguration()
++{
++	LgAwbRegionConfiguration config{};
++	config.rncCount = 13;
++	config.dtbCount = { 5, 1 };
++	config.rnc[0].points = { {
++		{ 0.275000006f, 0.293000013f },
++		{ 0.282999992f, 0.282999992f },
++		{ 0.294999987f, 0.317000002f },
++		{ 0.305000007f, 0.305000007f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[0].offset = { 0.0579999983f, 0.0579999983f };
++	config.rnc[0].luxKnots = { -1, 0, 190, 200 };
++	config.rnc[0].lumaGate = false;
++	config.rnc[0].lumaMode = 0;
++	config.rnc[0].lumaThreshold = 100.0f;
++	config.rnc[1].points = { {
++		{ 0.340000004f, 0.402999997f },
++		{ 0.351000011f, 0.381999999f },
++		{ 0.375999987f, 0.397000015f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[1].offset = { 0.00700000022f, -0.0270000007f };
++	config.rnc[1].luxKnots = { 125, 135, 155, 165 };
++	config.rnc[1].lumaGate = false;
++	config.rnc[1].lumaMode = 0;
++	config.rnc[1].lumaThreshold = 100.0f;
++	config.rnc[2].points = { {
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[2].offset = { 0.0f, 0.0f };
++	config.rnc[2].luxKnots = { -1, 0, 500, 500 };
++	config.rnc[2].lumaGate = false;
++	config.rnc[2].lumaMode = 0;
++	config.rnc[2].lumaThreshold = 100.0f;
++	config.rnc[3].points = { {
++		{ 0.370999992f, 0.397000015f },
++		{ 0.35800001f, 0.409999996f },
++		{ 0.391000003f, 0.405999988f },
++		{ 0.377999991f, 0.421999991f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[3].offset = { -0.00499999989f, -0.0329999998f };
++	config.rnc[3].luxKnots = { 145, 155, 170, 180 };
++	config.rnc[3].lumaGate = false;
++	config.rnc[3].lumaMode = 0;
++	config.rnc[3].lumaThreshold = 100.0f;
++	config.rnc[4].points = { {
++		{ 0.342999995f, 0.426999986f },
++		{ 0.354999989f, 0.404000014f },
++		{ 0.367000014f, 0.439999998f },
++		{ 0.377999991f, 0.416000009f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[4].offset = { -0.00400000019f, -0.0480000004f };
++	config.rnc[4].luxKnots = { 175, 185, 245, 255 };
++	config.rnc[4].lumaGate = false;
++	config.rnc[4].lumaMode = 0;
++	config.rnc[4].lumaThreshold = 100.0f;
++	config.rnc[5].points = { {
++		{ 0.326000005f, 0.400999993f },
++		{ 0.324999988f, 0.379000008f },
++		{ 0.349999994f, 0.38499999f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[5].offset = { -0.00400000019f, -0.00999999978f };
++	config.rnc[5].luxKnots = { 235, 250, 265, 275 };
++	config.rnc[5].lumaGate = false;
++	config.rnc[5].lumaMode = 0;
++	config.rnc[5].lumaThreshold = 100.0f;
++	config.rnc[6].points = { {
++		{ 0.363999993f, 0.361999989f },
++		{ 0.400000006f, 0.379000008f },
++		{ 0.372999996f, 0.349999994f },
++		{ 0.404000014f, 0.367000014f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[6].offset = { -0.0370000005f, -0.00999999978f };
++	config.rnc[6].luxKnots = { 180, 190, 220, 255 };
++	config.rnc[6].lumaGate = false;
++	config.rnc[6].lumaMode = 0;
++	config.rnc[6].lumaThreshold = 100.0f;
++	config.rnc[7].points = { {
++		{ 0.352999985f, 0.375999987f },
++		{ 0.358999997f, 0.361000001f },
++		{ 0.379999995f, 0.395000011f },
++		{ 0.39199999f, 0.377000004f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[7].offset = { -0.0149999997f, -0.00499999989f };
++	config.rnc[7].luxKnots = { 160, 170, 220, 230 };
++	config.rnc[7].lumaGate = false;
++	config.rnc[7].lumaMode = 0;
++	config.rnc[7].lumaThreshold = 100.0f;
++	config.rnc[8].points = { {
++		{ 0.287f, 0.340000004f },
++		{ 0.300000012f, 0.326000005f },
++		{ 0.312999994f, 0.358999997f },
++		{ 0.317000002f, 0.344000012f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[8].offset = { 0.00800000038f, -0.00999999978f };
++	config.rnc[8].luxKnots = { 150, 180, 240, 260 };
++	config.rnc[8].lumaGate = false;
++	config.rnc[8].lumaMode = 0;
++	config.rnc[8].lumaThreshold = 100.0f;
++	config.rnc[9].points = { {
++		{ 0.384000003f, 0.39199999f },
++		{ 0.393999994f, 0.372000009f },
++		{ 0.419f, 0.409000009f },
++		{ 0.428000003f, 0.388000011f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[9].offset = { -0.0500000007f, -0.0219999999f };
++	config.rnc[9].luxKnots = { 170, 190, 230, 240 };
++	config.rnc[9].lumaGate = false;
++	config.rnc[9].lumaMode = 0;
++	config.rnc[9].lumaThreshold = 100.0f;
++	config.rnc[10].points = { {
++		{ 0.294999987f, 0.317000002f },
++		{ 0.305000007f, 0.305000007f },
++		{ 0.319000006f, 0.345999986f },
++		{ 0.333000004f, 0.328999996f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[10].offset = { 0.0450000018f, 0.0419999994f };
++	config.rnc[10].luxKnots = { -1, 0, 90, 100 };
++	config.rnc[10].lumaGate = false;
++	config.rnc[10].lumaMode = 0;
++	config.rnc[10].lumaThreshold = 100.0f;
++	config.rnc[11].points = { {
++		{ 0.472000003f, 0.430999994f },
++		{ 0.472000003f, 0.418000013f },
++		{ 0.5f, 0.42899999f },
++		{ 0.503000021f, 0.421999991f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[11].offset = { -0.0350000001f, -0.00300000003f };
++	config.rnc[11].luxKnots = { 225, 240, 295, 315 };
++	config.rnc[11].lumaGate = false;
++	config.rnc[11].lumaMode = 0;
++	config.rnc[11].lumaThreshold = 100.0f;
++	config.rnc[12].points = { {
++		{ 0.294999987f, 0.305000007f },
++		{ 0.312000006f, 0.294f },
++		{ 0.270000011f, 0.250999987f },
++		{ 0.284000009f, 0.244000003f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[12].offset = { 0.0160000008f, 0.0309999995f };
++	config.rnc[12].luxKnots = { 260, 280, 320, 340 };
++	config.rnc[12].lumaGate = true;
++	config.rnc[12].lumaMode = 1;
++	config.rnc[12].lumaThreshold = 40.0f;
++	config.dtb[0][0].points = { {
++		{ 0.497999996f, 0.446999997f },
++		{ 0.477999985f, 0.409999996f },
++		{ 0.681999981f, 0.324000001f },
++		{ 0.70599997f, 0.287999988f },
++		{ 0.633000016f, 0.243000001f },
++		{ 0.628000021f, 0.328999996f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][0].luxBoundary = 270;
++	config.dtb[0][1].points = { {
++		{ 0.518000007f, 0.393000007f },
++		{ 0.470999986f, 0.294f },
++		{ 0.625f, 0.342000008f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][1].luxBoundary = 360;
++	config.dtb[0][2].points = { {
++		{ 0.507000029f, 0.407999992f },
++		{ 0.465000004f, 0.287999988f },
++		{ 0.633000016f, 0.338f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][2].luxBoundary = 500;
++	config.dtb[0][3].points = { {
++		{ 0.256000012f, 0.280000001f },
++		{ 0.279000014f, 0.272000015f },
++		{ 0.192000002f, 0.0879999995f },
++		{ 0.203999996f, 0.0879999995f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][3].luxBoundary = 370;
++	config.dtb[0][4].points = { {
++		{ 0.294999987f, 0.39199999f },
++		{ 0.244000003f, 0.25f },
++		{ 0.328000009f, 0.374000013f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][4].luxBoundary = 405;
++	config.dtb[1][0].points = { {
++		{ 0.319999993f, 0.398999989f },
++		{ 0.335000008f, 0.372999996f },
++		{ 0.377000004f, 0.42899999f },
++		{ 0.393000007f, 0.402999997f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[1][0].luxBoundary = 215;
++	return config;
++}
++
++inline LgAwbPreprocessConfiguration imx351LgAwbPreprocessConfiguration()
++{
++	return { imx351LgAwbColourConfiguration(), imx351LgAwbStatisticsConfiguration(),
++		 imx351LgAwbGrayConfiguration(), imx351LgAwbRegionConfiguration() };
++}
++
++inline LgAwbGrayCoreConfiguration imx351LgAwbGrayCoreConfiguration()
++{
++	return { imx351LgAwbPreprocessConfiguration(), imx351LgAwbSceneWeightConfiguration(),
++		 imx351LgAwbSceneReweightConfiguration() };
++}
++
+@@ -1134,0 +1700,322 @@
++inline LgAwbRegionConfiguration s5k3m5LgAwbRegionConfiguration()
++{
++	LgAwbRegionConfiguration config{};
++	config.rncCount = 15;
++	config.dtbCount = { 6, 1 };
++	config.rnc[0].points = { {
++		{ 0.312000006f, 0.333000004f },
++		{ 0.323000014f, 0.317999989f },
++		{ 0.273000002f, 0.289999992f },
++		{ 0.282999992f, 0.284000009f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[0].offset = { 0.0480000004f, 0.0480000004f };
++	config.rnc[0].luxKnots = { -1, 0, 180, 210 };
++	config.rnc[0].lumaGate = true;
++	config.rnc[0].lumaMode = 1;
++	config.rnc[0].lumaThreshold = 10.0f;
++	config.rnc[1].points = { {
++		{ 0.340000004f, 0.402999997f },
++		{ 0.351000011f, 0.381999999f },
++		{ 0.375999987f, 0.397000015f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[1].offset = { 0.00800000038f, -0.0170000009f };
++	config.rnc[1].luxKnots = { 145, 155, 175, 185 };
++	config.rnc[1].lumaGate = false;
++	config.rnc[1].lumaMode = 0;
++	config.rnc[1].lumaThreshold = 100.0f;
++	config.rnc[2].points = { {
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[2].offset = { 0.0f, 0.0f };
++	config.rnc[2].luxKnots = { -1, 0, 500, 500 };
++	config.rnc[2].lumaGate = false;
++	config.rnc[2].lumaMode = 0;
++	config.rnc[2].lumaThreshold = 100.0f;
++	config.rnc[3].points = { {
++		{ 0.352999985f, 0.404000014f },
++		{ 0.363999993f, 0.386999995f },
++		{ 0.377999991f, 0.418000013f },
++		{ 0.388000011f, 0.404000014f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[3].offset = { -0.0149999997f, -0.0439999998f };
++	config.rnc[3].luxKnots = { 145, 155, 260, 300 };
++	config.rnc[3].lumaGate = false;
++	config.rnc[3].lumaMode = 0;
++	config.rnc[3].lumaThreshold = 100.0f;
++	config.rnc[4].points = { {
++		{ 0.342999995f, 0.426999986f },
++		{ 0.354999989f, 0.404000014f },
++		{ 0.367000014f, 0.439999998f },
++		{ 0.377999991f, 0.416000009f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[4].offset = { -0.00200000009f, -0.0480000004f };
++	config.rnc[4].luxKnots = { 170, 180, 220, 290 };
++	config.rnc[4].lumaGate = false;
++	config.rnc[4].lumaMode = 0;
++	config.rnc[4].lumaThreshold = 100.0f;
++	config.rnc[5].points = { {
++		{ 0.363999993f, 0.361999989f },
++		{ 0.372999996f, 0.349999994f },
++		{ 0.42899999f, 0.388999999f },
++		{ 0.433999985f, 0.381999999f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[5].offset = { -0.023f, -0.00800000038f };
++	config.rnc[5].luxKnots = { 195, 200, 255, 265 };
++	config.rnc[5].lumaGate = false;
++	config.rnc[5].lumaMode = 0;
++	config.rnc[5].lumaThreshold = 100.0f;
++	config.rnc[6].points = { {
++		{ 0.352999985f, 0.375999987f },
++		{ 0.358999997f, 0.361000001f },
++		{ 0.370999992f, 0.381000012f },
++		{ 0.377999991f, 0.368999988f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[6].offset = { -0.0189999994f, -0.0120000001f };
++	config.rnc[6].luxKnots = { 160, 170, 220, 250 };
++	config.rnc[6].lumaGate = false;
++	config.rnc[6].lumaMode = 0;
++	config.rnc[6].lumaThreshold = 100.0f;
++	config.rnc[7].points = { {
++		{ 0.273999989f, 0.30399999f },
++		{ 0.200000003f, 0.101000004f },
++		{ 0.307999998f, 0.296000004f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[7].offset = { 0.00800000038f, 0.0149999997f };
++	config.rnc[7].luxKnots = { 210, 220, 300, 320 };
++	config.rnc[7].lumaGate = false;
++	config.rnc[7].lumaMode = 0;
++	config.rnc[7].lumaThreshold = 100.0f;
++	config.rnc[8].points = { {
++		{ 0.287f, 0.340000004f },
++		{ 0.300000012f, 0.326000005f },
++		{ 0.312999994f, 0.358999997f },
++		{ 0.317000002f, 0.344000012f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[8].offset = { 0.0160000008f, -0.0179999992f };
++	config.rnc[8].luxKnots = { 150, 180, 250, 290 };
++	config.rnc[8].lumaGate = false;
++	config.rnc[8].lumaMode = 0;
++	config.rnc[8].lumaThreshold = 100.0f;
++	config.rnc[9].points = { {
++		{ 0.386999995f, 0.400000006f },
++		{ 0.39199999f, 0.375999987f },
++		{ 0.428000003f, 0.405000001f },
++		{ 0.435000002f, 0.386000007f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[9].offset = { -0.0579999983f, -0.0399999991f };
++	config.rnc[9].luxKnots = { 220, 240, 250, 260 };
++	config.rnc[9].lumaGate = false;
++	config.rnc[9].lumaMode = 0;
++	config.rnc[9].lumaThreshold = 100.0f;
++	config.rnc[10].points = { {
++		{ 0.472000003f, 0.430999994f },
++		{ 0.472000003f, 0.418000013f },
++		{ 0.5f, 0.42899999f },
++		{ 0.503000021f, 0.421999991f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[10].offset = { -0.0350000001f, -0.00300000003f };
++	config.rnc[10].luxKnots = { 260, 280, 330, 355 };
++	config.rnc[10].lumaGate = false;
++	config.rnc[10].lumaMode = 0;
++	config.rnc[10].lumaThreshold = 100.0f;
++	config.rnc[11].points = { {
++		{ 0.370999992f, 0.388999999f },
++		{ 0.377000004f, 0.379999995f },
++		{ 0.395999998f, 0.40200001f },
++		{ 0.404000014f, 0.389999986f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[11].offset = { -0.0309999995f, -0.0329999998f };
++	config.rnc[11].luxKnots = { 130, 140, 190, 200 };
++	config.rnc[11].lumaGate = false;
++	config.rnc[11].lumaMode = 0;
++	config.rnc[11].lumaThreshold = 100.0f;
++	config.rnc[12].points = { {
++		{ 0.386000007f, 0.361999989f },
++		{ 0.393000007f, 0.349999994f },
++		{ 0.421000004f, 0.381000012f },
++		{ 0.423999995f, 0.374000013f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[12].offset = { -0.0439999998f, -0.0160000008f };
++	config.rnc[12].luxKnots = { 250, 270, 330, 350 };
++	config.rnc[12].lumaGate = false;
++	config.rnc[12].lumaMode = 0;
++	config.rnc[12].lumaThreshold = 100.0f;
++	config.rnc[13].points = { {
++		{ 0.287999988f, 0.289999992f },
++		{ 0.300000012f, 0.284000009f },
++		{ 0.310000002f, 0.326999992f },
++		{ 0.324000001f, 0.317000002f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[13].offset = { 0.0299999993f, -0.0320000015f };
++	config.rnc[13].luxKnots = { 330, 340, 355, 395 };
++	config.rnc[13].lumaGate = false;
++	config.rnc[13].lumaMode = 0;
++	config.rnc[13].lumaThreshold = 100.0f;
++	config.rnc[14].points = { {
++		{ 0.316000015f, 0.351999998f },
++		{ 0.356000006f, 0.379999995f },
++		{ 0.328999996f, 0.333999991f },
++		{ 0.367000014f, 0.368999988f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.rnc[14].offset = { 0.0140000004f, 0.00999999978f };
++	config.rnc[14].luxKnots = { 230, 250, 270, 290 };
++	config.rnc[14].lumaGate = true;
++	config.rnc[14].lumaMode = 1;
++	config.rnc[14].lumaThreshold = 100.0f;
++	config.dtb[0][0].points = { {
++		{ 0.497999996f, 0.446999997f },
++		{ 0.477999985f, 0.409999996f },
++		{ 0.681999981f, 0.324000001f },
++		{ 0.70599997f, 0.287999988f },
++		{ 0.633000016f, 0.243000001f },
++		{ 0.628000021f, 0.328999996f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][0].luxBoundary = 270;
++	config.dtb[0][1].points = { {
++		{ 0.518000007f, 0.39199999f },
++		{ 0.472000003f, 0.294999987f },
++		{ 0.671000004f, 0.316000015f },
++		{ 0.566999972f, 0.289999992f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][1].luxBoundary = 290;
++	config.dtb[0][2].points = { {
++		{ 0.507000029f, 0.407999992f },
++		{ 0.465000004f, 0.287999988f },
++		{ 0.633000016f, 0.338f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][2].luxBoundary = 500;
++	config.dtb[0][3].points = { {
++		{ 0.256000012f, 0.280000001f },
++		{ 0.279000014f, 0.272000015f },
++		{ 0.192000002f, 0.0879999995f },
++		{ 0.203999996f, 0.0879999995f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][3].luxBoundary = 370;
++	config.dtb[0][4].points = { {
++		{ 0.294999987f, 0.39199999f },
++		{ 0.244000003f, 0.25f },
++		{ 0.328000009f, 0.374000013f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][4].luxBoundary = 405;
++	config.dtb[0][5].points = { {
++		{ 0.497999996f, 0.446999997f },
++		{ 0.477999985f, 0.409999996f },
++		{ 0.681999981f, 0.324000001f },
++		{ 0.70599997f, 0.287999988f },
++		{ 0.633000016f, 0.243000001f },
++		{ 0.628000021f, 0.328999996f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[0][5].luxBoundary = 230;
++	config.dtb[1][0].points = { {
++		{ 0.319999993f, 0.398999989f },
++		{ 0.335000008f, 0.372999996f },
++		{ 0.377000004f, 0.42899999f },
++		{ 0.393000007f, 0.402999997f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++		{ 0.0f, 0.0f },
++	} };
++	config.dtb[1][0].luxBoundary = 215;
++	return config;
++}
++
++inline LgAwbPreprocessConfiguration s5k3m5LgAwbPreprocessConfiguration()
++{
++	return { s5k3m5LgAwbColourConfiguration(), s5k3m5LgAwbStatisticsConfiguration(),
++		 s5k3m5LgAwbGrayConfiguration(), s5k3m5LgAwbRegionConfiguration() };
++}
++
++inline LgAwbGrayCoreConfiguration s5k3m5LgAwbGrayCoreConfiguration()
++{
++	return { s5k3m5LgAwbPreprocessConfiguration(), s5k3m5LgAwbSceneWeightConfiguration(),
++		 s5k3m5LgAwbSceneReweightConfiguration() };
++}
++
