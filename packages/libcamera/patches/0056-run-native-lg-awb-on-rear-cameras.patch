@@ -1,0 +1,269 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: run calibrated native LG AWB on rear cameras
+
+Bind each rear sensor to its LG pipeline, EEPROM records and histogram
+flatness producer. Consume BG, applied-exposure lux, AE settled state,
+frame cadence and delayed flatness, then apply native gains and CCT to IFE.
+Use the calibrated LG colour transform for manual white balance metadata.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -63,0 +64,4 @@
++#include "lg_awb_tuning.h"
++#include "lg_ae_flat_tuning.h"
++#include "lg_awb_flat_input.h"
++#include "lg_awb_calibration_tuning.h"
+@@ -122,2 +125,0 @@
+-	const CctReference *cctReferences;
+-	std::size_t cctReferenceCount;
+@@ -124,0 +127,3 @@
++	LgAwbPipelineConfiguration (*lgAwbConfiguration)() = nullptr;
++	LgAeFlatConfiguration (*lgAwbFlatConfiguration)() = nullptr;
++	std::array<unsigned int, 2> (*lgAwbEepromOffsets)() = nullptr;
+@@ -153,2 +158,3 @@
+-	.cctReferences = kCctReferences,
+-	.cctReferenceCount = std::size(kCctReferences),
++	.lgAwbConfiguration = s5k3m5LgAwbPipelineConfiguration,
++	.lgAwbFlatConfiguration = s5k3m5LgAeFlatConfiguration,
++	.lgAwbEepromOffsets = s5k3m5LgAwbEepromOffsets,
+@@ -183,2 +189,3 @@
+-	.cctReferences = kImx363CctReferences,
+-	.cctReferenceCount = std::size(kImx363CctReferences),
++	.lgAwbConfiguration = imx363LgAwbPipelineConfiguration,
++	.lgAwbFlatConfiguration = imx363LgAeFlatConfiguration,
++	.lgAwbEepromOffsets = imx363LgAwbEepromOffsets,
+@@ -213,2 +220,3 @@
+-	.cctReferences = kImx351CctReferences,
+-	.cctReferenceCount = std::size(kImx351CctReferences),
++	.lgAwbConfiguration = imx351LgAwbPipelineConfiguration,
++	.lgAwbFlatConfiguration = imx351LgAeFlatConfiguration,
++	.lgAwbEepromOffsets = imx351LgAwbEepromOffsets,
+@@ -243,2 +250,0 @@
+-	.cctReferences = kImx520CctReferences,
+-	.cctReferenceCount = std::size(kImx520CctReferences),
+@@ -396,22 +401,0 @@
+-}
+-
+-double estimateCct(const SensorProfile &profile, double rg, double bg)
+-{
+-	double bestDistance = std::numeric_limits<double>::max();
+-	double cct = 4250.0;
+-	for (std::size_t i = 0; i + 1 < profile.cctReferenceCount; i++) {
+-		const CctReference &lower = profile.cctReferences[i];
+-		const CctReference &upper = profile.cctReferences[i + 1];
+-		double dx = upper.rg - lower.rg;
+-		double dy = upper.bg - lower.bg;
+-		double t = std::clamp(((rg - lower.rg) * dx + (bg - lower.bg) * dy) /
+-				      (dx * dx + dy * dy), 0.0, 1.0);
+-		double ex = rg - (lower.rg + t * dx);
+-		double ey = bg - (lower.bg + t * dy);
+-		double distance = ex * ex + ey * ey;
+-		if (distance < bestDistance) {
+-			bestDistance = distance;
+-			cct = 1.0 / ((1.0 - t) / lower.cct + t / upper.cct);
+-		}
+-	}
+-	return cct;
+@@ -631,0 +616,5 @@
++	std::unique_ptr<LgAwbPipeline> lgAwb_;
++	std::unique_ptr<LgAwbFlatInput> lgFlat_;
++	LgAwbBgStatistics lgBg_;
++	unsigned int awbCameraId_ = 0, awbMinimumGrayCount_ = 0;
++	float awbFlatMetric_ = 0;
+@@ -636 +624,0 @@
+-	unsigned int awbCounter_ = 0;
+@@ -676,2 +664 @@
+-	void updateAwb();
+-	void updateCcm(double r, double g, double b);
++	void updateAwb(bool aeSettled);
+@@ -888 +875 @@
+-	if (afEnabled_ || profile_.awbConfiguration) {
++	if (afEnabled_ || profile_.awbConfiguration || profile_.lgAwbConfiguration) {
+@@ -935,0 +923,28 @@
++	}
++
++	if (profile_.lgAwbConfiguration) {
++		auto offsets = profile_.lgAwbEepromOffsets();
++		std::array<std::array<uint8_t, 8>, 2> blocks;
++		for (unsigned int i = 0; i < blocks.size(); i++) {
++			ret = readFile(nvmem, offsets[i], &blocks[i]);
++			if (ret) {
++				LOG(QcomPipeline, Error) << "Failed to read LG AWB calibration from " << nvmem;
++				return ret;
++			}
++		}
++		auto calibration = lgAwbEepromCalibration(blocks);
++		if (!calibration) {
++			LOG(QcomPipeline, Error) << "Invalid LG AWB calibration checksum";
++			return -EINVAL;
++		}
++		auto config = profile_.lgAwbConfiguration();
++		awbMinimumGrayCount_ = config.minimumGrayCount;
++		awbCameraId_ = cameraId;
++		lgAwb_ = std::make_unique<LgAwbPipeline>(config, *calibration);
++		lgFlat_ = std::make_unique<LgAwbFlatInput>(profile_.lgAwbFlatConfiguration());
++		LOG(QcomPipeline, Info) << "Loaded LG camera ID " << cameraId
++			<< " AWB calibration from " << nvmem << std::setprecision(9)
++			<< ": daylight " << calibration->measured[0].red << " " << calibration->measured[0].blue
++			<< ", incandescent " << calibration->measured[1].red << " " << calibration->measured[1].blue
++			<< ", valid " << calibration->valid[0] << " " << calibration->valid[1]
++			<< ", minimum gray count " << awbMinimumGrayCount_;
+@@ -1256 +1271,7 @@
+-	awbCounter_ = 0;
++	if (lgAwb_) {
++		lgAwb_->reset();
++		lgFlat_->reset();
++		lgBg_ = {};
++		awbFlatMetric_ = 0;
++		awbFrame_ = 0;
++	}
+@@ -1277,2 +1298,5 @@
+-	else
+-		colourTemperature_ = estimateCct(profile_, 1.0 / awbGainR_, 1.0 / awbGainB_);
++	else {
++		auto colour = lgAwb_->grayCore().colour().fromRgb(
++			{ 1.0f / static_cast<float>(awbGainR_), 1.0f / static_cast<float>(awbGainB_) });
++		colourTemperature_ = lgAwbColourTemperature({ colour.x, colour.y });
++	}
+@@ -1435,0 +1460,5 @@
++	if (lgFlat_) {
++		std::array<uint32_t, 1024> histogram;
++		std::copy_n(hist_.begin(), histogram.size(), histogram.begin());
++		awbFlatMetric_ = lgFlat_->update(request.sequence, histogram);
++	}
+@@ -1452 +1481 @@
+-		updateAwb();
++		updateAwb(aeSettled);
+@@ -1600,12 +1629 @@
+-void QcomCameraData::updateCcm(double r, double g, double b)
+-{
+-	double cct = estimateCct(profile_, r / g, b / g);
+-	colourTemperature_ = colourTemperature_ * 0.8 + cct * 0.2;
+-	interpolateCcm(profile_, colourTemperature_, ccmQ7_);
+-
+-	LOG(QcomPipeline, Debug) << "AWB CCT " << colourTemperature_
+-				 << " CCM " << ccmQ7_[0] << " " << ccmQ7_[4]
+-				 << " " << ccmQ7_[8];
+-}
+-
+-void QcomCameraData::updateAwb()
++void QcomCameraData::updateAwb(bool aeSettled)
+@@ -1634 +1652 @@
+-	if (++awbCounter_ % 4)
++	if (!luxIndex_)
+@@ -1636,64 +1654,23 @@
+-
+-	uint64_t sums[4] = {};
+-	uint64_t counts[4] = {};
+-
+-	for (unsigned int y = 0; y < QCOM_CAMSS_AWB_BG_V_NUM; y++) {
+-		for (unsigned int x = 0; x < QCOM_CAMSS_AWB_BG_H_NUM; x++) {
+-			unsigned int i = y * QCOM_CAMSS_AWB_BG_H_NUM + x;
+-			const uint32_t *region = &awb_[i *
+-				(QCOM_CAMSS_AWB_BG_REGION_SIZE / sizeof(uint32_t))];
+-			uint32_t regionCounts[4] = {
+-				region[4] & 0xffff, region[4] >> 16,
+-				region[5] & 0xffff, region[5] >> 16,
+-			};
+-			uint32_t saturated[4] = {
+-				region[10] & 0xffff, region[10] >> 16,
+-				region[11] & 0xffff, region[11] >> 16,
+-			};
+-			unsigned int weight = x >= QCOM_CAMSS_AWB_BG_H_NUM / 4 &&
+-				x < 3 * QCOM_CAMSS_AWB_BG_H_NUM / 4 &&
+-				y >= QCOM_CAMSS_AWB_BG_V_NUM / 4 &&
+-				y < 3 * QCOM_CAMSS_AWB_BG_V_NUM / 4 ? 4 : 1;
+-
+-			if (std::any_of(std::begin(regionCounts), std::end(regionCounts),
+-					[](uint32_t count) { return !count; }))
+-				continue;
+-			uint64_t sampleCount = 0;
+-			uint64_t saturatedCount = 0;
+-			for (unsigned int c = 0; c < 4; c++) {
+-				sampleCount += regionCounts[c];
+-				saturatedCount += saturated[c];
+-			}
+-			if (saturatedCount > sampleCount / 8)
+-				continue;
+-
+-			for (unsigned int c = 0; c < 4; c++) {
+-				sums[c] += static_cast<uint64_t>(region[c] & 0x3fffffff) * weight;
+-				counts[c] += static_cast<uint64_t>(regionCounts[c]) * weight;
+-			}
+-		}
+-	}
+-
+-	if (std::any_of(std::begin(counts), std::end(counts),
+-			[](uint64_t count) { return !count; }))
+-		return;
+-
+-	double r = static_cast<double>(sums[0]) / counts[0];
+-	double b = static_cast<double>(sums[1]) / counts[1];
+-	double gr = static_cast<double>(sums[2]) / counts[2];
+-	double gb = static_cast<double>(sums[3]) / counts[3];
+-	double g = (gr + gb) * 0.5;
+-
+-	if (r <= 4.0 || b <= 4.0 || g <= 4.0)
+-		return;
+-
+-	double gainR = std::clamp(g / r, 0.25, 8.0);
+-	double gainB = std::clamp(g / b, 0.25, 8.0);
+-
+-	awbGainR_ = awbGainR_ * 0.8 + gainR * 0.2;
+-	awbGainB_ = awbGainB_ * 0.8 + gainB * 0.2;
+-	updateCcm(r, g, b);
+-	setIfeWb(awbGainR_, 1.0, awbGainB_);
+-
+-	LOG(QcomPipeline, Debug) << "AWB R " << r << " G " << g << " B " << b
+-				 << " gains " << awbGainR_ << " " << awbGainB_;
++	lgBg_.update(awb_.data(), 14, 0, LgAwbBgStatistics::Regions);
++	float lux = *luxIndex_;
++	int luxRounded = static_cast<int>(lux + 0.5f);
++	unsigned int fps = std::lround(1e9 / frameDurationNs_);
++	const auto &result = lgAwb_->process(lgBg_.rgb,
++		{ luxRounded, awbMinimumGrayCount_, 0, 0, awbCameraId_, fps, 13, 0,
++		  aeSettled, false, false, false, false, false, false, awbFlatMetric_, std::nullopt });
++	if (result.filtered.cct > 0) {
++		colourTemperature_ = result.filtered.cct;
++		interpolateCcm(profile_, colourTemperature_, ccmQ7_);
++	}
++	setIfeWb(result.rgb[0], result.rgb[1], result.rgb[2]);
++	LOG(QcomPipeline, Debug) << std::setprecision(9)
++		<< "LG AWB stats " << lastStatsSequence_ << " frame " << awbFrame_++
++		<< " lux " << lux << " rounded " << luxRounded << " fps " << fps
++		<< " ae " << aeSettled << " flat " << awbFlatMetric_
++		<< " startup " << result.cadence.startup << " skipped " << result.cadence.skipped
++		<< " counter " << result.cadence.counter << " gray " << result.grayValid
++		<< " source " << static_cast<unsigned int>(result.target.source)
++		<< " target " << result.target.rgb[0] << " " << result.target.rgb[1] << " " << result.target.rgb[2]
++		<< " gains " << result.rgb[0] << " " << result.rgb[1] << " " << result.rgb[2]
++		<< " cct " << result.filtered.cct;
++
+@@ -1930,2 +1907,7 @@
+-		if (enabled && !awbEnabled_ && qtiAwb_) {
+-			qtiAwb_->reset();
++		if (enabled && !awbEnabled_) {
++			if (qtiAwb_)
++				qtiAwb_->reset();
++			if (lgAwb_) {
++				lgAwb_->reset();
++				lgBg_ = {};
++			}
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_pipeline.h b/src/libcamera/pipeline/qcom/lg_awb_pipeline.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_pipeline.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_pipeline.h
+@@ -23,0 +24 @@
++	unsigned int minimumGrayCount;
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_tuning.h b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -950 +950 @@
+-		 imx363LgAwbFoeConfiguration(), { 4, 8, 12, 20 } };
++		 imx363LgAwbFoeConfiguration(), { 4, 8, 12, 20 }, 230 };
+@@ -1876 +1876 @@
+-		 imx351LgAwbFoeConfiguration(), { 4, 8, 12, 20 } };
++		 imx351LgAwbFoeConfiguration(), { 4, 8, 12, 20 }, 230 };
+@@ -2876 +2876 @@
+-		 s5k3m5LgAwbFoeConfiguration(), { 4, 8, 12, 20 } };
++		 s5k3m5LgAwbFoeConfiguration(), { 4, 8, 12, 20 }, 360 };
