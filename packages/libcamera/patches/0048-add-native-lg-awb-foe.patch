@@ -1,0 +1,103 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add native LG AWB FOE correction
+
+Generate the per-sensor lux and CCT knots, mixing limit and gain factors.
+Gate the correction on outdoor, flash, LED and IQM inputs, preserving
+factory plateau endpoints when lux knots coincide. Blend the calibrated
+5000 K reference before applying the configured R/B factors.
+
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_target.h b/src/libcamera/pipeline/qcom/lg_awb_target.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_target.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_target.h
+@@ -12 +12 @@
+-	None = 0, Gray = 1, History = 2, Previous = 3, Dtb = 5, Ohe = 6,
++	None = 0, Gray = 1, History = 2, Previous = 3, Dtb = 5, Ohe = 6, Foe = 9,
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_exceptions.h b/src/libcamera/pipeline/qcom/lg_awb_exceptions.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_exceptions.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_exceptions.h
+@@ -153,0 +154,64 @@
++struct LgAwbFoeConfiguration {
++	bool enabled;
++	std::array<int16_t, 4> luxKnots, cctKnots;
++	LgAwbRatios coefficients;
++	int16_t maximumPercent;
++};
++
++struct LgAwbFoeControls {
++	int lux;
++	unsigned int led;
++	bool outdoor, flashOn;
++	std::optional<float> iqmSecond;
++};
++
++class LgAwbFoe
++{
++public:
++	explicit LgAwbFoe(const LgAwbFoeConfiguration &config)
++		: config_(config)
++	{
++	}
++
++	void reset() { weight_ = 0; }
++	float weight() const { return weight_; }
++
++	void apply(LgAwbGainTarget &target, const LgAwbColour &colour, const LgAwbFoeControls &controls)
++	{
++		weight_ = config_.enabled ? lgAwbProduct(lgAwbProduct(config_.maximumPercent, 0.01f),
++			lgAwbProduct(factor(controls.lux, config_.luxKnots), factor(target.cct, config_.cctKnots))) : 0;
++		if (!config_.enabled || !controls.outdoor || controls.flashOn || controls.led ||
++		    !controls.iqmSecond || !(*controls.iqmSecond < 0.5f) || !(weight_ > 1e-6f))
++			return;
++		auto ratios = colour.nominalRgb()[2];
++		LgAwbRgb reference{ 1.0f / ratios.red, 1, 1.0f / ratios.blue };
++		float retained = 1.0f - weight_;
++		for (unsigned int channel = 0; channel < target.rgb.size(); channel++)
++			target.rgb[channel] = lgAwbProduct(weight_, reference[channel]) +
++				lgAwbProduct(retained, target.rgb[channel]);
++		target.rgb[0] = lgAwbProduct(target.rgb[0], config_.coefficients.red);
++		target.rgb[2] = lgAwbProduct(target.rgb[2], config_.coefficients.blue);
++		target.cct = static_cast<int32_t>(lgAwbProduct(weight_, 5000.0f) +
++			lgAwbProduct(retained, target.cct));
++		target.source = LgAwbGainSource::Foe;
++	}
++
++private:
++	static float factor(int value, const std::array<int16_t, 4> &knots)
++	{
++		if (value <= knots[0])
++			return 0;
++		if (value < knots[1])
++			return static_cast<float>(value - knots[0]) / (knots[1] - knots[0]);
++		/* FOE keeps the plateau endpoint when its last two knots coincide. */
++		if (value <= knots[2])
++			return 1;
++		if (value >= knots[3])
++			return 0;
++		return 1.0f - static_cast<float>(value - knots[2]) / (knots[3] - knots[2]);
++	}
++
++	LgAwbFoeConfiguration config_;
++	float weight_ = 0;
++};
++
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_tuning.h b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -666,0 +667,5 @@
++}
++
++inline LgAwbFoeConfiguration imx363LgAwbFoeConfiguration()
++{
++	return { true, { 130, 150, 320, 350 }, { 3400, 3600, 4250, 4400 }, { 1.0f, 1.0f }, 50 };
+@@ -1580,0 +1586,5 @@
++inline LgAwbFoeConfiguration imx351LgAwbFoeConfiguration()
++{
++	return { true, { 130, 150, 600, 600 }, { 2900, 3100, 4300, 4500 }, { 1.0f, 1.0f }, 50 };
++}
++
+@@ -2531,0 +2542,5 @@
++inline LgAwbFoeConfiguration s5k3m5LgAwbFoeConfiguration()
++{
++	return { true, { 130, 150, 600, 600 }, { 2900, 3100, 4300, 4500 }, { 1.0f, 1.0f }, 50 };
++}
++
