@@ -1,0 +1,225 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add native LG AWB history and target selection
+
+Store gated rolling and initial gain histories with modal-illuminant
+lookup, physical-slot accumulation and matching CCT rounding. Select
+sensor gains from the current gray result, available rolling history or
+the prior target. Share the gray core's calibrated colour transform so
+both directions use the same frame references.
+
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_history.h b/src/libcamera/pipeline/qcom/lg_awb_history.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_history.h
+@@ -0,0 +1,110 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <vector>
++
++#include "lg_awb_math.h"
++
++namespace libcamera::qcom {
++
++struct LgAwbGainSample {
++	LgAwbRgb rgb{};
++	int32_t cct = 0;
++	uint32_t illuminant = 0;
++};
++
++struct LgAwbHistoryConfiguration {
++	unsigned int capacity;
++	float maximumFlatMetric, initialMaximumFlatMetric;
++};
++
++enum class LgAwbHistoryKind { Initial, Rolling };
++
++struct LgAwbHistoryControls {
++	bool startup, grayValid, aeSettled;
++	unsigned int flashState;
++	float flatMetric;
++};
++
++class LgAwbHistory
++{
++public:
++	explicit LgAwbHistory(const LgAwbHistoryConfiguration &config)
++		: config_(config), rolling_(config.capacity), initial_(config.capacity)
++	{
++	}
++
++	void reset()
++	{
++		rollingCount_ = initialCount_ = next_ = 0;
++		rollingCounts_ = initialCounts_ = {};
++	}
++
++	void update(LgAwbRgb rgb, int32_t cct, const LgAwbHistoryControls &controls)
++	{
++		if (controls.startup || !controls.grayValid || !controls.aeSettled || controls.flashState ||
++		    !(controls.flatMetric < config_.maximumFlatMetric))
++			return;
++		LgAwbGainSample sample{ rgb, cct, lgAwbIlluminant(cct) };
++		if (rollingCount_ == config_.capacity)
++			rollingCounts_[rolling_[next_].illuminant]--;
++		else
++			rollingCount_++;
++		rolling_[next_] = sample;
++		rollingCounts_[sample.illuminant]++;
++		if (initialCount_ < config_.capacity && controls.flatMetric < config_.initialMaximumFlatMetric) {
++			initial_[initialCount_++] = sample;
++			initialCounts_[sample.illuminant]++;
++		}
++		next_ = (next_ + 1) % config_.capacity;
++	}
++
++	std::optional<LgAwbGainSample> lookup(LgAwbHistoryKind kind, bool skipped = false) const
++	{
++		bool initial = kind == LgAwbHistoryKind::Initial;
++		if (!initial && (skipped || rollingCount_ < 15))
++			return std::nullopt;
++		const auto &histogram = initial ? initialCounts_ : rollingCounts_;
++		const auto &samples = initial ? initial_ : rolling_;
++		unsigned int size = initial ? initialCount_ : rollingCount_;
++		unsigned int illuminant = std::max_element(histogram.begin(), histogram.end()) - histogram.begin();
++		LgAwbGainSample result{};
++		int cct = 0;
++		for (unsigned int i = 0; i < size; i++) {
++			if (samples[i].illuminant != illuminant)
++				continue;
++			for (unsigned int channel = 0; channel < result.rgb.size(); channel++)
++				result.rgb[channel] += samples[i].rgb[channel];
++			cct += samples[i].cct;
++		}
++		unsigned int count = histogram[illuminant];
++		for (float &value : result.rgb)
++			value /= count;
++		/* FCVTZS produces zero for the empty initial table's NaN CCT mean. */
++		result.cct = count ? static_cast<int32_t>(static_cast<float>(cct) / count) : 0;
++		result.illuminant = illuminant;
++		return result;
++	}
++
++	unsigned int size(LgAwbHistoryKind kind) const
++	{
++		return kind == LgAwbHistoryKind::Initial ? initialCount_ : rollingCount_;
++	}
++	const std::array<uint32_t, 6> &counts(LgAwbHistoryKind kind) const
++	{
++		return kind == LgAwbHistoryKind::Initial ? initialCounts_ : rollingCounts_;
++	}
++	unsigned int nextIndex() const { return next_; }
++
++private:
++	LgAwbHistoryConfiguration config_;
++	std::vector<LgAwbGainSample> rolling_, initial_;
++	std::array<uint32_t, 6> rollingCounts_{}, initialCounts_{};
++	unsigned int rollingCount_ = 0, initialCount_ = 0, next_ = 0;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_target.h b/src/libcamera/pipeline/qcom/lg_awb_target.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_target.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <cmath>
++
++#include "lg_awb_colour.h"
++#include "lg_awb_history.h"
++
++namespace libcamera::qcom {
++
++enum class LgAwbGainSource : uint32_t { None = 0, Gray = 1, History = 2, Previous = 3 };
++
++struct LgAwbGainTarget {
++	LgAwbRgb rgb{};
++	int32_t cct = 0;
++	LgAwbGainSource source = LgAwbGainSource::None;
++};
++
++class LgAwbTarget
++{
++public:
++	void reset()
++	{
++		target_ = {};
++		previous_ = {};
++		previousCct_ = 0;
++	}
++
++	const LgAwbGainTarget &select(const LgAwbColour &colour, const LgAwbHistory &history,
++				     LgAwbXyY gray, int32_t cct, uint32_t &grayValid,
++				     bool skipped, unsigned int flashState = 0)
++	{
++		if (grayValid == 1) {
++			auto ratios = colour.toRgb(gray);
++			if (std::abs(ratios.red) <= 1e-6f || std::abs(ratios.blue) <= 1e-6f) {
++				grayValid = 0;
++			} else {
++				target_ = { { 1.0f / ratios.red, 1, 1.0f / ratios.blue }, cct, LgAwbGainSource::Gray };
++				previousCct_ = cct;
++			}
++		}
++		if (!grayValid) {
++			auto sample = history.lookup(LgAwbHistoryKind::Rolling, skipped);
++			if (sample) {
++				target_ = { sample->rgb, sample->cct, LgAwbGainSource::History };
++				previousCct_ = sample->cct;
++			} else {
++				target_ = { previous_, previousCct_, LgAwbGainSource::Previous };
++			}
++		}
++		if (flashState == 0 || flashState == 5)
++			previous_ = target_.rgb;
++		return target_;
++	}
++
++private:
++	LgAwbGainTarget target_;
++	LgAwbRgb previous_{};
++	int32_t previousCct_ = 0;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_preprocess.h b/src/libcamera/pipeline/qcom/lg_awb_preprocess.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_preprocess.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_preprocess.h
+@@ -81,0 +82,2 @@
++	const LgAwbColour &colour() const { return colour_; }
++
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_gray_core.h b/src/libcamera/pipeline/qcom/lg_awb_gray_core.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_gray_core.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_gray_core.h
+@@ -55,0 +56,2 @@
++	const LgAwbColour &colour() const { return preprocess_.colour(); }
++
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_tuning.h b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -7,0 +8,2 @@
++#include "lg_awb_history.h"
++#include "lg_awb_target.h"
+@@ -670,0 +673,5 @@
++inline LgAwbHistoryConfiguration imx363LgAwbHistoryConfiguration()
++{
++	return { 15, 0.75f, 0.649999976f };
++}
++
+@@ -1324,0 +1332,5 @@
++inline LgAwbHistoryConfiguration imx351LgAwbHistoryConfiguration()
++{
++	return { 15, 0.850000024f, 0.699999988f };
++}
++
+@@ -2021,0 +2034,5 @@
++inline LgAwbHistoryConfiguration s5k3m5LgAwbHistoryConfiguration()
++{
++	return { 15, 1.0f, 0.699999988f };
++}
++
