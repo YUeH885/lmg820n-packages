@@ -1,0 +1,91 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: prepare histogram flatness input for rear AWB
+
+Preserve the CamX 25-bit histogram counts and LG four-bin reduction.
+Produce flatness from hardware statistics and retain the original two-frame
+AWB tag delay, startup behavior and missing-frame retention.
+
+diff --git a/src/libcamera/pipeline/qcom/lg_ae_histogram.h b/src/libcamera/pipeline/qcom/lg_ae_histogram.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_ae_histogram.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++namespace libcamera::qcom {
++
++inline std::array<uint32_t, 256> lgAeHistogram(const std::array<uint32_t, 1024> &raw)
++{
++	std::array<uint32_t, 256> result{};
++	for (unsigned int i = 0; i < result.size(); i++)
++		for (unsigned int j = 0; j < 4; j++)
++			result[i] += raw[i * 4 + j] & 0x01ffffff;
++	return result;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_ae_flat.h b/src/libcamera/pipeline/qcom/lg_ae_flat.h
+--- a/src/libcamera/pipeline/qcom/lg_ae_flat.h
++++ b/src/libcamera/pipeline/qcom/lg_ae_flat.h
+@@ -67,0 +68,2 @@
++	const LgAeFlatResult &result() const { return result_; }
++
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_flat_input.h b/src/libcamera/pipeline/qcom/lg_awb_flat_input.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_flat_input.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <optional>
++
++#include "lg_ae_flat.h"
++#include "lg_ae_histogram.h"
++
++namespace libcamera::qcom {
++
++class LgAwbFlatInput
++{
++public:
++	explicit LgAwbFlatInput(const LgAeFlatConfiguration &config) : flat_(config) {}
++
++	void reset()
++	{
++		flat_.reset();
++		frames_ = {};
++		value_ = 0;
++	}
++
++	float update(uint64_t frame, const std::array<uint32_t, 1024> &histogram)
++	{
++		const auto &result = flat_.process(lgAeHistogram(histogram));
++		frames_[frame % frames_.size()] = Frame{ frame, result.metric };
++		/* The plugin starts querying frame N-2 at N=3 and retains missing tags. */
++		if (frame >= 3) {
++			uint64_t requested = frame - 2;
++			const auto &previous = frames_[requested % frames_.size()];
++			if (previous && previous->sequence == requested)
++				value_ = previous->metric;
++		}
++		return value_;
++	}
++
++	const LgAeFlatResult &current() const { return flat_.result(); }
++
++private:
++	struct Frame {
++		uint64_t sequence;
++		float metric;
++	};
++
++	LgAeFlat flat_;
++	std::array<std::optional<Frame>, 3> frames_;
++	float value_ = 0;
++};
++
++} /* namespace libcamera::qcom */
