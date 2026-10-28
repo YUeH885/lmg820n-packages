@@ -1,0 +1,610 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add native LG AWB gray-zone geometry and classification
+
+Configure primary and reserved references from sensor tuning, interpolate
+lux-dependent reference shifts and outlier widths, and classify each
+point against the five-segment locus and reserved circles. Preserve the
+factory's endpoint, nearest-reference and boundary selection rules.
+
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_gray.h b/src/libcamera/pipeline/qcom/lg_awb_gray.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_gray.h
+@@ -0,0 +1,154 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++#include "lg_awb_statistics.h"
++
++namespace libcamera::qcom {
++
++struct LgAwbGrayReferences {
++	unsigned int count;
++	std::array<LgAwbPoint, 17> points;
++	std::array<float, 17> above, below;
++};
++
++struct LgAwbGrayDecision {
++	uint32_t nearest, additionalNearest, valid, weightGroup, category;
++};
++
++class LgAwbGrayClassifier
++{
++public:
++	explicit LgAwbGrayClassifier(const LgAwbGrayReferences &references)
++		: references_(references)
++	{
++		for (unsigned int i = 0; i < lines_.size(); i++) {
++			auto a = references_.points[i], b = references_.points[i + 1];
++			float dx = b.x - a.x;
++			lines_[i] = { (b.y - a.y) / dx,
++				      (product(a.y, b.x) - product(a.x, b.y)) / dx };
++		}
++	}
++
++	LgAwbGrayDecision classify(LgAwbPoint point) const
++	{
++		std::array<LgAwbPoint, 6> primary;
++		std::copy_n(references_.points.begin(), primary.size(), primary.begin());
++		unsigned int nearest = lgAwbNearestReference(primary, point);
++		unsigned int additional = 6;
++		float additionalDistance = distance(point, references_.points[additional]);
++		for (unsigned int i = 7; i < references_.count; i++) {
++			float current = distance(point, references_.points[i]);
++			if (current < additionalDistance) {
++				additional = i;
++				additionalDistance = current;
++			}
++		}
++		LgAwbGrayDecision result{ nearest, additional, 0, 0, 0 };
++		unsigned int segment;
++		int cap = -1;
++		Projection projection;
++		if (nearest == 0) {
++			segment = 0;
++			projection = project(point, segment);
++			if (projection.x < primary.front().x) {
++				cap = 0;
++				projection.distance = distance(point, primary.front());
++			}
++		} else if (nearest == 5) {
++			segment = 4;
++			projection = project(point, segment);
++			if (projection.x > primary.back().x) {
++				cap = 5;
++				projection.distance = distance(point, primary.back());
++			}
++		} else {
++			auto before = project(point, nearest - 1), after = project(point, nearest);
++			bool beforeValid = before.x >= primary[nearest - 1].x && before.x <= primary[nearest].x;
++			bool afterValid = after.x >= primary[nearest].x && after.x <= primary[nearest + 1].x;
++			bool chooseBefore = (beforeValid && (!afterValid || before.distance < after.distance)) ||
++				(!afterValid && before.distance >= after.distance);
++			segment = chooseBefore ? nearest - 1 : nearest;
++			projection = chooseBefore ? before : after;
++		}
++		if (projection.distance > additionalDistance) {
++			float width = references_.above[additional];
++			/* The middle segment's forward branch excludes the circle boundary. */
++			bool strict = nearest > 0 && nearest < 5 && segment == nearest;
++			if (strict ? additionalDistance < width : additionalDistance <= width) {
++				result.valid = 1;
++				result.category = 12 + additional;
++			}
++			return result;
++		}
++		const auto &widths = projection.above ? references_.above : references_.below;
++		float width;
++		unsigned int category;
++		if (cap >= 0) {
++			width = widths[cap];
++			category = cap == 0 ? 1 : 17;
++		} else {
++			float a = primary[segment].x, b = primary[segment + 1].x;
++			width = interpolate(projection.x, a, b, widths[segment], widths[segment + 1]);
++			float third = a + product(b - a, 1.0f / 3.0f);
++			float twoThirds = a + product(b - a, 2.0f / 3.0f);
++			category = 3 * segment + (projection.x <= third ? 2 : projection.x <= twoThirds ? 3 : 4);
++		}
++		if (projection.distance <= width) {
++			result.valid = 1;
++			result.category = category;
++			if (projection.distance < width / 3.0f)
++				result.weightGroup = projection.above ? 2 : 3;
++			else if (projection.distance < width)
++				result.weightGroup = projection.above ? 1 : 4;
++		}
++		return result;
++	}
++
++private:
++	struct Line {
++		float slope, intercept;
++	};
++
++	struct Projection {
++		float x, distance;
++		bool above;
++	};
++
++	static float product(float a, float b)
++	{
++		/* Match the factory's separate multiplication and addition rounding. */
++		volatile float result = a * b;
++		return result;
++	}
++
++	static float distance(LgAwbPoint a, LgAwbPoint b)
++	{
++		float dx = a.x - b.x, dy = a.y - b.y;
++		return std::sqrt(product(dx, dx) + product(dy, dy));
++	}
++
++	static float interpolate(float x, float a, float b, float first, float last)
++	{
++		if (a >= b - 1e-6f && a <= b + 1e-6f)
++			return product(first + last, 0.5f);
++		return first + product((x - a) / (b - a), last - first);
++	}
++
++	Projection project(LgAwbPoint point, unsigned int segment) const
++	{
++		auto line = lines_[segment];
++		float divisor = product(line.slope, line.slope) + 1.0f;
++		return { (point.x + product(line.slope, point.y - line.intercept)) / divisor,
++			 std::abs((point.y - product(point.x, line.slope)) - line.intercept) / std::sqrt(divisor),
++			 point.y > product(point.x, line.slope) + line.intercept };
++	}
++
++	LgAwbGrayReferences references_;
++	std::array<Line, 5> lines_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_gray_geometry.h b/src/libcamera/pipeline/qcom/lg_awb_gray_geometry.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_gray_geometry.h
+@@ -0,0 +1,91 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++
++#include "lg_awb_colour.h"
++#include "lg_awb_gray.h"
++
++namespace libcamera::qcom {
++
++struct LgAwbReferenceChange {
++	unsigned int index;
++	std::array<int16_t, 2> lux;
++	LgAwbPoint target;
++};
++
++struct LgAwbGrayConfiguration {
++	LgAwbColourConfiguration colour;
++	unsigned int additionalCount, changeCount;
++	std::array<LgAwbRatios, 11> additional;
++	std::array<LgAwbReferenceChange, 10> changes;
++	std::array<int16_t, 17> above, below;
++	std::array<int16_t, 24> luxKnots;
++	std::array<std::array<std::array<int16_t, 17>, 2>, 24> distanceOffsets;
++};
++
++class LgAwbGrayGeometry
++{
++public:
++	explicit LgAwbGrayGeometry(const LgAwbGrayConfiguration &config)
++		: config_(config)
++	{
++		std::copy(config.colour.ideal.begin(), config.colour.ideal.end(), points_.begin());
++		/* Reserved references use the fixed, uncalibrated nominal sensor-to-ideal shift. */
++		auto nominal = config.colour;
++		nominal.lowLightEnabled = false;
++		LgAwbColour colour(nominal);
++		for (unsigned int i = 0; i < config.additionalCount; i++) {
++			auto point = colour.fromRgb(config.additional[i]);
++			points_[6 + i] = { point.x, point.y };
++		}
++	}
++
++	LgAwbGrayReferences references(int lux, bool widen4000KBelow = false) const
++	{
++		LgAwbGrayReferences result{};
++		result.count = 6 + config_.additionalCount;
++		result.points = points_;
++		for (unsigned int i = 0; i < config_.changeCount; i++) {
++			const auto &change = config_.changes[i];
++			auto base = points_[change.index];
++			float t = std::clamp(static_cast<float>(lux - change.lux[0]) /
++					     (change.lux[1] - change.lux[0]), 0.0f, 1.0f);
++			result.points[change.index] = { base.x + product(t, change.target.x - base.x),
++						       base.y + product(t, change.target.y - base.y) };
++		}
++		unsigned int region = std::lower_bound(config_.luxKnots.begin(), config_.luxKnots.end(), lux) -
++			config_.luxKnots.begin();
++		unsigned int first = region ? region - 1 : 0;
++		unsigned int last = std::min<unsigned int>(region, config_.luxKnots.size() - 1);
++		float t = first == last ? 0.0f : static_cast<float>(lux - config_.luxKnots[first]) /
++			(config_.luxKnots[last] - config_.luxKnots[first]);
++		for (unsigned int i = 0; i < result.above.size(); i++) {
++			for (unsigned int side = 0; side < 2; side++) {
++				float a = product(config_.distanceOffsets[first][side][i], 0.001f);
++				float b = product(config_.distanceOffsets[last][side][i], 0.001f);
++				float base = product(side ? config_.below[i] : config_.above[i], 0.001f);
++				float value = base + (a + product(t, b - a));
++				(side ? result.below : result.above)[i] = value;
++			}
++		}
++		if (widen4000KBelow && region >= 7 && region <= 14)
++			result.below[3] = 0.03f;
++		return result;
++	}
++
++private:
++	static float product(float a, float b)
++	{
++		/* Match the factory's separate multiplication and addition rounding. */
++		volatile float result = a * b;
++		return result;
++	}
++
++	LgAwbGrayConfiguration config_;
++	std::array<LgAwbPoint, 17> points_{};
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_tuning.h b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -4,0 +5 @@
++#include "lg_awb_gray_geometry.h"
+@@ -226,0 +228,115 @@
++inline LgAwbGrayConfiguration imx363LgAwbGrayConfiguration()
++{
++	LgAwbGrayConfiguration config{};
++	config.colour = imx363LgAwbColourConfiguration();
++	config.additionalCount = 6;
++	config.changeCount = 1;
++	config.additional[0] = { 0.516889989f, 0.455657005f };
++	config.additional[1] = { 0.509561002f, 0.602955997f };
++	config.additional[2] = { 0.579777002f, 0.749513984f };
++	config.additional[3] = { 0.649776995f, 0.703391016f };
++	config.additional[4] = { 0.699910998f, 0.581396997f };
++	config.additional[5] = { 0.612776995f, 0.363391012f };
++	config.changes[0] = { 0, { 230, 320 }, { 0.289999992f, 0.296000004f } };
++	config.above = { 20, 20, 20, 20, 20, 20, 20, 20, 0, 0, 0, 0, 20, 20, 20, 20, 20 };
++	config.below = { 20, 20, 20, 20, 20, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++	config.luxKnots = { 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 260, 280, 300, 320, 340, 360, 380, 400, 420, 440, 460, 480, 500, 520 };
++	config.distanceOffsets[0] = { {
++		{ 0, 0, 0, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[1] = { {
++		{ 0, 0, -2, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[2] = { {
++		{ 0, 0, -2, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[3] = { {
++		{ 0, 0, -2, -6, -4, -4, -12, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[4] = { {
++		{ 0, 0, -6, -6, -4, -7, -12, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -7, -6, -6, -6, -4, -7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[5] = { {
++		{ -4, -3, -8, -8, -4, -8, -12, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -7, -6, -5, -10, -4, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[6] = { {
++		{ -3, -4, -5, -8, -4, -8, -12, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -5, -10, -6, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[7] = { {
++		{ -2, -4, -5, -8, -4, -8, -12, -6, 10, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -2, -2, -2, -8, -8, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[8] = { {
++		{ -2, -4, -5, -8, -9, -7, -8, -6, 10, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -2, -2, -2, -8, -7, -7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[9] = { {
++		{ -11, -9, -4, -8, -8, -7, -8, -4, 10, 0, 12, 0, 0, 0, 0, 0, 0 },
++		{ -10, -5, -1, -8, -5, -12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[10] = { {
++		{ -11, -9, -3, -4, -4, -10, -8, -6, 10, 12, 12, 0, 0, 0, 0, 0, 0 },
++		{ -6, -5, -5, -9, -13, -12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[11] = { {
++		{ -11, -9, -3, -4, -3, -12, -8, -6, 10, 14, 12, 8, 0, 0, 0, 0, 0 },
++		{ -6, -9, -5, -4, -13, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[12] = { {
++		{ -9, -9, -3, -6, -7, -12, -8, -3, 10, 14, 0, 10, 0, 0, 0, 0, 0 },
++		{ -6, -9, -7, -4, -10, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[13] = { {
++		{ -9, -9, -3, -6, -7, -12, -3, -3, 10, 0, 0, 10, 0, 0, 0, 0, 0 },
++		{ -5, -9, -5, -4, -6, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[14] = { {
++		{ -5, -7, -7, -7, -7, -7, -3, 0, 0, 0, 8, 3, 0, 0, 0, 0, 0 },
++		{ -5, -4, -4, -4, -6, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[15] = { {
++		{ -7, -7, -5, -7, -7, -7, -3, 0, 10, 10, 10, 0, 0, 0, 0, 0, 0 },
++		{ -5, -7, -3, -3, -7, -7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[16] = { {
++		{ -7, -7, -7, -7, -7, -7, -4, 0, 10, 10, 10, 0, 0, 0, 0, 0, 0 },
++		{ -7, -7, -7, -5, -8, -7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[17] = { {
++		{ -7, -7, -7, -5, 0, 0, -8, 0, 10, 10, 10, 20, 0, 0, 0, 0, 0 },
++		{ -10, -9, -7, -9, -6, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[18] = { {
++		{ -7, -7, -2, -5, 0, 0, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -10, -9, -6, -9, -3, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[19] = { {
++		{ -7, -7, -2, -5, 0, 0, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -10, -10, -10, -10, -4, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[20] = { {
++		{ -4, -4, -4, -4, -4, -4, -2, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -10, -10, -10, -8, -8, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[21] = { {
++		{ -4, -4, -4, -4, -4, -4, -2, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -10, -9, -7, -8, -8, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[22] = { {
++		{ -4, -4, -4, -4, -4, -4, -2, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -10, -9, -7, -8, -10, -12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[23] = { {
++		{ -4, -4, -4, -4, -4, -4, -2, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -10, -9, -7, -8, -10, -12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	return config;
++}
++
+@@ -444,0 +561,112 @@
++inline LgAwbGrayConfiguration imx351LgAwbGrayConfiguration()
++{
++	LgAwbGrayConfiguration config{};
++	config.colour = imx351LgAwbColourConfiguration();
++	config.additionalCount = 2;
++	config.changeCount = 2;
++	config.additional[0] = { 0.663703978f, 0.438495994f };
++	config.additional[1] = { 0.529668987f, 0.517938018f };
++	config.changes[0] = { 0, { 210, 310 }, { 0.294999987f, 0.300000012f } };
++	config.changes[1] = { 5, { 360, 410 }, { 0.479999989f, 0.414999992f } };
++	config.above = { 20, 20, 20, 20, 20, 20, 20, 20, 0, 20, 20, 20, 20, 20, 20, 20, 20 };
++	config.below = { 20, 20, 20, 20, 20, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++	config.luxKnots = { 70, 90, 110, 130, 150, 170, 190, 210, 230, 250, 270, 290, 310, 330, 350, 370, 390, 410, 430, 450, 470, 490, 510, 530 };
++	config.distanceOffsets[0] = { {
++		{ 0, 0, 0, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[1] = { {
++		{ 0, 0, 0, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[2] = { {
++		{ 0, 0, 0, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[3] = { {
++		{ 0, 0, -2, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[4] = { {
++		{ 0, 0, 0, -5, -4, -7, -9, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -7, -6, -5, -6, -4, -7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[5] = { {
++		{ 0, 0, -2, -6, -4, -8, -10, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -7, -6, -5, -6, -4, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[6] = { {
++		{ -2, -1, -2, -6, -4, -8, -10, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -8, -5, -6, -6, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[7] = { {
++		{ -2, -1, -2, -4, -4, -8, -10, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -4, -5, -4, -8, -8, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[8] = { {
++		{ -2, -1, -2, -4, -6, -7, -8, -2, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -4, -4, -4, -8, -9, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[9] = { {
++		{ -2, -1, -1, -4, -6, -7, -7, -2, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -3, -8, -10, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[10] = { {
++		{ -2, -1, -1, -3, -6, -7, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -4, -6, -7, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[11] = { {
++		{ -11, -10, -1, -3, -8, -10, -2, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -3, -5, -4, -5, -5, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[12] = { {
++		{ -11, -10, -2, -4, -8, -8, 6, -2, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -6, -6, -6, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[13] = { {
++		{ -11, -10, 0, -4, -3, -4, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -6, -6, -6, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[14] = { {
++		{ -2, -1, -1, -3, -3, -4, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -4, -4, -4, -7, -7, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[15] = { {
++		{ -2, -1, 0, -3, -4, -4, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -7, -3, -7, -7, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[16] = { {
++		{ -8, -10, -6, 4, -4, -4, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -8, -5, -10, -8, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[17] = { {
++		{ -8, -10, -6, 4, -3, 0, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -7, -10, -11, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[18] = { {
++		{ -3, 0, 2, 4, -4, 0, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -6, -10, -11, -12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[19] = { {
++		{ -3, 0, 2, 4, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -9, -9, -6, -10, -10, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[20] = { {
++		{ -15, -12, 10, 8, -5, 0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -15, -10, -10, -10, -10, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[21] = { {
++		{ -15, -12, 10, 10, -3, 0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -15, -12, -10, -10, -10, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[22] = { {
++		{ -10, -10, 10, 10, -3, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -10, -10, -10, -10, -10, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[23] = { {
++		{ -10, -10, 10, 10, -3, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -10, -10, -10, -10, -10, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	return config;
++}
++
+@@ -662,0 +891,114 @@
++inline LgAwbGrayConfiguration s5k3m5LgAwbGrayConfiguration()
++{
++	LgAwbGrayConfiguration config{};
++	config.colour = s5k3m5LgAwbColourConfiguration();
++	config.additionalCount = 4;
++	config.changeCount = 2;
++	config.additional[0] = { 0.532781005f, 0.399143994f };
++	config.additional[1] = { 0.481083006f, 0.545150995f };
++	config.additional[2] = { 0.579777002f, 0.669514f };
++	config.additional[3] = { 0.684777021f, 0.603390992f };
++	config.changes[0] = { 0, { 210, 360 }, { 0.300000012f, 0.300000012f } };
++	config.changes[1] = { 5, { 360, 410 }, { 0.479999989f, 0.414999992f } };
++	config.above = { 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 0, 0, 0, 0, 0, 0, 0 };
++	config.below = { 20, 20, 20, 20, 20, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++	config.luxKnots = { 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 260, 280, 300, 320, 340, 360, 380, 400, 420, 440, 460, 480, 500, 520 };
++	config.distanceOffsets[0] = { {
++		{ 0, 0, 0, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[1] = { {
++		{ 0, 0, 0, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[2] = { {
++		{ 0, 0, 0, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[3] = { {
++		{ 0, 0, -2, -5, -4, -4, -8, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -4, -4, -4, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[4] = { {
++		{ 0, 0, 0, -5, -4, -7, -9, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -7, -7, -5, -6, -4, -7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[5] = { {
++		{ 0, 0, -2, -6, -4, -8, -10, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -7, -7, -4, -4, -4, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[6] = { {
++		{ -2, -1, -2, -6, -4, -8, -10, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -8, -6, -6, -6, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[7] = { {
++		{ -2, -1, -2, -4, -4, -8, -10, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -4, -5, -4, -8, -8, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[8] = { {
++		{ -2, -1, -2, -4, -6, -7, -8, -2, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -4, -4, -4, -8, -9, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[9] = { {
++		{ -2, -1, -1, -4, -6, -7, -7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -3, -8, -10, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[10] = { {
++		{ -2, -1, -1, -4, -6, -7, -7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -6, -6, -7, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[11] = { {
++		{ -3, -2, -1, -6, -13, -10, -9, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -3, -5, -4, -4, -10, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[12] = { {
++		{ -4, -3, -2, -6, -8, -8, -9, 3, -10, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -6, -7, -8, -10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[13] = { {
++		{ -4, -3, -3, -6, -3, -4, 6, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -6, -6, -8, -10, -10, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[14] = { {
++		{ -7, -7, -5, -3, -6, -6, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -4, -4, -8, -10, -10, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[15] = { {
++		{ -7, -7, -5, -3, -8, -8, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -5, -10, -8, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[16] = { {
++		{ -7, -7, -5, -3, -8, -8, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -5, -10, -8, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[17] = { {
++		{ -3, 0, 2, 4, -3, 0, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -8, -8, -10, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[18] = { {
++		{ -3, 0, 2, 4, -4, 0, -4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -5, -8, -10, -12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[19] = { {
++		{ -3, 0, 2, 4, -5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -5, -8, -10, -12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[20] = { {
++		{ -15, -12, 10, 8, -5, 0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -5, -8, -8, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[21] = { {
++		{ -15, -12, 10, 10, -3, 0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -5, -8, -8, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[22] = { {
++		{ -15, -12, 10, 10, -3, 0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -5, -8, -8, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	config.distanceOffsets[23] = { {
++		{ -15, -12, 10, 10, -3, 0, 4, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++		{ -5, -5, -5, -8, -8, -8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++	} };
++	return config;
++}
++
