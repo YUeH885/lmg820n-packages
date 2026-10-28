@@ -1,0 +1,441 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add native LG AWB scene weights and gray aggregation
+
+Apply ALE-2/3/4 reductions and the optional ALE3 additive weights using
+sensor tuning and category counts. Aggregate valid and gray xyY samples,
+remove zero-weight samples, preserve prior means for insufficient input
+and reproduce the scene-dependent second weighted pass with separately
+rounded arithmetic and matching colour-temperature classification.
+
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_math.h b/src/libcamera/pipeline/qcom/lg_awb_math.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_math.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++#include "lg_awb_types.h"
++
++namespace libcamera::qcom {
++
++inline float lgAwbProduct(float a, float b)
++{
++	/* Match the factory's separate multiplication and addition rounding. */
++	volatile float result = a * b;
++	return result;
++}
++
++inline float lgAwbTriangle(int value, const std::array<int16_t, 4> &knots)
++{
++	if (value <= knots[0] || value >= knots[3])
++		return 0;
++	if (value < knots[1])
++		return static_cast<float>(value - knots[0]) / (knots[1] - knots[0]);
++	if (value <= knots[2])
++		return 1;
++	return 1.0f - static_cast<float>(value - knots[2]) / (knots[3] - knots[2]);
++}
++
++inline int32_t lgAwbColourTemperature(LgAwbPoint point)
++{
++	float n = point.y == 0.1858f ? 0 : (point.x - 0.332f) / (point.y - 0.1858f);
++	float cubic = lgAwbProduct(lgAwbProduct(lgAwbProduct(n, -449.0f), n), n);
++	float square = lgAwbProduct(lgAwbProduct(n, 3525.0f), n);
++	float linear = lgAwbProduct(n, -6823.3f);
++	return static_cast<int32_t>(((square + cubic) + linear) + 5520.83f);
++}
++
++inline uint32_t lgAwbIlluminant(int32_t cct)
++{
++	return cct >= 7000 ? 0 : cct >= 5750 ? 1 : cct > 4500 ? 2 :
++		cct > 3428 ? 3 : cct > 2578 ? 4 : 5;
++}
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_scene_weights.h b/src/libcamera/pipeline/qcom/lg_awb_scene_weights.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_scene_weights.h
+@@ -0,0 +1,106 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++#include "lg_awb_math.h"
++#include "lg_awb_statistics.h"
++
++namespace libcamera::qcom {
++
++using LgAwbCategoryCounts = std::array<int16_t, 30>;
++
++struct LgAwbAleConfiguration {
++	bool enabled;
++	std::array<int16_t, 2> countThresholds;
++	std::array<int16_t, 4> luxKnots;
++	int16_t reductionPercent;
++	std::array<uint32_t, 2> countRange;
++	std::array<std::array<uint32_t, 2>, 2> targetRanges;
++};
++
++struct LgAwbAleBoostConfiguration {
++	bool enabled;
++	std::array<int16_t, 4> luxKnots;
++	int16_t increment;
++	std::array<uint32_t, 2> targetRange;
++};
++
++struct LgAwbSceneWeightConfiguration {
++	unsigned int additionalCount;
++	std::array<uint32_t, 10> additionalLights;
++	std::array<LgAwbAleConfiguration, 3> ale;
++	LgAwbAleBoostConfiguration boost;
++};
++
++class LgAwbSceneWeights
++{
++public:
++	explicit LgAwbSceneWeights(const LgAwbSceneWeightConfiguration &config)
++		: config_(config)
++	{
++	}
++
++	void reduce(LgAwbRegionWeights &weights, int lux, unsigned int flash,
++		    const LgAwbCategoryCounts &counts, std::array<float, 3> &factors,
++		    unsigned int mode = 0) const
++	{
++		for (unsigned int i = 0; i < config_.ale.size(); i++) {
++			const auto &config = config_.ale[i];
++			unsigned int current = i + 2;
++			if ((mode && mode != current) || !config.enabled || (current == 4 && flash == 5))
++				continue;
++			int count = 0;
++			for (unsigned int index = config.countRange[0]; index <= config.countRange[1]; index++)
++				count += counts[index];
++			if (current == 3)
++				count += counts[18];
++			for (unsigned int index = 0; index + 1 < config_.additionalCount; index++) {
++				unsigned int light = config_.additionalLights[index];
++				if ((current == 2 && (light == 1 || light == 2)) ||
++				    (current == 3 && (light == 3 || light == 6)) || (current == 4 && light == 5))
++					count += counts[19 + index];
++			}
++			float ramp = count < config.countThresholds[0] ? 0.0f :
++				count > config.countThresholds[1] ? 1.0f :
++				static_cast<float>(count - config.countThresholds[0]) /
++				(config.countThresholds[1] - config.countThresholds[0]);
++			float factor = 1.0f - lgAwbProduct(lgAwbProduct(config.reductionPercent, 0.01f),
++				lgAwbProduct(ramp, lgAwbTriangle(lux, config.luxKnots)));
++			factors[i] = factor;
++			auto apply = [&weights, factor](unsigned int index) {
++				for (auto &group : weights)
++					group[index] = lgAwbProduct(group[index], factor);
++			};
++			for (auto range : config.targetRanges)
++				if (range[0] != 29 && range[1] != 29)
++					for (unsigned int index = range[0]; index <= range[1]; index++)
++						apply(index);
++			for (unsigned int index = 0; index < config_.additionalLights.size(); index++) {
++				unsigned int light = config_.additionalLights[index];
++				if ((current == 2 && light >= 3 && light <= 6) ||
++				    (current == 3 && light == 5) || (current == 4 && light < 3))
++					apply(19 + index);
++			}
++		}
++	}
++
++	float boost(LgAwbRegionWeights &weights, int lux, bool outdoor, bool flashOn, unsigned int led) const
++	{
++		const auto &config = config_.boost;
++		float factor = config.enabled ? lgAwbTriangle(lux, config.luxKnots) : 0;
++		if (outdoor && !flashOn && !led && factor > 1e-6f) {
++			float increment = lgAwbProduct(factor, config.increment);
++			for (unsigned int group = 1; group < weights.size(); group++)
++				for (unsigned int index = config.targetRange[0]; index <= config.targetRange[1]; index++)
++					weights[group][index] += increment;
++		}
++		return factor;
++	}
++
++private:
++	LgAwbSceneWeightConfiguration config_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_aggregate.h b/src/libcamera/pipeline/qcom/lg_awb_aggregate.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/lg_awb_aggregate.h
+@@ -0,0 +1,133 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++#include "lg_awb_gray.h"
++#include "lg_awb_math.h"
++#include "lg_awb_scene_weights.h"
++
++namespace libcamera::qcom {
++
++struct LgAwbGraySample {
++	LgAwbXyY colour;
++	float luma;
++	uint32_t valid;
++	LgAwbGrayDecision decision;
++};
++
++struct LgAwbSceneReweightConfiguration {
++	bool enabled;
++	std::array<int16_t, 4> luxKnots;
++	float minimumDistance, maximumDistance, maximumLuma, minimumXDifference;
++	int16_t reductionPercent;
++};
++
++struct LgAwbMean {
++	LgAwbXyY colour;
++	uint32_t illuminant;
++	int32_t cct;
++};
++
++struct LgAwbGrayResult {
++	LgAwbMean all{}, gray{};
++	uint32_t grayValid = 0;
++	uint32_t validCount = 0, grayCount = 0, rejectedCount = 0;
++	float sceneFactor = 1, distance = 0;
++};
++
++class LgAwbGrayAggregate
++{
++public:
++	explicit LgAwbGrayAggregate(const LgAwbSceneReweightConfiguration &config)
++		: config_(config)
++	{
++	}
++
++	void update(std::array<LgAwbGraySample, 3072> &samples, const LgAwbRegionWeights &weights,
++		    LgAwbCategoryCounts &counts, int lux, unsigned int flash, unsigned int minimumGrayCount,
++		    const std::array<LgAwbPoint, 17> &references, LgAwbGrayResult &result) const
++	{
++		LgAwbXyY all{}, gray{};
++		int weightTotal = 0;
++		result.validCount = result.grayCount = result.rejectedCount = 0;
++		for (auto &sample : samples) {
++			if (!valid(sample))
++				continue;
++			result.validCount++;
++			add(all, sample.colour, 1);
++			if (sample.decision.valid != 1)
++				continue;
++			int weight = quantize(weights[sample.decision.weightGroup][sample.decision.category]);
++			if (!weight) {
++				counts[sample.decision.category]--;
++				counts[0]++;
++				sample.decision.valid = sample.decision.weightGroup = sample.decision.category = 0;
++				result.rejectedCount++;
++			} else {
++				result.grayCount++;
++			}
++			weightTotal += weight;
++			add(gray, sample.colour, weight);
++		}
++		if (result.validCount)
++			result.all = mean(all, result.validCount);
++		result.grayValid = weightTotal && result.grayCount >= minimumGrayCount;
++		if (result.grayValid)
++			result.gray = mean(gray, weightTotal);
++		float dx = result.gray.colour.x - result.all.colour.x;
++		float dy = result.gray.colour.y - result.all.colour.y;
++		result.distance = std::sqrt(lgAwbProduct(dx, dx) + lgAwbProduct(dy, dy));
++		float upperX = lgAwbProduct(references[4].x + references[5].x, 0.5f);
++		if (!config_.enabled || !result.grayValid || result.gray.colour.x > upperX || flash ||
++		    std::abs(result.gray.colour.x) <= 1e-6f || result.distance < config_.minimumDistance)
++			return;
++		if (result.distance > config_.minimumDistance) {
++			float distanceFactor = result.distance < config_.maximumDistance ?
++				(result.distance - config_.minimumDistance) /
++				(config_.maximumDistance - config_.minimumDistance) : 1.0f;
++			result.sceneFactor = 1.0f - lgAwbProduct(lgAwbProduct(config_.reductionPercent, 0.01f),
++				lgAwbProduct(lgAwbTriangle(lux, config_.luxKnots), distanceFactor));
++		}
++		gray = {};
++		weightTotal = 0;
++		for (const auto &sample : samples) {
++			if (!valid(sample) || sample.decision.valid != 1)
++				continue;
++			float factor = sample.luma < config_.maximumLuma &&
++				sample.colour.x < result.all.colour.x - config_.minimumXDifference ? result.sceneFactor : 1.0f;
++			int weight = quantize(lgAwbProduct(factor, weights[sample.decision.weightGroup][sample.decision.category]));
++			weightTotal += weight;
++			add(gray, sample.colour, weight);
++		}
++		result.gray = mean(gray, weightTotal);
++	}
++
++private:
++	static bool valid(const LgAwbGraySample &sample)
++	{
++		return sample.colour.x > 0 && sample.colour.y > 0 && sample.valid == 1;
++	}
++
++	static int quantize(float weight) { return static_cast<int>(weight + 0.5f); }
++
++	static void add(LgAwbXyY &sum, LgAwbXyY value, int weight)
++	{
++		sum.x += lgAwbProduct(value.x, weight);
++		sum.y += lgAwbProduct(value.y, weight);
++		sum.luma += lgAwbProduct(value.luma, weight);
++	}
++
++	static LgAwbMean mean(LgAwbXyY sum, int count)
++	{
++		LgAwbXyY colour{ sum.x / count, sum.y / count, sum.luma / count };
++		int32_t cct = lgAwbColourTemperature({ colour.x, colour.y });
++		return { colour, lgAwbIlluminant(cct), cct };
++	}
++
++	LgAwbSceneReweightConfiguration config_;
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/lg_awb_tuning.h b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -3,0 +4 @@
++#include "lg_awb_aggregate.h"
+@@ -342,0 +344,43 @@
++inline LgAwbSceneWeightConfiguration imx363LgAwbSceneWeightConfiguration()
++{
++	LgAwbSceneWeightConfiguration config{};
++	config.additionalCount = 6;
++	config.additionalLights = { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 };
++	config.ale[0].enabled = true;
++	config.ale[0].countThresholds = { 900, 1400 };
++	config.ale[0].luxKnots = { 180, 200, 380, 410 };
++	config.ale[0].countRange = { 7, 8 };
++	config.ale[0].reductionPercent = 70;
++	config.ale[0].targetRanges = { { { 11, 18 }, { 1, 4 } } };
++	config.ale[1].enabled = false;
++	config.ale[1].countThresholds = { 600, 1600 };
++	config.ale[1].luxKnots = { 0, 0, 300, 600 };
++	config.ale[1].countRange = { 10, 12 };
++	config.ale[1].reductionPercent = 50;
++	config.ale[1].targetRanges = { { { 13, 17 }, { 1, 4 } } };
++	config.ale[2].enabled = true;
++	config.ale[2].countThresholds = { 500, 1500 };
++	config.ale[2].luxKnots = { 180, 200, 340, 380 };
++	config.ale[2].countRange = { 13, 15 };
++	config.ale[2].reductionPercent = 98;
++	config.ale[2].targetRanges = { { { 1, 7 }, { 17, 29 } } };
++	config.boost.enabled = false;
++	config.boost.luxKnots = { 175, 200, 300, 325 };
++	config.boost.increment = 30;
++	config.boost.targetRange = { 4, 6 };
++	return config;
++}
++
++inline LgAwbSceneReweightConfiguration imx363LgAwbSceneReweightConfiguration()
++{
++	LgAwbSceneReweightConfiguration config{};
++	config.enabled = true;
++	config.luxKnots = { 180, 210, 370, 400 };
++	config.minimumDistance = 0.00999999978f;
++	config.maximumDistance = 0.0299999993f;
++	config.maximumLuma = 15.0f;
++	config.minimumXDifference = 0.0500000007f;
++	config.reductionPercent = 90;
++	return config;
++}
++
+@@ -669,0 +714,43 @@
++	return config;
++}
++
++inline LgAwbSceneWeightConfiguration imx351LgAwbSceneWeightConfiguration()
++{
++	LgAwbSceneWeightConfiguration config{};
++	config.additionalCount = 2;
++	config.additionalLights = { 2, 0, 2, 2, 2, 2, 2, 2, 2, 2 };
++	config.ale[0].enabled = true;
++	config.ale[0].countThresholds = { 500, 1400 };
++	config.ale[0].luxKnots = { 0, 0, 390, 420 };
++	config.ale[0].countRange = { 5, 8 };
++	config.ale[0].reductionPercent = 80;
++	config.ale[0].targetRanges = { { { 10, 18 }, { 1, 4 } } };
++	config.ale[1].enabled = true;
++	config.ale[1].countThresholds = { 600, 1600 };
++	config.ale[1].luxKnots = { 0, 0, 310, 610 };
++	config.ale[1].countRange = { 10, 12 };
++	config.ale[1].reductionPercent = 90;
++	config.ale[1].targetRanges = { { { 13, 17 }, { 1, 4 } } };
++	config.ale[2].enabled = true;
++	config.ale[2].countThresholds = { 500, 1100 };
++	config.ale[2].luxKnots = { 340, 360, 370, 390 };
++	config.ale[2].countRange = { 13, 17 };
++	config.ale[2].reductionPercent = 70;
++	config.ale[2].targetRanges = { { { 1, 8 }, { 29, 29 } } };
++	config.boost.enabled = false;
++	config.boost.luxKnots = { 175, 200, 300, 325 };
++	config.boost.increment = 30;
++	config.boost.targetRange = { 4, 6 };
++	return config;
++}
++
++inline LgAwbSceneReweightConfiguration imx351LgAwbSceneReweightConfiguration()
++{
++	LgAwbSceneReweightConfiguration config{};
++	config.enabled = false;
++	config.luxKnots = { 130, 160, 410, 510 };
++	config.minimumDistance = 0.0f;
++	config.maximumDistance = 0.0f;
++	config.maximumLuma = 0.0799999982f;
++	config.minimumXDifference = 0.0900000036f;
++	config.reductionPercent = 100;
+@@ -1004,0 +1092,43 @@
++inline LgAwbSceneWeightConfiguration s5k3m5LgAwbSceneWeightConfiguration()
++{
++	LgAwbSceneWeightConfiguration config{};
++	config.additionalCount = 4;
++	config.additionalLights = { 2, 0, 2, 2, 2, 2, 2, 2, 2, 2 };
++	config.ale[0].enabled = true;
++	config.ale[0].countThresholds = { 900, 1400 };
++	config.ale[0].luxKnots = { 0, 0, 390, 420 };
++	config.ale[0].countRange = { 5, 8 };
++	config.ale[0].reductionPercent = 50;
++	config.ale[0].targetRanges = { { { 10, 18 }, { 1, 3 } } };
++	config.ale[1].enabled = true;
++	config.ale[1].countThresholds = { 600, 1600 };
++	config.ale[1].luxKnots = { 0, 0, 250, 400 };
++	config.ale[1].countRange = { 10, 12 };
++	config.ale[1].reductionPercent = 30;
++	config.ale[1].targetRanges = { { { 13, 17 }, { 1, 4 } } };
++	config.ale[2].enabled = true;
++	config.ale[2].countThresholds = { 500, 1100 };
++	config.ale[2].luxKnots = { 240, 300, 390, 430 };
++	config.ale[2].countRange = { 13, 17 };
++	config.ale[2].reductionPercent = 30;
++	config.ale[2].targetRanges = { { { 1, 8 }, { 29, 29 } } };
++	config.boost.enabled = false;
++	config.boost.luxKnots = { 175, 200, 300, 325 };
++	config.boost.increment = 30;
++	config.boost.targetRange = { 4, 6 };
++	return config;
++}
++
++inline LgAwbSceneReweightConfiguration s5k3m5LgAwbSceneReweightConfiguration()
++{
++	LgAwbSceneReweightConfiguration config{};
++	config.enabled = false;
++	config.luxKnots = { 130, 160, 410, 510 };
++	config.minimumDistance = 0.0f;
++	config.maximumDistance = 0.0f;
++	config.maximumLuma = 0.0799999982f;
++	config.minimumXDifference = 0.0900000036f;
++	config.reductionPercent = 100;
++	return config;
++}
++
