@@ -1,0 +1,34 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: account for queued sensor transactions in AE latency
+
+Use the earliest next capture target to include the sensor request queue
+in the control loop delay.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -1694,3 +1694,2 @@
+-	const auto &delays = sensor_->sensorDelays();
+-	uint32_t nextFrame;
+-	int ret = video_->ioctl(VIDIOC_QCOM_CAMSS_GET_FRAME_SEQUENCE, &nextFrame);
++	uint32_t nextRequest;
++	int ret = video_->ioctl(VIDIOC_QCOM_CAMSS_GET_REQUEST_SEQUENCE, &nextRequest);
+@@ -1698 +1697 @@
+-		LOG(QcomPipeline, Error) << "AE frame sequence query failed: " << ret;
++		LOG(QcomPipeline, Error) << "AE request sequence query failed: " << ret;
+@@ -1701,3 +1700 @@
+-	/* Include the statistics age and the next SOF control write. */
+-	unsigned int latency = std::max(delays.exposureDelay, delays.gainDelay) +
+-		nextFrame - sequence;
++	unsigned int latency = nextRequest - sequence;
+@@ -1715 +1712 @@
+-		<< " ev offset " << evOffset << " next frame " << nextFrame;
++		<< " ev offset " << evOffset << " next request " << nextRequest;
+@@ -1982 +1978,0 @@
+-
+diff --git a/src/libcamera/pipeline/qcom/qcom_camss.h b/src/libcamera/pipeline/qcom/qcom_camss.h
+--- a/src/libcamera/pipeline/qcom/qcom_camss.h
++++ b/src/libcamera/pipeline/qcom/qcom_camss.h
+@@ -66,0 +67,2 @@
++#define VIDIOC_QCOM_CAMSS_GET_REQUEST_SEQUENCE \
++	_IOR('V', BASE_VIDIOC_PRIVATE + 2, uint32_t)

@@ -1,0 +1,156 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: bind sensor controls to capture requests
+
+Submit exposure, analogue gain and IFE tuning in one media request.
+Use the applied sensor state attached to statistics for AE inputs.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -26 +25,0 @@
+-#include <unordered_map>
+@@ -51 +49,0 @@
+-#include "libcamera/internal/delayed_controls.h"
+@@ -538 +535,0 @@
+-	void frameStart(uint32_t sequence);
+@@ -547 +543,0 @@
+-	void pushSensorControls();
+@@ -558 +553,0 @@
+-	std::unique_ptr<DelayedControls> delayedCtrls_;
+@@ -595,2 +589,0 @@
+-		bool aeEnabled;
+-		float exposureValue;
+@@ -603,0 +597,3 @@
++		ControlList sensor;
++		bool aeEnabled;
++		float exposureValue;
+@@ -1030,6 +1026,4 @@
+-	std::unordered_map<uint32_t, DelayedControls::ControlParams> params = {
+-		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
+-		{ V4L2_CID_EXPOSURE, { delays.exposureDelay, false } },
+-	};
+-	delayedCtrls_ = std::make_unique<DelayedControls>(sensor_->device(), params);
+-	pix_->frameStart.connect(this, &QcomCameraData::frameStart);
++	if (delays.exposureDelay != 2 || delays.gainDelay != 2) {
++		LOG(QcomPipeline, Error) << "CAMSS requires two-frame sensor control delays";
++		return -EOPNOTSUPP;
++	}
+@@ -1168,5 +1161,0 @@
+-void QcomCameraData::frameStart(uint32_t sequence)
+-{
+-	delayedCtrls_->applyControls(sequence);
+-}
+-
+@@ -1176,2 +1165 @@
+-			  afMode_, afState_, afPauseState_, aeEnabled_,
+-			  aeEnabled_ ? aeEvValue(aeEvStep_) : 0.0f };
++			  afMode_, afState_, afPauseState_ };
+@@ -1190,2 +1178 @@
+-		<< state.afMode << " " << state.afState << " " << state.afPauseState
+-		<< " AE " << state.aeEnabled << " EV " << state.exposureValue;
++		<< state.afMode << " " << state.afState << " " << state.afPauseState;
+@@ -1284,9 +1270,0 @@
+-void QcomCameraData::pushSensorControls()
+-{
+-	ControlList ctrls(sensor_->controls());
+-	ctrls.set(V4L2_CID_EXPOSURE, static_cast<int32_t>(std::lround(aeExposure_)));
+-	ctrls.set(V4L2_CID_ANALOGUE_GAIN,
+-		  gainToCode(profile_, aeGain_));
+-	delayedCtrls_->push(ctrls);
+-}
+-
+@@ -1351,0 +1330 @@
++	config.sensor_delay = 2;
+@@ -1379,0 +1359 @@
++	config.sensor_delay = 0;
+@@ -1400,0 +1381,8 @@
++	context.sensor = ControlList(sensor_->controls());
++	context.sensor.set(V4L2_CID_EXPOSURE, static_cast<int32_t>(std::lround(aeExposure_)));
++	context.sensor.set(V4L2_CID_ANALOGUE_GAIN, gainToCode(profile_, aeGain_));
++	context.aeEnabled = aeEnabled_;
++	context.exposureValue = aeEnabled_ ? aeEvValue(aeEvStep_) : 0.0f;
++	ret = sensor_->device()->setControls(&context.sensor, context.request.get());
++	if (ret)
++		return ret;
+@@ -1442,0 +1431,11 @@
++	const std::array<uint32_t, 2> ids{ V4L2_CID_EXPOSURE, V4L2_CID_ANALOGUE_GAIN };
++	ControlList sensor = sensor_->device()->getControls(ids, context.request.get());
++	if (sensor.size() != ids.size())
++		return -EIO;
++	for (uint32_t id : ids)
++		if (sensor.get(id) != context.sensor.get(id))
++			return -EIO;
++	LOG(QcomPipeline, Debug) << "Sensor request frame " << sequence << " exposure "
++		<< sensor.get(V4L2_CID_EXPOSURE).get<int32_t>() << " gain "
++		<< sensor.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>() << " AE "
++		<< context.aeEnabled << " EV " << context.exposureValue;
+@@ -1445 +1444 @@
+-	    config.frame_sequence != sequence ||
++	    config.frame_sequence != sequence || config.sensor_delay != expected.sensor_delay ||
+@@ -1569,0 +1569,4 @@
++	if (!(request.flags & QCOM_CAMSS_STATS_SENSOR_CONTROLS)) {
++		LOG(QcomPipeline, Debug) << "Statistics sensor controls are not known";
++		return;
++	}
+@@ -1575,3 +1578,2 @@
+-		ControlList applied = delayedCtrls_->get(sequence);
+-		double exposure = applied.get(V4L2_CID_EXPOSURE).get<int32_t>() * lineDurationNs_;
+-		double gain = gainFromCode(profile_, applied.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>());
++		double exposure = request.exposure_lines * lineDurationNs_;
++		double gain = gainFromCode(profile_, request.analogue_gain);
+@@ -1733,3 +1734,0 @@
+-	if (static_cast<int32_t>(std::lround(aeExposure_)) != previousExposure ||
+-	    gainToCode(profile_, aeGain_) != previousGain)
+-		pushSensorControls();
+@@ -1983 +1981,0 @@
+-	bool sensorUpdate = false;
+@@ -1998 +1995,0 @@
+-			sensorUpdate = true;
+@@ -2006 +2002,0 @@
+-			sensorUpdate = true;
+@@ -2012 +2007,0 @@
+-			sensorUpdate = true;
+@@ -2093,2 +2087,0 @@
+-	if (sensorUpdate)
+-		pushSensorControls();
+@@ -2101 +2094,2 @@
+-	ControlList applied = delayedCtrls_->get(sequence);
++	const FrameContext &context = frameContexts_.at(request->findBuffer(&stream_));
++	const ControlList &applied = context.sensor;
+@@ -2132,2 +2126,2 @@
+-	metadata.set(controls::AeEnable, state.aeEnabled);
+-	metadata.set(controls::ExposureValue, state.exposureValue);
++	metadata.set(controls::AeEnable, context.aeEnabled);
++	metadata.set(controls::ExposureValue, context.exposureValue);
+@@ -2260 +2253,0 @@
+-	data->delayedCtrls_->reset();
+@@ -2284 +2276,0 @@
+-	data->pushSensorControls();
+@@ -2298,5 +2289,0 @@
+-	ret = data->pix_->setFrameStartEnabled(true);
+-	if (ret < 0) {
+-		data->video_->releaseBuffers();
+-		return ret;
+-	}
+@@ -2336 +2322,0 @@
+-	data->pix_->setFrameStartEnabled(false);
+@@ -2339 +2324,0 @@
+-	data->delayedCtrls_->reset();
+diff --git a/src/libcamera/pipeline/qcom/qcom_camss.h b/src/libcamera/pipeline/qcom/qcom_camss.h
+--- a/src/libcamera/pipeline/qcom/qcom_camss.h
++++ b/src/libcamera/pipeline/qcom/qcom_camss.h
+@@ -9 +9 @@
+-#define QCOM_CAMSS_IFE_CONFIG_VERSION 2
++#define QCOM_CAMSS_IFE_CONFIG_VERSION 3
+@@ -23 +23 @@
+-	uint32_t reserved;
++	uint32_t sensor_delay;
+@@ -34 +34,2 @@
+-#define QCOM_CAMSS_STATS_VERSION 2
++#define QCOM_CAMSS_STATS_VERSION 3
++#define QCOM_CAMSS_STATS_SENSOR_CONTROLS (1U << 0)
+@@ -55,0 +57,4 @@
++	uint32_t flags;
++	uint32_t exposure_lines;
++	uint32_t analogue_gain;
++	uint32_t reserved1;
