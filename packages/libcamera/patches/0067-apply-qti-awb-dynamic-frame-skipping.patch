@@ -1,0 +1,199 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: apply QTI AWB dynamic frame skipping
+
+Schedule statistics analysis with the factory DSFV1 and history rules.
+Keep temporal convergence and gain adjustment running on every frame.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_frame_skip.h b/src/libcamera/pipeline/qcom/awb_frame_skip.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_frame_skip.h
+@@ -0,0 +1,102 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++#include "awb_locus.h"
++#include "awb_weights.h"
++
++namespace libcamera::qcom {
++
++struct QtiAwbFrameSkipConfiguration {
++	QtiAwbWeightCurve change;
++	unsigned int historySize;
++};
++
++struct QtiAwbFrameSkipState {
++	uint32_t skipped;
++	int32_t remaining;
++	float change;
++	float average;
++};
++
++class QtiAwbFrameSkip
++{
++public:
++	explicit QtiAwbFrameSkip(QtiAwbFrameSkipConfiguration config)
++		: config_(std::move(config)), history_(config_.historySize)
++	{
++	}
++
++	void reset()
++	{
++		std::fill(history_.begin(), history_.end(), Record{});
++		position_ = frames_ = 0;
++		state_ = {};
++	}
++
++	bool beginFrame()
++	{
++		state_.skipped = frames_++ >= 30 && state_.remaining > 0;
++		if (state_.skipped)
++			state_.remaining--;
++		return state_.skipped;
++	}
++
++	int32_t frameCount() const { return frames_; }
++
++	QtiAwbFrameSkipState finishFrame(QtiAwbPoint current, QtiAwbPoint previous)
++	{
++		Record &record = history_[position_];
++		record.processed = !state_.skipped;
++		if (!state_.skipped) {
++			state_.change = 0;
++			float redSum = current.rg + previous.rg;
++			float blueSum = current.bg + previous.bg;
++			if (redSum != 0 && blueSum != 0) {
++				float red = (2.0f * std::abs(current.rg - previous.rg)) * 100.0f / redSum;
++				float blue = (2.0f * std::abs(current.bg - previous.bg)) * 100.0f / blueSum;
++				record.change = std::fmax(red, blue);
++				state_.change = std::fmax(record.change, average());
++				state_.remaining = static_cast<int32_t>(qtiAwbInterpolateWeight(
++					config_.change, state_.change, [](float value) { return value; }));
++			}
++		}
++		state_.average = average();
++		position_ = (position_ + 1) % history_.size();
++		return state_;
++	}
++
++private:
++	struct Record {
++		bool processed = false;
++		float change = 0;
++	};
++
++	float average() const
++	{
++		unsigned int count = 0;
++		float sum = 0;
++		for (unsigned int i = 0; i < history_.size(); i++) {
++			const Record &record = history_[(position_ + history_.size() - i) % history_.size()];
++			if (!record.processed)
++				continue;
++			sum += record.change;
++			if (++count == 5)
++				return sum / 5.0f;
++		}
++		return 100.0f;
++	}
++
++	QtiAwbFrameSkipConfiguration config_;
++	std::vector<Record> history_;
++	unsigned int position_ = 0;
++	int32_t frames_ = 0;
++	QtiAwbFrameSkipState state_{};
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_front_configuration.h b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+--- a/src/libcamera/pipeline/qcom/awb_front_configuration.h
++++ b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+@@ -8,0 +9 @@
++#include "awb_frame_skip.h"
+@@ -51,0 +53 @@
++	QtiAwbFrameSkipConfiguration frameSkip;
+diff --git a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+@@ -574,0 +575,6 @@
++	config.frameSkip.change = {
++		{ 0.0f, 1.0f, 3.0f },
++		{ 2.0f, 3.0f, 2.0f },
++		{ 4.0f, 100.0f, 1.0f },
++	};
++	config.frameSkip.historySize = 30;
+diff --git a/src/libcamera/pipeline/qcom/awb_front.h b/src/libcamera/pipeline/qcom/awb_front.h
+--- a/src/libcamera/pipeline/qcom/awb_front.h
++++ b/src/libcamera/pipeline/qcom/awb_front.h
+@@ -19 +18,0 @@
+-	int32_t number;
+@@ -35,0 +35 @@
++	QtiAwbFrameSkipState frameSkip;
+@@ -49 +49 @@
+-		  temporal_(config_.temporal), gain_(config_.gain)
++		  temporal_(config_.temporal), gain_(config_.gain), frameSkip_(config_.frameSkip)
+@@ -65,0 +66,2 @@
++		frameSkip_.reset();
++		analysis_ = {};
+@@ -69,0 +72,24 @@
++	{
++		if (!frameSkip_.beginFrame())
++			analysis_ = analyze(frame);
++		QtiAwbFrontResult result = analysis_;
++		if (result.target.confidence && result.target.point.rg && result.target.point.bg)
++			retainedTarget_ = result.target.point;
++		result.filtered = temporal_.run(frameSkip_.frameCount(), result.target.point, result.target.confidence,
++			previousFiltered_, retainedTarget_, locus_);
++		auto factor = calibration_.factors()[locus_.evaluate(result.filtered.point).illuminant];
++		QtiAwbPoint gainReference{ result.filtered.point.rg * (1.0f / factor.rg),
++					   result.filtered.point.bg * (1.0f / factor.bg) };
++		result.adjusted = gain_.run(frame.lux, result.filtered.point, gainReference, locus_);
++		result.gains = qtiAwbRgbGains(result.adjusted.point);
++		/* Process publishes the filtered CCT before gain adjustment. */
++		result.cct = static_cast<uint32_t>(result.filtered.cct);
++		result.lightId = qtiAwbLightId(result.cct);
++		result.frameSkip = frameSkip_.finishFrame(result.target.point, previousTarget_);
++		previousTarget_ = result.target.point;
++		previousFiltered_ = result.filtered.point;
++		return result;
++	}
++
++private:
++	QtiAwbFrontResult analyze(const QtiAwbBgFrame &frame)
+@@ -121,14 +146,0 @@
+-		if (result.target.confidence && result.target.point.rg && result.target.point.bg)
+-			retainedTarget_ = result.target.point;
+-		result.filtered = temporal_.run(frame.number, result.target.point, result.target.confidence,
+-			previousFiltered_, retainedTarget_, locus_);
+-		auto factor = calibration_.factors()[locus_.evaluate(result.filtered.point).illuminant];
+-		QtiAwbPoint gainReference{ result.filtered.point.rg * (1.0f / factor.rg),
+-					   result.filtered.point.bg * (1.0f / factor.bg) };
+-		result.adjusted = gain_.run(frame.lux, result.filtered.point, gainReference, locus_);
+-		result.gains = qtiAwbRgbGains(result.adjusted.point);
+-		/* Process publishes the filtered CCT before gain adjustment. */
+-		result.cct = static_cast<uint32_t>(result.filtered.cct);
+-		result.lightId = qtiAwbLightId(result.cct);
+-		previousTarget_ = result.target.point;
+-		previousFiltered_ = result.filtered.point;
+@@ -138 +149,0 @@
+-private:
+@@ -174,0 +186,2 @@
++	QtiAwbFrameSkip frameSkip_;
++	QtiAwbFrontResult analysis_{};
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -1750 +1750 @@
+-		auto result = qtiAwb_->process({ awb_.data(), 14, width * height, awbFrame_++, lux, 0 });
++		auto result = qtiAwb_->process({ awb_.data(), 14, width * height, lux, 0 });
+@@ -1755 +1755 @@
+-			<< "QTI AWB stats " << lastStatsSequence_ << " frame " << awbFrame_ - 1
++			<< "QTI AWB stats " << lastStatsSequence_ << " frame " << awbFrame_++
+@@ -1756,0 +1757,2 @@
++			<< " skipped " << result.frameSkip.skipped << " remaining " << result.frameSkip.remaining
++			<< " change " << result.frameSkip.change << " average " << result.frameSkip.average
