@@ -1,0 +1,27 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: return the capture SOF timestamp
+
+Read the CLOCK_BOOTTIME CAMIF timestamp from the completed capture request.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -1444 +1444,2 @@
+-	    config.frame_sequence != sequence || config.sensor_delay != expected.sensor_delay ||
++	    config.frame_sequence != sequence || !config.sensor_timestamp ||
++	    config.sensor_delay != expected.sensor_delay ||
+@@ -1452,0 +1454,2 @@
++	buffer->request()->_d()->metadata().set(controls::SensorTimestamp,
++					      config.sensor_timestamp);
+@@ -2171,2 +2173,0 @@
+-	request->_d()->metadata().set(controls::SensorTimestamp,
+-				      buffer->metadata().timestamp);
+diff --git a/src/libcamera/pipeline/qcom/qcom_camss.h b/src/libcamera/pipeline/qcom/qcom_camss.h
+--- a/src/libcamera/pipeline/qcom/qcom_camss.h
++++ b/src/libcamera/pipeline/qcom/qcom_camss.h
+@@ -9 +9 @@
+-#define QCOM_CAMSS_IFE_CONFIG_VERSION 3
++#define QCOM_CAMSS_IFE_CONFIG_VERSION 4
+@@ -31,0 +32,2 @@
++	uint32_t reserved2;
++	uint64_t sensor_timestamp;
