@@ -1,0 +1,77 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: record control state at hardware frame boundaries
+
+Query the next CAMSS input frame when control state changes. Keep state
+intervals independently of the SOF event queue and require the counter API.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -538,0 +539 @@
++	int recordFrameState();
+@@ -591,0 +593,2 @@
++
++		bool operator==(const FrameState &) const = default;
+@@ -1002,0 +1006,7 @@
++
++	uint32_t sequence;
++	ret = video_->ioctl(VIDIOC_QCOM_CAMSS_GET_FRAME_SEQUENCE, &sequence);
++	if (ret) {
++		LOG(QcomPipeline, Error) << "CAMSS frame sequence query failed: " << ret;
++		return ret;
++	}
+@@ -1148,5 +1157,0 @@
+-	frameStates_[sequence] = { lens_ ? static_cast<float>(lensPosition()) : 0.0f,
+-				   afMode_, afState_, afPauseState_,
+-				   aeEnabled_, aeEnabled_ ? aeEvValue(aeEvStep_) : 0.0f };
+-	while (frameStates_.size() > 64)
+-		frameStates_.erase(frameStates_.begin());
+@@ -1158,0 +1164,22 @@
++}
++
++int QcomCameraData::recordFrameState()
++{
++	FrameState state{ lens_ ? static_cast<float>(lensPosition()) : 0.0f,
++			  afMode_, afState_, afPauseState_, aeEnabled_,
++			  aeEnabled_ ? aeEvValue(aeEvStep_) : 0.0f };
++	if (!frameStates_.empty() && frameStates_.rbegin()->second == state)
++		return 0;
++
++	uint32_t sequence;
++	int ret = video_->ioctl(VIDIOC_QCOM_CAMSS_GET_FRAME_SEQUENCE, &sequence);
++	if (ret)
++		return ret;
++	frameStates_[sequence] = state;
++	while (frameStates_.size() > 64)
++		frameStates_.erase(frameStates_.begin());
++	LOG(QcomPipeline, Debug) << "Frame state " << sequence << " lens "
++		<< std::setprecision(9) << state.lensPosition << " AF "
++		<< state.afMode << " " << state.afState << " " << state.afPauseState
++		<< " AE " << state.aeEnabled << " EV " << state.exposureValue;
++	return 0;
+@@ -1491,0 +1519,3 @@
++	int ret = recordFrameState();
++	if (ret)
++		LOG(QcomPipeline, Error) << "Failed to record frame state: " << ret;
+@@ -1990 +2020 @@
+-	return 0;
++	return recordFrameState();
+@@ -2026,2 +2056,2 @@
+-	auto it = frameStates_.find(sequence);
+-	if (it == frameStates_.end()) {
++	auto it = frameStates_.upper_bound(sequence);
++	if (it == frameStates_.begin()) {
+@@ -2031 +2061 @@
+-	const FrameState &state = it->second;
++	const FrameState &state = std::prev(it)->second;
+@@ -2181,0 +2212,4 @@
++	ret = data->recordFrameState();
++	if (ret)
++		return ret;
++
+diff --git a/src/libcamera/pipeline/qcom/qcom_camss.h b/src/libcamera/pipeline/qcom/qcom_camss.h
+--- a/src/libcamera/pipeline/qcom/qcom_camss.h
++++ b/src/libcamera/pipeline/qcom/qcom_camss.h
+@@ -59,0 +60,2 @@
++#define VIDIOC_QCOM_CAMSS_GET_FRAME_SEQUENCE \
++	_IOR('V', BASE_VIDIOC_PRIVATE + 1, uint32_t)
