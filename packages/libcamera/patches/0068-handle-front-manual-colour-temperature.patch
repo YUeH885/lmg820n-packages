@@ -1,0 +1,52 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: handle front manual colour temperature
+
+Use calibrated QTI reference gains for manual CCT requests and retain an
+explicit CCT when gains and temperature are supplied together.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_front.h b/src/libcamera/pipeline/qcom/awb_front.h
+--- a/src/libcamera/pipeline/qcom/awb_front.h
++++ b/src/libcamera/pipeline/qcom/awb_front.h
+@@ -59,0 +60,6 @@
++
++	std::array<float, 2> manualGains(float cct) const
++	{
++		auto gains = QtiAwbReferenceGains(reference_).fromCct(cct);
++		return { gains.rg, gains.bg };
++	}
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -668 +668 @@
+-	void setManualAwb(double gainR, double gainB);
++	void setManualAwb(double gainR, double gainB, std::optional<int32_t> cct);
+@@ -1064,0 +1065,2 @@
++	if (qtiAwb_)
++		ctrls[&controls::ColourTemperature] = ControlInfo(1500, 12000, 5000);
+@@ -1311 +1313 @@
+-void QcomCameraData::setManualAwb(double gainR, double gainB)
++void QcomCameraData::setManualAwb(double gainR, double gainB, std::optional<int32_t> cct)
+@@ -1315 +1317,3 @@
+-	if (qtiAwb_)
++	if (cct)
++		colourTemperature_ = *cct;
++	else if (qtiAwb_)
+@@ -2021,7 +2025,11 @@
+-		if (!awbEnabled_ && controls.contains(controls::ColourGains.id())) {
+-			const auto gains = *controls.get(controls::ColourGains);
+-			setManualAwb(gains[0], gains[1]);
+-		}
+-	} else if (!awbEnabled_ && controls.contains(controls::ColourGains.id())) {
+-		const auto gains = *controls.get(controls::ColourGains);
+-		setManualAwb(gains[0], gains[1]);
++	}
++	if (!awbEnabled_) {
++		auto cct = qtiAwb_ ? controls.get(controls::ColourTemperature) : std::nullopt;
++		if (cct)
++			*cct = std::clamp(*cct, 1500, 12000);
++		if (auto gains = controls.get(controls::ColourGains)) {
++			setManualAwb((*gains)[0], (*gains)[1], cct);
++		} else if (cct) {
++			auto gains = qtiAwb_->manualGains(*cct);
++			setManualAwb(gains[0], gains[1], cct);
++		}
