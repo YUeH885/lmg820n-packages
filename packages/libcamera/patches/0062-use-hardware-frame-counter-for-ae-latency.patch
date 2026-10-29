@@ -1,0 +1,23 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: use the hardware frame counter for AE latency
+
+Control-state boundaries are sparse and cannot serve as a frame clock.
+Use the next hardware input frame when accounting for statistics age and
+sensor control delay.
+
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -1692,0 +1693,6 @@
++	uint32_t nextFrame;
++	int ret = video_->ioctl(VIDIOC_QCOM_CAMSS_GET_FRAME_SEQUENCE, &nextFrame);
++	if (ret) {
++		LOG(QcomPipeline, Error) << "AE frame sequence query failed: " << ret;
++		return false;
++	}
+@@ -1695 +1701 @@
+-		frameStates_.rbegin()->first - sequence + 1;
++		nextFrame - sequence;
+@@ -1707 +1713 @@
+-		<< " ev offset " << evOffset;
++		<< " ev offset " << evOffset << " next frame " << nextFrame;

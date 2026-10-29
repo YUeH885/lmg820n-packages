@@ -1,0 +1,11 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] v4l2: disable the request notifier on completion
+
+A completed request fd remains ready until reinitialization. Disable its
+notifier before signaling completion to deliver one event per queue cycle.
+
+diff --git a/src/libcamera/v4l2_request.cpp b/src/libcamera/v4l2_request.cpp
+--- a/src/libcamera/v4l2_request.cpp
++++ b/src/libcamera/v4l2_request.cpp
+@@ -124,0 +125 @@
++	fdNotifier_.setEnabled(false);
