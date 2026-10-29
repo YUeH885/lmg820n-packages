@@ -1,0 +1,72 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add QTI AWB face statistics collection
+
+Collect all face ROI regions with the factory strict RGB thresholds
+and equal-weight R/G and B/G means. Generate the lux trigger tables.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_face.h b/src/libcamera/pipeline/qcom/awb_face.h
+--- a/src/libcamera/pipeline/qcom/awb_face.h
++++ b/src/libcamera/pipeline/qcom/awb_face.h
+@@ -6,0 +7,4 @@
++
++#include "awb_locus.h"
++#include "awb_statistics.h"
++#include "awb_triggers.h"
+@@ -84,0 +89,42 @@
++struct QtiAwbFaceStatisticsConfiguration {
++	QtiAwbTriggerTable<1, 3> minimumRgb;
++	QtiAwbTriggerTable<1, 3> maximumRgb;
++};
++
++struct QtiAwbFaceStatistics {
++	QtiAwbPoint mean;
++	uint32_t count;
++};
++
++inline QtiAwbFaceStatistics qtiAwbCollectFaceStatistics(
++	const QtiAwbFaceStatisticsConfiguration &config, const QtiAwbFaceFrameState &frame,
++	const uint32_t *bg, unsigned int columns, unsigned int rows,
++	unsigned int bitDepth, unsigned int pixels, float lux)
++{
++	QtiAwbFaceStatistics result{};
++	if (!frame.stable)
++		return result;
++	auto minimum = qtiAwbEvaluateTrigger(config.minimumRgb, &lux);
++	auto maximum = qtiAwbEvaluateTrigger(config.maximumRgb, &lux);
++	for (unsigned int i = 0; i < columns * rows; i++) {
++		float x = i % columns, y = i / columns;
++		if (x < frame.left || x > frame.right || y < frame.top || y > frame.bottom)
++			continue;
++		auto stat = qtiAwbParseBg(bg + i * 12, bitDepth, pixels);
++		bool valid = true;
++		for (unsigned int channel = 0; channel < stat.rgb.size(); channel++)
++			if (stat.rgb[channel] <= minimum[channel] || stat.rgb[channel] >= maximum[channel])
++				valid = false;
++		if (valid) {
++			result.mean.rg += stat.rg;
++			result.mean.bg += stat.bg;
++			result.count++;
++		}
++	}
++	if (result.count) {
++		result.mean.rg /= result.count;
++		result.mean.bg /= result.count;
++	}
++	return result;
++}
++
+diff --git a/src/libcamera/pipeline/qcom/awb_front_configuration.h b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+--- a/src/libcamera/pipeline/qcom/awb_front_configuration.h
++++ b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+@@ -55,0 +56 @@
++	QtiAwbFaceStatisticsConfiguration faceStatistics;
+diff --git a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+@@ -581,0 +582,6 @@
++	config.faceStatistics.minimumRgb = { {
++		{ 0.0f, 999.0f, { 5.0f, 5.0f, 5.0f } },
++	} };
++	config.faceStatistics.maximumRgb = { {
++		{ 0.0f, 999.0f, { 240.0f, 240.0f, 240.0f } },
++	} };
