@@ -1,0 +1,107 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add QTI AWB face frame processing
+
+Normalize face rectangles and track the factory ROI, detection, and
+temporal speed registration rules independently of the detector.
+
+diff --git a/src/libcamera/pipeline/qcom/awb_face.h b/src/libcamera/pipeline/qcom/awb_face.h
+--- /dev/null
++++ b/src/libcamera/pipeline/qcom/awb_face.h
+@@ -0,0 +1,85 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++namespace libcamera::qcom {
++
++struct QtiAwbFaceRectangle {
++	float x, y, width, height;
++};
++
++inline QtiAwbFaceRectangle qtiAwbNormalizeFace(QtiAwbFaceRectangle face,
++					    QtiAwbFaceRectangle crop,
++					    float imageWidth, float imageHeight)
++{
++	if (crop.x >= 0 && crop.y >= 0 && crop.width > 0 && crop.height > 0) {
++		float left = std::min(std::max(face.x - crop.x, 0.0f), crop.width);
++		float top = std::min(std::max(face.y - crop.y, 0.0f), crop.height);
++		float right = std::max((face.x + face.width) - crop.x, 0.0f);
++		float bottom = std::max((face.y + face.height) - crop.y, 0.0f);
++		return { left / crop.width, top / crop.height,
++			 std::min(right - left, crop.width - left) / crop.width,
++			 std::min(bottom - top, crop.height - top) / crop.height };
++	}
++	if (imageWidth > 0 && imageHeight > 0)
++		return { face.x / imageWidth, face.y / imageHeight,
++			 face.width / imageWidth, face.height / imageHeight };
++	return {};
++}
++
++struct QtiAwbFaceFrameConfiguration {
++	float halfWidth, halfHeight;
++	int32_t detectionFrames, absenceFrames;
++	float convergenceSpeed;
++};
++
++struct QtiAwbFaceFrameState {
++	float left, right, top, bottom;
++	int32_t detectedFrames, absentFrames;
++	uint32_t speedRegistered, stable;
++};
++
++class QtiAwbFaceFrame
++{
++public:
++	explicit QtiAwbFaceFrame(QtiAwbFaceFrameConfiguration config)
++		: config_(config)
++	{
++	}
++
++	void reset() { state_ = {}; }
++
++	QtiAwbFaceFrameState process(const QtiAwbFaceRectangle *face,
++				     unsigned int columns, unsigned int rows)
++	{
++		state_.left = state_.right = state_.top = state_.bottom = 0;
++		if (face) {
++			state_.stable = state_.detectedFrames >= config_.detectionFrames;
++			state_.detectedFrames = std::min(state_.detectedFrames + 1, config_.detectionFrames);
++			state_.absentFrames = 0;
++			/* Preserve the separate products used by the factory ROI arithmetic. */
++			volatile float centerX = std::fma(face->width, 0.5f, face->x) * columns;
++			volatile float centerY = std::fma(face->height, 0.5f, face->y) * rows;
++			volatile float halfWidth = (face->width * columns) * config_.halfWidth;
++			volatile float halfHeight = (face->height * rows) * config_.halfHeight;
++			state_.left = std::max((centerX - halfWidth) + 0.5f, 0.0f);
++			state_.right = std::min((centerX + halfWidth) + 0.5f, float(columns - 1));
++			state_.top = std::max((centerY - halfHeight) + 0.5f, 0.0f);
++			state_.bottom = std::min((centerY + halfHeight) + 0.5f, float(rows - 1));
++		} else {
++			state_.stable = state_.detectedFrames = 0;
++			state_.absentFrames = std::min(state_.absentFrames + 1, config_.absenceFrames);
++		}
++		state_.speedRegistered = state_.absentFrames > 0 && state_.absentFrames < config_.absenceFrames;
++		return state_;
++	}
++
++private:
++	QtiAwbFaceFrameConfiguration config_;
++	QtiAwbFaceFrameState state_{};
++};
++
++} /* namespace libcamera::qcom */
+diff --git a/src/libcamera/pipeline/qcom/awb_front_configuration.h b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+--- a/src/libcamera/pipeline/qcom/awb_front_configuration.h
++++ b/src/libcamera/pipeline/qcom/awb_front_configuration.h
+@@ -9,0 +10 @@
++#include "awb_face.h"
+@@ -53,0 +55 @@
++	QtiAwbFaceFrameConfiguration faceFrame;
+diff --git a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+--- a/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/imx520_awb_tuning.h
+@@ -580,0 +581 @@
++	config.faceFrame = { 0.330000013f, 0.375f, 10, 30, 0.00999999978f };
