@@ -8,6 +8,7 @@
 | :--- | :--- | :--- |
 | `geoclue-2.0` | Debian sid `geoclue-2.0` | 原生应用桌面授权补丁与定位服务代理 |
 | `libspa-0.2-bluetooth-lmg820n` | Debian sid `pipewire` | 蓝牙 SCO 语音传输状态通知插件 |
+| `libspa-0.2-bluetooth-aac` | Debian sid `pipewire` | 蓝牙 AAC 编解码器插件（链接 Debian non-free 的 `libfdk-aac2t64`） |
 | `hexagonrpc` | Debian sid `hexagonrpc` | Hexagon DSP RPC 守护进程与运行库 |
 | `libssc` | Debian sid `libssc` | 传感器子系统 (SSC) 通信库 |
 | `iio-sensor-proxy` | Debian sid `iio-sensor-proxy` | 传感器热插拔与发现补丁 |

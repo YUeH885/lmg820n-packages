@@ -2,7 +2,7 @@ Source: pipewire
 Section: sound
 Priority: optional
 Maintainer: LMG820N Linux Maintainers <root@localhost>
-Build-Depends: debhelper-compat (= 13), meson, ninja-build, pkgconf, libdbus-1-dev, libbluetooth-dev, libglib2.0-dev, libsbc-dev
+Build-Depends: debhelper-compat (= 13), meson, ninja-build, pkgconf, libdbus-1-dev, libbluetooth-dev, libglib2.0-dev, libsbc-dev, libfdk-aac-dev
 Standards-Version: 4.7.2
 Rules-Requires-Root: no
 
@@ -12,3 +12,11 @@ Depends: ${shlibs:Depends}, ${misc:Depends}, libspa-0.2-bluetooth (>= ${source:U
 Description: PipeWire Bluetooth transport readiness for the LM-G820N
  Provides a separate Bluetooth SPA plugin with SCO transport readiness
  notifications for the board-specific WirePlumber audio routing.
+
+Package: libspa-0.2-bluetooth-aac
+Architecture: arm64
+Section: contrib/sound
+Depends: ${shlibs:Depends}, ${misc:Depends}, libspa-0.2-bluetooth (>= ${source:Upstream-Version})
+Description: PipeWire Bluetooth AAC codec plugin for LM-G820N
+ Provides the upstream AAC codec plugin for PipeWire bluez5, compiled against
+ libfdk-aac from Debian non-free.

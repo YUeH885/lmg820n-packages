@@ -28,10 +28,15 @@ def prepare_builder(log):
     key = hashlib.sha256(json.dumps(["sid-src", build_arch, "arm64", mirror, BUILD_PACKAGES]).encode()).hexdigest()[:16]
     builder = WORK / f"rootfs-{key}"
     if builder.exists():
-        # Ensure deb-src is enabled in existing builder
         sources_list = builder / "etc/apt/sources.list"
-        if sources_list.exists() and "deb-src" not in sources_list.read_text():
-            run_cmd(["sudo", "bash", "-c", f'echo "deb-src {mirror} sid main contrib non-free non-free-firmware" >> {sources_list}'])
+        if sources_list.exists():
+            content = sources_list.read_text()
+            if "non-free" not in content or "deb-src" not in content:
+                sources = (
+                    f"deb {mirror} sid main contrib non-free non-free-firmware\n"
+                    f"deb-src {mirror} sid main contrib non-free non-free-firmware\n"
+                )
+                run_cmd(["sudo", "tee", str(sources_list)], input=sources, text=True, stdout=subprocess.DEVNULL)
         return builder
 
     WORK.mkdir(parents=True, exist_ok=True)

@@ -5,12 +5,13 @@ include /usr/share/dpkg/architecture.mk
 	dh $@
 
 override_dh_auto_configure:
-	dh_auto_configure -- --auto-features=disabled -Dspa-plugins=enabled -Ddbus=enabled -Dbluez5=enabled -Dbluez5-backend-hsp-native=enabled -Dbluez5-backend-hfp-native=enabled -Dsession-managers=[]
+	dh_auto_configure -- --auto-features=disabled -Dspa-plugins=enabled -Ddbus=enabled -Dbluez5=enabled -Dbluez5-backend-hsp-native=enabled -Dbluez5-backend-hfp-native=enabled -Dbluez5-codec-aac=enabled -Dsession-managers=[]
 
 override_dh_auto_build:
-	dh_auto_build -- spa/plugins/bluez5/libspa-bluez5.so
+	dh_auto_build -- spa/plugins/bluez5/libspa-bluez5.so spa/plugins/bluez5/libspa-codec-bluez5-aac.so
 
 override_dh_auto_test:
 
 override_dh_auto_install:
 	install -D -m644 obj-$(DEB_HOST_GNU_TYPE)/spa/plugins/bluez5/libspa-bluez5.so debian/libspa-0.2-bluetooth-lmg820n/usr/lib/$(DEB_HOST_MULTIARCH)/spa-0.2/lmg820n/libspa-bluez5.so
+	install -D -m644 obj-$(DEB_HOST_GNU_TYPE)/spa/plugins/bluez5/libspa-codec-bluez5-aac.so debian/libspa-0.2-bluetooth-aac/usr/lib/$(DEB_HOST_MULTIARCH)/spa-0.2/bluez5/libspa-codec-bluez5-aac.so
