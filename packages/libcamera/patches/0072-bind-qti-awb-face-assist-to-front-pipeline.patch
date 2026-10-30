@@ -1,0 +1,134 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: bind QTI AWB face assist to front pipeline
+
+Schedule face frame state tracking, ROI statistics, target and
+confidence analysis into the front AWB pipeline. Apply factory
+temporal convergence speed registration and persist analysis results
+across DSFV1 frame skips.
+
+--- a/src/libcamera/pipeline/qcom/awb_temporal.h	2026-10-30 14:32:17.076763167 +0800
++++ b/src/libcamera/pipeline/qcom/awb_temporal.h	2026-10-30 14:32:23.310197480 +0800
+@@ -34,11 +34,13 @@
+ 
+ 	QtiAwbTemporalResult run(int32_t frame, QtiAwbPoint target, float confidence,
+ 				 QtiAwbPoint previousFiltered, QtiAwbPoint previousTarget,
+-				 const QtiAwbLocus &locus)
++				 const QtiAwbLocus &locus, float registeredSpeed = 0.0f)
+ 	{
+ 		if (startupActive_ && frame > config_.startupFrames)
+ 			startupActive_ = false;
+-		float speed = startupActive_ ? config_.startupSpeed : std::min(config_.defaultSpeed, 1.0f);
++		float speed = startupActive_ ? config_.startupSpeed
++					     : (registeredSpeed > 0 ? registeredSpeed : config_.defaultSpeed);
++		speed = std::min(speed, 1.0f);
+ 		/* Invalid decisions retain the prior target while filtering continues. */
+ 		if (target.rg == 0 || target.bg == 0 || confidence == 0)
+ 			target = previousTarget;
+--- a/src/libcamera/pipeline/qcom/awb_front.h	2026-10-30 14:32:17.077898035 +0800
++++ b/src/libcamera/pipeline/qcom/awb_front.h	2026-10-30 14:32:51.145185764 +0800
+@@ -18,6 +18,7 @@
+ 	unsigned int pixelsPerRegion;
+ 	float lux;
+ 	float mlcTrigger15;
++	const QtiAwbFaceRectangle *face = nullptr;
+ };
+ 
+ struct QtiAwbFrontResult {
+@@ -33,6 +34,9 @@
+ 	uint32_t cct;
+ 	uint32_t lightId;
+ 	QtiAwbFrameSkipState frameSkip;
++	QtiAwbFaceFrameState faceFrame;
++	QtiAwbFaceStatistics faceStatistics;
++	QtiAwbFaceResult faceResult;
+ };
+ 
+ /* Normal streaming with sensor calibration and SFSubSmpV1 mode 0. */
+@@ -46,7 +50,8 @@
+ 		: config_(std::move(config)), calibration_(std::move(calibration)),
+ 		  reference_(calibratedReference()), locus_(reference_),
+ 		  mlc_(config_.mlcDetection, config_.mlcExclusion),
+-		  temporal_(config_.temporal), gain_(config_.gain), frameSkip_(config_.frameSkip)
++		  temporal_(config_.temporal), gain_(config_.gain), frameSkip_(config_.frameSkip),
++		  faceFrame_(config_.faceFrame), faceAnalysis_(config_.faceAnalysis)
+ 	{
+ 		reset();
+ 	}
+@@ -70,19 +75,24 @@
+ 		mlc_.reset();
+ 		temporal_.reset();
+ 		frameSkip_.reset();
++		faceFrame_.reset();
++		faceAnalysis_.reset();
+ 		analysis_ = {};
+ 		previousTarget_ = previousFiltered_ = retainedTarget_ = initial;
+ 	}
+ 
+ 	QtiAwbFrontResult process(const QtiAwbBgFrame &frame)
+ 	{
++		auto faceState = faceFrame_.process(frame.face, Width, Height);
+ 		if (!frameSkip_.beginFrame())
+-			analysis_ = analyze(frame);
++			analysis_ = analyze(frame, faceState);
+ 		QtiAwbFrontResult result = analysis_;
++		result.faceFrame = faceState;
+ 		if (result.target.confidence && result.target.point.rg && result.target.point.bg)
+ 			retainedTarget_ = result.target.point;
++		float speed = (faceState.stable || faceState.speedRegistered) ? config_.faceFrame.convergenceSpeed : 0.0f;
+ 		result.filtered = temporal_.run(frameSkip_.frameCount(), result.target.point, result.target.confidence,
+-			previousFiltered_, retainedTarget_, locus_);
++			previousFiltered_, retainedTarget_, locus_, speed);
+ 		auto factor = calibration_.factors()[locus_.evaluate(result.filtered.point).illuminant];
+ 		QtiAwbPoint gainReference{ result.filtered.point.rg * (1.0f / factor.rg),
+ 					   result.filtered.point.bg * (1.0f / factor.bg) };
+@@ -98,7 +108,7 @@
+ 	}
+ 
+ private:
+-	QtiAwbFrontResult analyze(const QtiAwbBgFrame &frame)
++	QtiAwbFrontResult analyze(const QtiAwbBgFrame &frame, const QtiAwbFaceFrameState &faceState)
+ 	{
+ 		QtiAwbFrontResult result{};
+ 		/* The factory sampler fixes the tile offsets to a 64x48 grid. */
+@@ -149,6 +159,16 @@
+ 				result.agw.weightedMean, groups, [this](auto point) { return calibratePoint(point); }));
+ 			decisions.push_back(result.scenes.back());
+ 		}
++		if (faceState.stable) {
++			result.faceStatistics = qtiAwbCollectFaceStatistics(
++				config_.faceStatistics, faceState, frame.regions,
++				Width, Height, frame.bitDepth, frame.pixelsPerRegion, frame.lux);
++			result.faceResult = faceAnalysis_.process(
++				result.faceStatistics, result.agw.weightedMean, frame.lux,
++				metrics[1], result.admitted, Width * Height, locus_);
++			decisions.push_back({ result.faceResult.point, result.faceResult.confidence,
++					      0, 0, result.faceResult.weight });
++		}
+ 		result.target = qtiAwbAggregate(config_.aggregation, std::move(decisions), previousTarget_);
+ 		return result;
+ 	}
+@@ -190,6 +210,8 @@
+ 	QtiAwbTemporalConvergence temporal_;
+ 	QtiAwbGainAdjustment gain_;
+ 	QtiAwbFrameSkip frameSkip_;
++	QtiAwbFaceFrame faceFrame_;
++	QtiAwbFaceAnalysis faceAnalysis_;
+ 	QtiAwbFrontResult analysis_{};
+ 	QtiAwbPoint previousTarget_{};
+ 	QtiAwbPoint previousFiltered_{};
+--- a/src/libcamera/pipeline/qcom/qcom.cpp	2026-10-30 14:32:17.079068176 +0800
++++ b/src/libcamera/pipeline/qcom/qcom.cpp	2026-10-30 14:32:56.981005434 +0800
+@@ -1766,6 +1766,13 @@
+ 			<< " filtered " << result.filtered.point.rg << " " << result.filtered.point.bg
+ 			<< " gains " << result.gains[0] << " " << result.gains[1] << " " << result.gains[2]
+ 			<< " cct " << result.cct;
++		if (result.faceFrame.detectedFrames || result.faceFrame.speedRegistered)
++			LOG(QcomPipeline, Debug)
++				<< "QTI AWB face detected " << result.faceFrame.detectedFrames
++				<< " absent " << result.faceFrame.absentFrames
++				<< " stable " << result.faceFrame.stable
++				<< " count " << result.faceStatistics.count
++				<< " conf " << result.faceResult.confidence;
+ 		return;
+ 	}
+ 	if (!luxIndex_)
