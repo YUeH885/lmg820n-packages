@@ -1,0 +1,529 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add flash device control and precapture measurement
+
+Add sysfs FlashDevice controller managing white and yellow flash LEDs on
+PM8150L PMIC. Implement Chromatix-aligned flash measurement sequence with
+enter frame skip, torch settling convergence, flux ratio extrapolation,
+and strobe trigger on still capture. Expose draft FlashMode and FlashState
+controls and map Android HAL flash modes and precapture triggers.
+
+---
+diff --git a/src/android/camera_capabilities.cpp b/src/android/camera_capabilities.cpp
+index 19d605d..484cee2 100644
+--- a/src/android/camera_capabilities.cpp
++++ b/src/android/camera_capabilities.cpp
+@@ -1243,6 +1243,8 @@ int CameraCapabilities::initializeStaticMetadata()
+ 
+ 	/* Flash static metadata. */
+ 	char flashAvailable = ANDROID_FLASH_INFO_AVAILABLE_FALSE;
++	if (camera_->id().find("imx520") == std::string::npos)
++		flashAvailable = ANDROID_FLASH_INFO_AVAILABLE_TRUE;
+ 	staticMetadata_->addEntry(ANDROID_FLASH_INFO_AVAILABLE,
+ 				  flashAvailable);
+ 
+diff --git a/src/android/camera_device.cpp b/src/android/camera_device.cpp
+index 2651e1b..74c88b3 100644
+--- a/src/android/camera_device.cpp
++++ b/src/android/camera_device.cpp
+@@ -824,6 +824,26 @@ int CameraDevice::processControls(Camera3RequestDescriptor *descriptor)
+ 		controls.set(controls::draft::AeLock, data[0] == ANDROID_CONTROL_AE_LOCK_ON);
+ 	}
+ 
++	if (settings.getEntry(ANDROID_FLASH_MODE, &entry)) {
++		const uint8_t *data = entry.data.u8;
++		int32_t flashMode = controls::draft::FlashModeOff;
++		if (data[0] == ANDROID_FLASH_MODE_SINGLE)
++			flashMode = controls::draft::FlashModeSingle;
++		else if (data[0] == ANDROID_FLASH_MODE_TORCH)
++			flashMode = controls::draft::FlashModeTorch;
++		controls.set(controls::draft::FlashMode, flashMode);
++	}
++
++	if (settings.getEntry(ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER, &entry)) {
++		const uint8_t *data = entry.data.u8;
++		int32_t trigger = controls::draft::AePrecaptureTriggerIdle;
++		if (data[0] == ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_START)
++			trigger = controls::draft::AePrecaptureTriggerStart;
++		else if (data[0] == ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL)
++			trigger = controls::draft::AePrecaptureTriggerCancel;
++		controls.set(controls::draft::AePrecaptureTrigger, trigger);
++	}
++
+ 	if (settings.getEntry(ANDROID_SENSOR_TEST_PATTERN_MODE, &entry)) {
+ 		const int32_t data = *entry.data.i32;
+ 		int32_t testPatternMode = controls::draft::TestPatternModeOff;
+@@ -1495,9 +1515,31 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
+ 	found = settings.getEntry(ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER, &entry);
+ 	value = found ? *entry.data.u8 :
+ 			(uint8_t)ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_IDLE;
++	if (metadata.contains(controls::draft::AePrecaptureTrigger)) {
++		int32_t trigger = metadata.get(controls::draft::AePrecaptureTrigger);
++		if (trigger == controls::draft::AePrecaptureTriggerStart)
++			value = ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_START;
++		else if (trigger == controls::draft::AePrecaptureTriggerCancel)
++			value = ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL;
++		else
++			value = ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_IDLE;
++	}
+ 	resultMetadata->addEntry(ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER, value);
+ 
+ 	value = aeLocked ? ANDROID_CONTROL_AE_STATE_LOCKED : ANDROID_CONTROL_AE_STATE_CONVERGED;
++	if (metadata.contains(controls::AeState)) {
++		int32_t aeState = metadata.get(controls::AeState);
++		if (aeState == controls::AeStateIdle)
++			value = ANDROID_CONTROL_AE_STATE_INACTIVE;
++		else if (aeState == controls::AeStateSearching)
++			value = ANDROID_CONTROL_AE_STATE_SEARCHING;
++		else if (aeState == controls::AeStateConverged)
++			value = aeLocked ? ANDROID_CONTROL_AE_STATE_LOCKED : ANDROID_CONTROL_AE_STATE_CONVERGED;
++		else if (aeState == 4)
++			value = ANDROID_CONTROL_AE_STATE_FLASH_REQUIRED;
++		else if (aeState == 5)
++			value = ANDROID_CONTROL_AE_STATE_PRECAPTURE;
++	}
+ 	resultMetadata->addEntry(ANDROID_CONTROL_AE_STATE, value);
+ 
+ 	value = ANDROID_CONTROL_AF_MODE_OFF;
+@@ -1534,9 +1576,27 @@ CameraDevice::getResultMetadata(const Camera3RequestDescriptor &descriptor) cons
+ 	resultMetadata->addEntry(ANDROID_CONTROL_VIDEO_STABILIZATION_MODE, value);
+ 
+ 	value = ANDROID_FLASH_MODE_OFF;
++	if (metadata.contains(controls::draft::FlashMode)) {
++		int32_t fm = metadata.get(controls::draft::FlashMode);
++		if (fm == controls::draft::FlashModeSingle)
++			value = ANDROID_FLASH_MODE_SINGLE;
++		else if (fm == controls::draft::FlashModeTorch)
++			value = ANDROID_FLASH_MODE_TORCH;
++	}
+ 	resultMetadata->addEntry(ANDROID_FLASH_MODE, value);
+ 
+ 	value = ANDROID_FLASH_STATE_UNAVAILABLE;
++	if (metadata.contains(controls::draft::FlashState)) {
++		int32_t fs = metadata.get(controls::draft::FlashState);
++		if (fs == controls::draft::FlashStateCharging)
++			value = ANDROID_FLASH_STATE_CHARGING;
++		else if (fs == controls::draft::FlashStateReady)
++			value = ANDROID_FLASH_STATE_READY;
++		else if (fs == controls::draft::FlashStateFlashFired)
++			value = ANDROID_FLASH_STATE_FIRED;
++		else if (fs == controls::draft::FlashStatePartial)
++			value = ANDROID_FLASH_STATE_PARTIAL;
++	}
+ 	resultMetadata->addEntry(ANDROID_FLASH_STATE, value);
+ 
+ 	if (settings.getEntry(ANDROID_LENS_APERTURE, &entry))
+diff --git a/src/libcamera/control_ids_draft.yaml b/src/libcamera/control_ids_draft.yaml
+index a67a999..390e5c5 100644
+--- a/src/libcamera/control_ids_draft.yaml
++++ b/src/libcamera/control_ids_draft.yaml
+@@ -38,6 +38,44 @@ controls:
+             The camera will cancel any active or completed metering sequence.
+             The AE algorithm is reset to its initial state.
+ 
++  - FlashMode:
++      type: int32_t
++      direction: inout
++      description: |
++        Control to select flash mode. Currently identical to ANDROID_FLASH_MODE.
++      enum:
++        - name: FlashModeOff
++          value: 0
++          description: Flash will not fire.
++        - name: FlashModeSingle
++          value: 1
++          description: Flash will fire for a single still capture.
++        - name: FlashModeTorch
++          value: 2
++          description: Flash will constantly emit light (torch mode).
++
++  - FlashState:
++      type: int32_t
++      direction: out
++      description: |
++        Control to report current flash state. Currently identical to ANDROID_FLASH_STATE.
++      enum:
++        - name: FlashStateUnavailable
++          value: 0
++          description: Flash is not available on this camera.
++        - name: FlashStateCharging
++          value: 1
++          description: Flash is charging and not ready.
++        - name: FlashStateReady
++          value: 2
++          description: Flash is ready to fire.
++        - name: FlashStateFlashFired
++          value: 3
++          description: Flash has fired for this capture.
++        - name: FlashStatePartial
++          value: 4
++          description: Flash fired at lower power.
++
+   - NoiseReductionMode:
+       type: int32_t
+       direction: inout
+diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
+index 3b17cd6..8322f19 100644
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -14,6 +14,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <deque>
++#include <fcntl.h>
+ #include <filesystem>
+ #include <iterator>
+ #include <limits>
+@@ -23,6 +24,7 @@
+ #include <optional>
+ #include <set>
+ #include <string>
++#include <unistd.h>
+ #include <utility>
+ #include <vector>
+ 
+@@ -80,6 +82,117 @@ LOG_DEFINE_CATEGORY(QcomPipeline)
+ 
+ namespace {
+ 
++class FlashDevice
++{
++public:
++	static FlashDevice &instance()
++	{
++		static FlashDevice dev;
++		return dev;
++	}
++
++	bool isAvailable() const { return hasFlash_; }
++
++	void turnOff()
++	{
++		if (!hasFlash_)
++			return;
++		setSysfs(whiteBrightnessFd_, 0);
++		setSysfs(yellowBrightnessFd_, 0);
++		setSysfs(whiteStrobeFd_, 0);
++		torchOn_ = false;
++		strobeActive_ = false;
++	}
++
++	void setTorch(bool on, uint32_t brightness = 255)
++	{
++		if (!hasFlash_)
++			return;
++		if (on) {
++			setSysfs(whiteBrightnessFd_, std::min<uint32_t>(brightness, 255));
++			torchOn_ = true;
++		} else {
++			setSysfs(whiteBrightnessFd_, 0);
++			setSysfs(yellowBrightnessFd_, 0);
++			torchOn_ = false;
++		}
++	}
++
++	void triggerFlash(uint32_t currentUa = 900000, uint32_t timeoutUs = 200000)
++	{
++		if (!hasFlash_)
++			return;
++		setSysfs(whiteFlashBrightnessFd_, std::min<uint32_t>(currentUa, 900000));
++		setSysfs(whiteTimeoutFd_, std::min<uint32_t>(timeoutUs, 500000));
++		setSysfs(whiteStrobeFd_, 1);
++		strobeActive_ = true;
++	}
++
++	bool isTorchOn() const { return torchOn_; }
++	bool isStrobeActive() const { return strobeActive_; }
++
++private:
++	FlashDevice()
++		: hasFlash_(false), torchOn_(false), strobeActive_(false),
++		  whiteBrightnessFd_(-1), whiteStrobeFd_(-1),
++		  whiteTimeoutFd_(-1), whiteFlashBrightnessFd_(-1),
++		  yellowBrightnessFd_(-1)
++	{
++		init();
++	}
++
++	~FlashDevice()
++	{
++		turnOff();
++		closeFds();
++	}
++
++	void init()
++	{
++		whiteBrightnessFd_ = open("/sys/class/leds/white:flash/brightness", O_WRONLY | O_CLOEXEC);
++		whiteStrobeFd_ = open("/sys/class/leds/white:flash/flash_strobe", O_WRONLY | O_CLOEXEC);
++		whiteTimeoutFd_ = open("/sys/class/leds/white:flash/flash_timeout", O_WRONLY | O_CLOEXEC);
++		whiteFlashBrightnessFd_ = open("/sys/class/leds/white:flash/flash_brightness", O_WRONLY | O_CLOEXEC);
++		yellowBrightnessFd_ = open("/sys/class/leds/yellow:flash/brightness", O_WRONLY | O_CLOEXEC);
++
++		hasFlash_ = (whiteBrightnessFd_ >= 0 && whiteStrobeFd_ >= 0);
++		turnOff();
++	}
++
++	void closeFds()
++	{
++		auto safeClose = [](int &fd) {
++			if (fd >= 0) {
++				close(fd);
++				fd = -1;
++			}
++		};
++		safeClose(whiteBrightnessFd_);
++		safeClose(whiteStrobeFd_);
++		safeClose(whiteTimeoutFd_);
++		safeClose(whiteFlashBrightnessFd_);
++		safeClose(yellowBrightnessFd_);
++	}
++
++	static void setSysfs(int fd, uint32_t val)
++	{
++		if (fd < 0)
++			return;
++		std::string str = std::to_string(val) + "\n";
++		lseek(fd, 0, SEEK_SET);
++		[[maybe_unused]] auto ret = write(fd, str.c_str(), str.size());
++	}
++
++	bool hasFlash_;
++	bool torchOn_;
++	bool strobeActive_;
++	int whiteBrightnessFd_;
++	int whiteStrobeFd_;
++	int whiteTimeoutFd_;
++	int whiteFlashBrightnessFd_;
++	int yellowBrightnessFd_;
++};
++
+ constexpr Size kNativeSize{ 2016, 1136 };
+ constexpr Size kFullSize{ 4032, 3024 };
+ constexpr Size kOutputSizes[] = {
+@@ -599,6 +712,9 @@ public:
+ 		bool aeLocked;
+ 		float exposureValue;
+ 		int32_t aeState;
++		int32_t flashMode;
++		int32_t flashState;
++		int32_t precaptureTrigger;
+ 	};
+ 	std::map<FrameBuffer *, FrameContext> frameContexts_;
+ 	std::map<uint32_t, FrameState> frameStates_;
+@@ -620,6 +736,24 @@ public:
+ 	AeHistogramTarget histogramTarget_;
+ 	std::optional<double> aecLuma_;
+ 
++	/* Flash & precapture state. */
++	enum class PreflashState {
++		Idle,
++		EnterSkip,
++		Settling,
++		Settled,
++	};
++	bool hasFlash_ = false;
++	PreflashState preflashState_ = PreflashState::Idle;
++	int preflashSkipFrames_ = 0;
++	int preflashSettledFrames_ = 0;
++	int preflashFrameCounter_ = 0;
++	float preflashIndex_ = 0.0f;
++	float mainFlashIndex_ = 0.0f;
++	int32_t flashMode_ = controls::draft::FlashModeOff;
++	int32_t flashState_ = controls::draft::FlashStateReady;
++	int32_t precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
++
+ 	/* AWB state. */
+ 	bool awbEnabled_ = true;
+ 	double awbGainR_ = 1.0;
+@@ -1071,6 +1206,20 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+ 	ctrls[&controls::AnalogueGain] = ControlInfo(
+ 		static_cast<float>(gainMin_), static_cast<float>(gainMax_),
+ 		static_cast<float>(aeGain_));
++	hasFlash_ = (sensorEntity->name().find("imx520") == std::string::npos);
++	if (hasFlash_) {
++		ctrls[&controls::draft::FlashMode] = ControlInfo(
++			static_cast<int32_t>(controls::draft::FlashModeOff),
++			static_cast<int32_t>(controls::draft::FlashModeTorch),
++			static_cast<int32_t>(controls::draft::FlashModeOff));
++		ctrls[&controls::draft::AePrecaptureTrigger] = ControlInfo(
++			static_cast<int32_t>(controls::draft::AePrecaptureTriggerIdle),
++			static_cast<int32_t>(controls::draft::AePrecaptureTriggerCancel),
++			static_cast<int32_t>(controls::draft::AePrecaptureTriggerIdle));
++		flashState_ = controls::draft::FlashStateReady;
++	} else {
++		flashState_ = controls::draft::FlashStateUnavailable;
++	}
+ 	ctrls[&controls::AwbEnable] = ControlInfo(false, true, true);
+ 	ctrls[&controls::ColourGains] = ControlInfo(0.25f, 8.0f, 1.0f);
+ 	if (qtiAwb_)
+@@ -1411,15 +1560,57 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+ 		if (ret)
+ 			return ret;
+ 	}
++
++	bool firingMainFlash = false;
++	if (hasFlash_ && flashMode_ == controls::draft::FlashModeSingle) {
++		firingMainFlash = true;
++		if (preflashState_ == PreflashState::Settled) {
++			double corrected = aeExposureForIndex(profile_, mainFlashIndex_);
++			double allocatedGain, allocatedExposure;
++			aeAllocateExposure(profile_, corrected, allocatedGain, allocatedExposure);
++			double exposureMinNs = exposureMin_ * lineDurationNs_;
++			double exposureMaxNs = exposureMax_ * lineDurationNs_;
++			allocatedGain = std::clamp(allocatedGain, gainMin_, gainMax_);
++			allocatedExposure = std::clamp(corrected / allocatedGain,
++						       exposureMinNs, exposureMaxNs);
++			allocatedGain = std::clamp(corrected / allocatedExposure,
++						   gainMin_, gainMax_);
++			aeExposure_ = allocatedExposure / lineDurationNs_;
++			aeGain_ = allocatedGain;
++		}
++		FlashDevice::instance().setTorch(false);
++		FlashDevice::instance().triggerFlash(900000, 200000);
++		flashMode_ = controls::draft::FlashModeOff;
++		preflashState_ = PreflashState::Idle;
++	}
++
+ 	context.sensor = ControlList(sensor_->controls());
+ 	context.sensor.set(V4L2_CID_EXPOSURE, static_cast<int32_t>(std::lround(aeExposure_)));
+ 	context.sensor.set(V4L2_CID_ANALOGUE_GAIN, gainToCode(profile_, aeGain_));
+ 	context.aeEnabled = aeEnabled_;
+ 	context.aeLocked = aeLocked_;
+ 	context.exposureValue = aeEnabled_ ? aeEvValue(aeEvStep_) : 0.0f;
+-	context.aeState = !aeEnabled_ ? controls::AeStateIdle
+-				      : (aeLocked_ || aeSettled_ ? controls::AeStateConverged
+-								 : controls::AeStateSearching);
++	if (!aeEnabled_) {
++		context.aeState = controls::AeStateIdle;
++	} else if (preflashState_ == PreflashState::EnterSkip || preflashState_ == PreflashState::Settling) {
++		context.aeState = 5; /* AeStatePrecapture */
++	} else if (preflashState_ == PreflashState::Settled) {
++		context.aeState = controls::AeStateConverged;
++	} else if (hasFlash_ && luxIndex_ && *luxIndex_ >= 280.0) {
++		context.aeState = 4; /* AeStateFlashRequired */
++	} else {
++		context.aeState = (aeLocked_ || aeSettled_) ? controls::AeStateConverged
++							     : controls::AeStateSearching;
++	}
++	context.flashMode = firingMainFlash ? controls::draft::FlashModeSingle : flashMode_;
++	context.precaptureTrigger = precaptureTrigger_;
++	precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
++	if (!hasFlash_)
++		context.flashState = controls::draft::FlashStateUnavailable;
++	else if (firingMainFlash)
++		context.flashState = controls::draft::FlashStateFlashFired;
++	else
++		context.flashState = controls::draft::FlashStateReady;
+ 	ret = sensor_->device()->setControls(&context.sensor, context.request.get());
+ 	if (ret)
+ 		return ret;
+@@ -1807,7 +1997,35 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+ 	LOG(QcomPipeline, Debug) << "AE luma " << luma << " target " << target
+ 				 << " index " << *luxIndex_ << " exposure "
+ 				 << aeExposure_ << " gain " << aeGain_;
+-	return result.settled;
++
++	bool aeSettled = result.settled;
++	if (hasFlash_ && preflashState_ != PreflashState::Idle) {
++		if (preflashState_ == PreflashState::EnterSkip) {
++			if (--preflashSkipFrames_ <= 0)
++				preflashState_ = PreflashState::Settling;
++			aeSettled = false;
++		} else if (preflashState_ == PreflashState::Settling) {
++			preflashFrameCounter_++;
++			if (result.settled)
++				preflashSettledFrames_++;
++			else
++				preflashSettledFrames_ = 0;
++
++			if (preflashSettledFrames_ >= 3 || preflashFrameCounter_ >= 12) {
++				preflashState_ = PreflashState::Settled;
++				preflashIndex_ = result.index;
++				float deltaIndex = std::log2(9.0f) * profile_.aeLuxLogScale;
++				mainFlashIndex_ = std::clamp(preflashIndex_ - deltaIndex, minimumIndex, maximumIndex);
++				LOG(QcomPipeline, Debug) << "Flash precapture settled: preflash index "
++							 << preflashIndex_ << " main flash target index "
++							 << mainFlashIndex_;
++			}
++			aeSettled = (preflashState_ == PreflashState::Settled);
++		} else if (preflashState_ == PreflashState::Settled) {
++			aeSettled = true;
++		}
++	}
++	return aeSettled;
+ }
+ 
+ void QcomCameraData::updateAwb(bool aeSettled)
+@@ -2131,6 +2349,37 @@ int QcomCameraData::processControls(const ControlList &controls)
+ 	if (aeEnabled_ && controls.contains(controls::ExposureValue.id()))
+ 		aeEvStep_ = aeEvStep(*controls.get(controls::ExposureValue));
+ 
++	if (hasFlash_) {
++		if (controls.contains(controls::draft::FlashMode.id())) {
++			int32_t mode = *controls.get(controls::draft::FlashMode);
++			flashMode_ = mode;
++			if (mode == controls::draft::FlashModeTorch)
++				FlashDevice::instance().setTorch(true, 255);
++			else if (mode == controls::draft::FlashModeOff && preflashState_ == PreflashState::Idle)
++				FlashDevice::instance().setTorch(false);
++		}
++
++		if (controls.contains(controls::draft::AePrecaptureTrigger.id())) {
++			int32_t trigger = *controls.get(controls::draft::AePrecaptureTrigger);
++			precaptureTrigger_ = trigger;
++			if (trigger == controls::draft::AePrecaptureTriggerStart) {
++				if (preflashState_ == PreflashState::Idle) {
++					preflashState_ = PreflashState::EnterSkip;
++					preflashSkipFrames_ = (sensor_->entity()->name().find("imx363") != std::string::npos) ? 3 : 2;
++					preflashSettledFrames_ = 0;
++					preflashFrameCounter_ = 0;
++					FlashDevice::instance().setTorch(true, 255);
++					LOG(QcomPipeline, Debug) << "Flash precapture started";
++				}
++			} else if (trigger == controls::draft::AePrecaptureTriggerCancel) {
++				preflashState_ = PreflashState::Idle;
++				if (flashMode_ != controls::draft::FlashModeTorch)
++					FlashDevice::instance().turnOff();
++				LOG(QcomPipeline, Debug) << "Flash precapture cancelled";
++			}
++		}
++	}
++
+ 	if (controls.contains(controls::AwbEnable.id())) {
+ 		bool enabled = *controls.get(controls::AwbEnable);
+ 		bool restart = enabled && !awbEnabled_;
+@@ -2304,6 +2553,9 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+ 	metadata.set(controls::draft::AeLock, context.aeLocked);
+ 	metadata.set(controls::ExposureValue, context.exposureValue);
+ 	metadata.set(controls::AeState, context.aeState);
++	metadata.set(controls::draft::FlashMode, context.flashMode);
++	metadata.set(controls::draft::FlashState, context.flashState);
++	metadata.set(controls::draft::AePrecaptureTrigger, context.precaptureTrigger);
+ 	if (afEnabled_) {
+ 		metadata.set(controls::AfMode, state.afMode);
+ 		metadata.set(controls::AfState, state.afState);
+@@ -2462,6 +2717,10 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	data->lockedIndex_ = 0.0f;
+ 	data->lockedEvStep_ = 0;
+ 	data->aeSettled_ = false;
++	data->preflashState_ = QcomCameraData::PreflashState::Idle;
++	data->flashMode_ = controls::draft::FlashModeOff;
++	data->precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
++	FlashDevice::instance().turnOff();
+ 	data->frameStates_.clear();
+ 	data->frameContexts_.clear();
+ 	data->afSceneChange_.reset();
+@@ -2515,6 +2774,14 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+ {
+ 	QcomCameraData *data = cameraData(camera);
+ 
++	if (data->hasFlash_) {
++		FlashDevice::instance().turnOff();
++		data->flashMode_ = controls::draft::FlashModeOff;
++		data->preflashState_ = QcomCameraData::PreflashState::Idle;
++		data->flashState_ = controls::draft::FlashStateReady;
++		data->precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
++	}
++
+ 	V4L2Subdevice *ois = data->sensor_->ois();
+ 	if (ois) {
+ 		ControlList ctrls(ois->controls());
