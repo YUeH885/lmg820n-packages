@@ -1,0 +1,169 @@
+From: The LM-G820N Linux contributors <yuzu23234@gmail.com>
+Subject: [PATCH] add optical image stabilization control and runtime handling
+
+Expose draft::OpticalImageStabilizationMode in control_ids_draft.yaml
+and Android camera HAL. Support dynamic runtime OIS control on cameras
+equipped with an OIS actuator (IMX363 with LC898124EP1).
+---
+diff -Naur libcamera-0.7.2/src/android/camera_capabilities.cpp libcamera-0.7.2-modified/src/android/camera_capabilities.cpp
+--- libcamera-0.7.2/src/android/camera_capabilities.cpp	2026-10-30 19:11:28.034147823 +0800
++++ libcamera-0.7.2-modified/src/android/camera_capabilities.cpp	2026-10-30 19:06:59.404498398 +0800
+@@ -1279,6 +1279,9 @@
+ 	std::vector<uint8_t> opticalStabilizations = {
+ 		ANDROID_LENS_OPTICAL_STABILIZATION_MODE_OFF,
+ 	};
++	if (camera_->controls().contains(controls::draft::OpticalImageStabilizationMode.id()))
++		opticalStabilizations.push_back(ANDROID_LENS_OPTICAL_STABILIZATION_MODE_ON);
++
+ 	staticMetadata_->addEntry(ANDROID_LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION,
+ 				  opticalStabilizations);
+ 
+diff -Naur libcamera-0.7.2/src/android/camera_device.cpp libcamera-0.7.2-modified/src/android/camera_device.cpp
+--- libcamera-0.7.2/src/android/camera_device.cpp	2026-10-30 19:11:28.034333263 +0800
++++ libcamera-0.7.2-modified/src/android/camera_device.cpp	2026-10-30 19:07:38.371963953 +0800
+@@ -834,6 +834,14 @@
+ 		controls.set(controls::draft::FlashMode, flashMode);
+ 	}
+ 
++	if (settings.getEntry(ANDROID_LENS_OPTICAL_STABILIZATION_MODE, &entry)) {
++		const uint8_t *data = entry.data.u8;
++		controls.set(controls::draft::OpticalImageStabilizationMode,
++			     data[0] == ANDROID_LENS_OPTICAL_STABILIZATION_MODE_ON
++				     ? controls::draft::OpticalImageStabilizationModeOn
++				     : controls::draft::OpticalImageStabilizationModeOff);
++	}
++
+ 	if (settings.getEntry(ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER, &entry)) {
+ 		const uint8_t *data = entry.data.u8;
+ 		int32_t trigger = controls::draft::AePrecaptureTriggerIdle;
+@@ -1609,6 +1617,11 @@
+ 	resultMetadata->addEntry(ANDROID_LENS_STATE, value);
+ 
+ 	value = ANDROID_LENS_OPTICAL_STABILIZATION_MODE_OFF;
++	if (metadata.contains(controls::draft::OpticalImageStabilizationMode)) {
++		if (metadata.get(controls::draft::OpticalImageStabilizationMode) ==
++		    controls::draft::OpticalImageStabilizationModeOn)
++			value = ANDROID_LENS_OPTICAL_STABILIZATION_MODE_ON;
++	}
+ 	resultMetadata->addEntry(ANDROID_LENS_OPTICAL_STABILIZATION_MODE,
+ 				 value);
+ 
+diff -Naur libcamera-0.7.2/src/libcamera/control_ids_draft.yaml libcamera-0.7.2-modified/src/libcamera/control_ids_draft.yaml
+--- libcamera-0.7.2/src/libcamera/control_ids_draft.yaml	2026-10-30 19:11:28.034512561 +0800
++++ libcamera-0.7.2-modified/src/libcamera/control_ids_draft.yaml	2026-10-30 19:06:49.480634890 +0800
+@@ -76,6 +76,20 @@
+           value: 4
+           description: Flash fired at lower power.
+ 
++  - OpticalImageStabilizationMode:
++      type: int32_t
++      direction: inout
++      description: |
++        Control to select optical image stabilization mode. Currently identical to
++        ANDROID_LENS_OPTICAL_STABILIZATION_MODE.
++      enum:
++        - name: OpticalImageStabilizationModeOff
++          value: 0
++          description: Optical image stabilization will not be active.
++        - name: OpticalImageStabilizationModeOn
++          value: 1
++          description: Optical image stabilization will be active.
++
+   - NoiseReductionMode:
+       type: int32_t
+       direction: inout
+diff -Naur libcamera-0.7.2/src/libcamera/pipeline/qcom/qcom.cpp libcamera-0.7.2-modified/src/libcamera/pipeline/qcom/qcom.cpp
+--- libcamera-0.7.2/src/libcamera/pipeline/qcom/qcom.cpp	2026-10-30 19:11:28.034762623 +0800
++++ libcamera-0.7.2-modified/src/libcamera/pipeline/qcom/qcom.cpp	2026-10-30 19:09:40.982296389 +0800
+@@ -867,6 +867,7 @@
+ 		int32_t flashMode;
+ 		int32_t flashState;
+ 		int32_t precaptureTrigger;
++		int32_t oisMode;
+ 	};
+ 	std::map<FrameBuffer *, FrameContext> frameContexts_;
+ 	std::map<uint32_t, FrameState> frameStates_;
+@@ -912,6 +913,10 @@
+ 	std::array<float, 256> ambientZoneLuma_{};
+ 	std::array<float, 256> preflashZoneLuma_{};
+ 
++	/* OIS state. */
++	bool hasOis_ = false;
++	int32_t oisMode_ = controls::draft::OpticalImageStabilizationModeOn;
++
+ 	/* AWB state. */
+ 	bool awbEnabled_ = true;
+ 	double awbGainR_ = 1.0;
+@@ -1378,6 +1383,14 @@
+ 	} else {
+ 		flashState_ = controls::draft::FlashStateUnavailable;
+ 	}
++	hasOis_ = (sensor_->ois() != nullptr);
++	if (hasOis_) {
++		oisMode_ = controls::draft::OpticalImageStabilizationModeOn;
++		ctrls[&controls::draft::OpticalImageStabilizationMode] = ControlInfo(
++			static_cast<int32_t>(controls::draft::OpticalImageStabilizationModeOff),
++			static_cast<int32_t>(controls::draft::OpticalImageStabilizationModeOn),
++			static_cast<int32_t>(controls::draft::OpticalImageStabilizationModeOn));
++	}
+ 	ctrls[&controls::AwbEnable] = ControlInfo(false, true, true);
+ 	ctrls[&controls::ColourGains] = ControlInfo(0.25f, 8.0f, 1.0f);
+ 	if (qtiAwb_)
+@@ -1768,6 +1781,7 @@
+ 	}
+ 	context.flashMode = firingMainFlash ? controls::draft::FlashModeSingle : flashMode_;
+ 	context.precaptureTrigger = precaptureTrigger_;
++	context.oisMode = oisMode_;
+ 	precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
+ 	if (!hasFlash_)
+ 		context.flashState = controls::draft::FlashStateUnavailable;
+@@ -2582,6 +2596,24 @@
+ 		}
+ 	}
+ 
++	if (hasOis_ && controls.contains(controls::draft::OpticalImageStabilizationMode.id())) {
++		int32_t mode = *controls.get(controls::draft::OpticalImageStabilizationMode);
++		if (mode != oisMode_) {
++			oisMode_ = mode;
++			V4L2Subdevice *ois = sensor_->ois();
++			if (ois) {
++				ControlList oisCtrls(ois->controls());
++				oisCtrls.set(V4L2_CID_IMAGE_STABILIZATION,
++					     mode == controls::draft::OpticalImageStabilizationModeOn ? 1 : 0);
++				int oisRet = ois->setControls(&oisCtrls);
++				if (oisRet)
++					LOG(QcomPipeline, Error) << "Failed to set OIS mode: " << oisRet;
++				else
++					LOG(QcomPipeline, Debug) << "OIS mode set to " << mode;
++			}
++		}
++	}
++
+ 	if (controls.contains(controls::AwbEnable.id())) {
+ 		bool enabled = *controls.get(controls::AwbEnable);
+ 		bool restart = enabled && !awbEnabled_;
+@@ -2758,6 +2790,8 @@
+ 	metadata.set(controls::draft::FlashMode, context.flashMode);
+ 	metadata.set(controls::draft::FlashState, context.flashState);
+ 	metadata.set(controls::draft::AePrecaptureTrigger, context.precaptureTrigger);
++	if (hasOis_)
++		metadata.set(controls::draft::OpticalImageStabilizationMode, context.oisMode);
+ 	if (afEnabled_) {
+ 		metadata.set(controls::AfMode, state.afMode);
+ 		metadata.set(controls::AfState, state.afState);
+@@ -2970,6 +3004,7 @@
+ 			stopDevice(camera);
+ 			return ret;
+ 		}
++		data->oisMode_ = controls::draft::OpticalImageStabilizationModeOn;
+ 	}
+ 
+ 	return 0;
+@@ -2996,6 +3031,7 @@
+ 		int ret = ois->setControls(&ctrls);
+ 		if (ret)
+ 			LOG(QcomPipeline, Error) << "Failed to disable OIS: " << ret;
++		data->oisMode_ = controls::draft::OpticalImageStabilizationModeOn;
+ 	}
+ 
+ 	data->video_->streamOff();
