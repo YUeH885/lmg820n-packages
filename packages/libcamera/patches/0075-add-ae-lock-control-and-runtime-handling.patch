@@ -1,0 +1,248 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add AE lock control and runtime handling
+
+Expose draft AeLock control and support ANDROID_CONTROL_AE_LOCK in Android
+HAL. When AE lock is enabled, capture the current exposure index and EV
+offset as baseline, freeze automatic convergence adjustments, apply EV
+offset deltas directly to the locked index, and publish draft AeLock and
+AeState controls in request metadata.
+
+--- a/src/libcamera/control_ids_draft.yaml
++++ b/src/libcamera/control_ids_draft.yaml
+@@ -8,6 +8,14 @@
+ # set through Request::controls() and returned out through Request::metadata().
+ vendor: draft
+ controls:
++  - AeLock:
++      type: bool
++      direction: inout
++      description: |
++        Control for AE lock. Currently identical to ANDROID_CONTROL_AE_LOCK.
++
++        Whether the camera device will lock automatic exposure algorithm.
++
+   - AePrecaptureTrigger:
+       type: int32_t
+       direction: inout
+
+--- a/src/android/camera_capabilities.cpp
++++ b/src/android/camera_capabilities.cpp
+@@ -1010,7 +1010,7 @@
+ 	staticMetadata_->addEntry(ANDROID_CONTROL_SCENE_MODE_OVERRIDES,
+ 				  sceneModesOverride);
+ 
+-	uint8_t aeLockAvailable = ANDROID_CONTROL_AE_LOCK_AVAILABLE_FALSE;
++	uint8_t aeLockAvailable = ANDROID_CONTROL_AE_LOCK_AVAILABLE_TRUE;
+ 	staticMetadata_->addEntry(ANDROID_CONTROL_AE_LOCK_AVAILABLE,
+ 				  aeLockAvailable);
+ 
+
+--- a/src/android/camera_device.cpp
++++ b/src/android/camera_device.cpp
+@@ -819,6 +819,11 @@
+ 		controls.set(controls::draft::FaceDetectMode, data[0]);
+ 	}
+ 
++	if (settings.getEntry(ANDROID_CONTROL_AE_LOCK, &entry)) {
++		const uint8_t *data = entry.data.u8;
++		controls.set(controls::draft::AeLock, data[0] == ANDROID_CONTROL_AE_LOCK_ON);
++	}
++
+ 	if (settings.getEntry(ANDROID_SENSOR_TEST_PATTERN_MODE, &entry)) {
+ 		const int32_t data = *entry.data.i32;
+ 		int32_t testPatternMode = controls::draft::TestPatternModeOff;
+@@ -1468,7 +1473,11 @@
+ 	resultMetadata->addEntry(ANDROID_CONTROL_AE_EXPOSURE_COMPENSATION,
+ 				 value32);
+ 
+-	value = ANDROID_CONTROL_AE_LOCK_OFF;
++	bool aeLocked = false;
++	if (metadata.contains(controls::draft::AeLock))
++		aeLocked = metadata.get(controls::draft::AeLock);
++
++	value = aeLocked ? ANDROID_CONTROL_AE_LOCK_ON : ANDROID_CONTROL_AE_LOCK_OFF;
+ 	resultMetadata->addEntry(ANDROID_CONTROL_AE_LOCK, value);
+ 
+ 	value = ANDROID_CONTROL_AE_MODE_ON;
+@@ -1488,7 +1497,7 @@
+ 			(uint8_t)ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_IDLE;
+ 	resultMetadata->addEntry(ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER, value);
+ 
+-	value = ANDROID_CONTROL_AE_STATE_CONVERGED;
++	value = aeLocked ? ANDROID_CONTROL_AE_STATE_LOCKED : ANDROID_CONTROL_AE_STATE_CONVERGED;
+ 	resultMetadata->addEntry(ANDROID_CONTROL_AE_STATE, value);
+ 
+ 	value = ANDROID_CONTROL_AF_MODE_OFF;
+
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -596,7 +596,9 @@
+ 		IfeState ife;
+ 		ControlList sensor;
+ 		bool aeEnabled;
++		bool aeLocked;
+ 		float exposureValue;
++		int32_t aeState;
+ 	};
+ 	std::map<FrameBuffer *, FrameContext> frameContexts_;
+ 	std::map<uint32_t, FrameState> frameStates_;
+@@ -607,6 +609,10 @@
+ 
+ 	/* AE state. */
+ 	bool aeEnabled_ = true;
++	bool aeLocked_ = false;
++	float lockedIndex_ = 0.0f;
++	int lockedEvStep_ = 0;
++	bool aeSettled_ = false;
+ 	int aeEvStep_ = 0;
+ 	double aeExposure_ = 1000.0;
+ 	double aeGain_ = 1.0;
+@@ -1056,6 +1062,7 @@
+ 
+ 	ControlInfoMap::Map ctrls;
+ 	ctrls[&controls::AeEnable] = ControlInfo(false, true, true);
++	ctrls[&controls::draft::AeLock] = ControlInfo(false, true, false);
+ 	ctrls[&controls::ExposureValue] = ControlInfo(kAeMinEv, kAeMaxEv, 0.0f);
+ 	ctrls[&controls::ExposureTime] = ControlInfo(
+ 		static_cast<int32_t>(exposureMin_ * lineDurationNs_ / 1000.0),
+@@ -1408,7 +1415,11 @@
+ 	context.sensor.set(V4L2_CID_EXPOSURE, static_cast<int32_t>(std::lround(aeExposure_)));
+ 	context.sensor.set(V4L2_CID_ANALOGUE_GAIN, gainToCode(profile_, aeGain_));
+ 	context.aeEnabled = aeEnabled_;
++	context.aeLocked = aeLocked_;
+ 	context.exposureValue = aeEnabled_ ? aeEvValue(aeEvStep_) : 0.0f;
++	context.aeState = !aeEnabled_ ? controls::AeStateIdle
++				      : (aeLocked_ || aeSettled_ ? controls::AeStateConverged
++								 : controls::AeStateSearching);
+ 	ret = sensor_->device()->setControls(&context.sensor, context.request.get());
+ 	if (ret)
+ 		return ret;
+@@ -1601,7 +1612,7 @@
+ 	}
+ 	aecLuma_ = measuredLuma();
+ 
+-	bool aeSettled = !aeEnabled_;
++	bool aeSettled = !aeEnabled_ || aeLocked_;
+ 	if (aecLuma_) {
+ 		uint32_t sequence = qcom::inputSequence(request.sequence);
+ 		double exposure = request.exposure_lines * lineDurationNs_;
+@@ -1613,6 +1624,7 @@
+ 		if (aeEnabled_)
+ 			aeSettled = updateAe(sequence, *aecLuma_, appliedIndex);
+ 	}
++	aeSettled_ = aeSettled;
+ 	if (awbEnabled_)
+ 		updateAwb(aeSettled);
+ 	if (afEnabled_)
+@@ -1720,6 +1732,39 @@
+ 	float currentIndex = aeExposureIndex(profile_, requested);
+ 	float minimumIndex = aeExposureIndex(profile_, exposureMin_ * lineDurationNs_ * gainMin_);
+ 	float maximumIndex = aeExposureIndex(profile_, exposureMax_ * lineDurationNs_ * gainMax_);
++	if (aeLocked_) {
++		float evDelta = aeEvOffset(aeEvStep_, profile_.aeLuxLogScale) -
++				aeEvOffset(lockedEvStep_, profile_.aeLuxLogScale);
++		float activeIndex = std::clamp(lockedIndex_ + evDelta, minimumIndex, maximumIndex);
++		LOG(QcomPipeline, Debug) << std::setprecision(9)
++			<< "AE locked frame " << sequence << " baseline " << lockedIndex_
++			<< " locked EV " << aeEvValue(lockedEvStep_) << " current EV " << aeEvValue(aeEvStep_)
++			<< " offset " << evDelta << " active " << activeIndex;
++
++		double corrected = aeExposureForIndex(profile_, activeIndex);
++		if (activeIndex == minimumIndex)
++			corrected = exposureMin_ * lineDurationNs_ * gainMin_;
++		else if (activeIndex == maximumIndex)
++			corrected = exposureMax_ * lineDurationNs_ * gainMax_;
++		double allocatedGain, allocatedExposure;
++		aeAllocateExposure(profile_, corrected, allocatedGain, allocatedExposure);
++
++		double exposureMinNs = exposureMin_ * lineDurationNs_;
++		double exposureMaxNs = exposureMax_ * lineDurationNs_;
++		allocatedGain = std::clamp(allocatedGain, gainMin_, gainMax_);
++		allocatedExposure = std::clamp(corrected / allocatedGain,
++					       exposureMinNs, exposureMaxNs);
++		allocatedGain = std::clamp(corrected / allocatedExposure,
++					   gainMin_, gainMax_);
++
++		aeExposure_ = allocatedExposure / lineDurationNs_;
++		aeGain_ = allocatedGain;
++
++		LOG(QcomPipeline, Debug) << "AE locked luma " << luma << " target " << target
++					 << " index " << *luxIndex_ << " exposure "
++					 << aeExposure_ << " gain " << aeGain_;
++		return true;
++	}
+ 	uint32_t nextRequest;
+ 	int ret = video_->ioctl(VIDIOC_QCOM_CAMSS_GET_REQUEST_SEQUENCE, &nextRequest);
+ 	if (ret) {
+@@ -2029,7 +2074,16 @@
+ int QcomCameraData::processControls(const ControlList &controls)
+ {
+ 	if (controls.contains(controls::AeEnable.id())) {
+-		aeEnabled_ = *controls.get(controls::AeEnable);
++		bool enabled = *controls.get(controls::AeEnable);
++		bool resumeAuto = enabled && !aeEnabled_;
++		aeEnabled_ = enabled;
++		if (resumeAuto && aeLocked_) {
++			int32_t expLines = std::lround(aeExposure_);
++			int32_t gainCode = gainToCode(profile_, aeGain_);
++			double total = expLines * lineDurationNs_ * gainFromCode(profile_, gainCode);
++			lockedIndex_ = aeExposureIndex(profile_, total);
++			lockedEvStep_ = aeEvStep_;
++		}
+ 		if (!aeEnabled_) {
+ 			if (controls.contains(controls::ExposureTime.id())) {
+ 				int32_t us = *controls.get(controls::ExposureTime);
+@@ -2056,6 +2110,24 @@
+ 		}
+ 	}
+ 
++	if (controls.contains(controls::draft::AeLock.id())) {
++		bool lock = *controls.get(controls::draft::AeLock);
++		if (lock != aeLocked_) {
++			aeLocked_ = lock;
++			if (aeLocked_) {
++				int32_t expLines = std::lround(aeExposure_);
++				int32_t gainCode = gainToCode(profile_, aeGain_);
++				double total = expLines * lineDurationNs_ * gainFromCode(profile_, gainCode);
++				lockedIndex_ = aeExposureIndex(profile_, total);
++				lockedEvStep_ = aeEvStep_;
++				LOG(QcomPipeline, Debug) << "AEC locked at EV " << aeEvValue(lockedEvStep_)
++							 << " index " << lockedIndex_;
++			} else {
++				LOG(QcomPipeline, Debug) << "AEC unlocked";
++			}
++		}
++	}
++
+ 	if (aeEnabled_ && controls.contains(controls::ExposureValue.id()))
+ 		aeEvStep_ = aeEvStep(*controls.get(controls::ExposureValue));
+ 
+@@ -2229,7 +2301,9 @@
+ 	}
+ 	const FrameState &state = std::prev(it)->second;
+ 	metadata.set(controls::AeEnable, context.aeEnabled);
++	metadata.set(controls::draft::AeLock, context.aeLocked);
+ 	metadata.set(controls::ExposureValue, context.exposureValue);
++	metadata.set(controls::AeState, context.aeState);
+ 	if (afEnabled_) {
+ 		metadata.set(controls::AfMode, state.afMode);
+ 		metadata.set(controls::AfState, state.afState);
+@@ -2384,6 +2458,10 @@
+ 	data->luxIndex_.reset();
+ 	data->histogramTarget_.reset();
+ 	data->aecLuma_.reset();
++	data->aeLocked_ = false;
++	data->lockedIndex_ = 0.0f;
++	data->lockedEvStep_ = 0;
++	data->aeSettled_ = false;
+ 	data->frameStates_.clear();
+ 	data->frameContexts_.clear();
+ 	data->afSceneChange_.reset();
+@@ -2451,6 +2529,7 @@
+ 	data->video_->releaseBuffers();
+ 	data->frameContexts_.clear();
+ 	data->lastStatsSequence_ = UINT32_MAX;
++	data->aeLocked_ = false;
+ 	data->closeAncillaryDevices();
+ 	if (activeCamera_ == camera)
+ 		activeCamera_ = nullptr;
