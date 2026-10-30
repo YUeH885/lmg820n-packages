@@ -1,0 +1,138 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: bind face detection controls and metadata to pipeline
+
+Expose draft FaceDetectMode, FaceDetectFaceRectangles and
+FaceDetectFaceScores controls on front camera pipeline. Process incoming
+face detection request controls by selecting the largest face area
+matching factory FaceSizeSort behavior, normalize coordinates to the
+sensor active input array, feed into QtiAwbFront, and publish detected
+face results to request metadata.
+
+--- a/src/libcamera/pipeline/qcom/qcom.cpp	2026-10-30 14:32:56.981005434 +0800
++++ b/src/libcamera/pipeline/qcom/qcom.cpp	2026-10-30 14:51:09.932110428 +0800
+@@ -620,6 +620,9 @@
+ 	double awbGainB_ = 1.0;
+ 	double awbGainG_ = 1.0;
+ 	std::unique_ptr<QtiAwbFront> qtiAwb_;
++	std::optional<QtiAwbFaceRectangle> faceRect_;
++	int32_t faceDetectMode_ = controls::draft::FaceDetectModeOff;
++	uint8_t reportedFaceScore_ = 0;
+ 	std::unique_ptr<LgAwbPipeline> lgAwb_;
+ 	std::unique_ptr<LgAwbFlatInput> lgFlat_;
+ 	LgAwbBgStatistics lgBg_;
+@@ -1062,8 +1065,21 @@
+ 		static_cast<float>(aeGain_));
+ 	ctrls[&controls::AwbEnable] = ControlInfo(false, true, true);
+ 	ctrls[&controls::ColourGains] = ControlInfo(0.25f, 8.0f, 1.0f);
+-	if (qtiAwb_)
++	if (qtiAwb_) {
+ 		ctrls[&controls::ColourTemperature] = ControlInfo(1500, 12000, 5000);
++		ctrls[&controls::draft::FaceDetectMode] = ControlInfo(
++			{ { ControlValue(controls::draft::FaceDetectModeOff),
++			    ControlValue(controls::draft::FaceDetectModeSimple),
++			    ControlValue(controls::draft::FaceDetectModeFull) } },
++			ControlValue(controls::draft::FaceDetectModeOff));
++		ctrls[&controls::draft::FaceDetectFaceRectangles] = ControlInfo(
++			Rectangle{},
++			Rectangle(statsInputSize_.width, statsInputSize_.height,
++				  statsInputSize_.width, statsInputSize_.height),
++			Rectangle{});
++		ctrls[&controls::draft::FaceDetectFaceScores] = ControlInfo(
++			static_cast<uint8_t>(0), static_cast<uint8_t>(100), static_cast<uint8_t>(0));
++	}
+ 	ctrls[&controls::DigitalGain] = ControlInfo(1.0f, 4095.0f / 128, 1.0f);
+ 	if (afEnabled_) {
+ 		ctrls[&controls::AfMode] = ControlInfo(
+@@ -1300,6 +1316,8 @@
+ 	}
+ 	if (qtiAwb_) {
+ 		qtiAwb_->reset();
++		faceRect_.reset();
++		reportedFaceScore_ = 0;
+ 		if (awbEnabled_) {
+ 			auto initial = profile_.awbConfiguration().initial;
+ 			auto gains = qtiAwb_->initialGains();
+@@ -1751,10 +1769,16 @@
+ 		unsigned int width = (statsInputSize_.width / QtiAwbFront::Width) & ~1U;
+ 		unsigned int height = (statsInputSize_.height / QtiAwbFront::Height) & ~1U;
+ 		float lux = *luxIndex_;
+-		auto result = qtiAwb_->process({ awb_.data(), 14, width * height, lux, 0 });
++		const QtiAwbFaceRectangle *face = faceRect_ ? &*faceRect_ : nullptr;
++		auto result = qtiAwb_->process({ awb_.data(), 14, width * height, lux, 0, face });
+ 		colourTemperature_ = result.cct;
+ 		interpolateCcm(profile_, colourTemperature_, ccmQ7_);
+ 		setIfeWb(result.gains[0], result.gains[1], result.gains[2]);
++		if (result.faceFrame.detectedFrames && result.faceStatistics.count > 0)
++			reportedFaceScore_ = static_cast<uint8_t>(
++				std::clamp(std::round(result.faceResult.confidence * 100.0f), 0.0f, 100.0f));
++		else
++			reportedFaceScore_ = 0;
+ 		LOG(QcomPipeline, Debug) << std::setprecision(9)
+ 			<< "QTI AWB stats " << lastStatsSequence_ << " frame " << awbFrame_++
+ 			<< " lux " << lux << " pixels " << width * height
+@@ -2037,9 +2061,43 @@
+ 		if (auto gains = controls.get(controls::ColourGains)) {
+ 			setManualAwb((*gains)[0], (*gains)[1], cct);
+ 		} else if (cct) {
+-			auto gains = qtiAwb_->manualGains(*cct);
+-			setManualAwb(gains[0], gains[1], cct);
++			auto manualGains = qtiAwb_->manualGains(*cct);
++			setManualAwb(manualGains[0], manualGains[1], cct);
++		}
++	}
++
++	if (controls.contains(controls::draft::FaceDetectMode.id()))
++		faceDetectMode_ = *controls.get(controls::draft::FaceDetectMode);
++
++	if (qtiAwb_ && faceDetectMode_ != controls::draft::FaceDetectModeOff &&
++	    controls.contains(controls::draft::FaceDetectFaceRectangles.id())) {
++		auto rects = controls.get(controls::draft::FaceDetectFaceRectangles);
++		if (rects && !rects->empty()) {
++			const Rectangle *primaryFace = nullptr;
++			uint64_t maxArea = 0;
++			for (const auto &r : *rects) {
++				uint64_t area = static_cast<uint64_t>(r.width) * r.height;
++				if (area > maxArea) {
++					maxArea = area;
++					primaryFace = &r;
++				}
++			}
++			if (primaryFace && statsInputSize_.width > 0 && statsInputSize_.height > 0) {
++				float invW = 1.0f / static_cast<float>(statsInputSize_.width);
++				float invH = 1.0f / static_cast<float>(statsInputSize_.height);
++				float nx = std::clamp(static_cast<float>(primaryFace->x) * invW, 0.0f, 1.0f);
++				float ny = std::clamp(static_cast<float>(primaryFace->y) * invH, 0.0f, 1.0f);
++				float nw = std::clamp(static_cast<float>(primaryFace->width) * invW, 0.0f, 1.0f - nx);
++				float nh = std::clamp(static_cast<float>(primaryFace->height) * invH, 0.0f, 1.0f - ny);
++				faceRect_ = QtiAwbFaceRectangle{ nx, ny, nw, nh };
++			} else {
++				faceRect_.reset();
++			}
++		} else {
++			faceRect_.reset();
+ 		}
++	} else if (faceDetectMode_ == controls::draft::FaceDetectModeOff) {
++		faceRect_.reset();
+ 	}
+ 
+ 	if (afEnabled_ && controls.contains(controls::AfMode.id())) {
+@@ -2152,6 +2210,19 @@
+ 		metadata.set(controls::FocusFoM,
+ 		     static_cast<int32_t>(std::clamp(focusScore() / 1000.0,
+ 						     0.0, 2147483647.0)));
++
++	if (qtiAwb_ && faceDetectMode_ != controls::draft::FaceDetectModeOff) {
++		metadata.set(controls::draft::FaceDetectMode, faceDetectMode_);
++		if (faceRect_ && reportedFaceScore_ > 0) {
++			Rectangle r(
++				static_cast<int32_t>(std::round(faceRect_->x * statsInputSize_.width)),
++				static_cast<int32_t>(std::round(faceRect_->y * statsInputSize_.height)),
++				static_cast<int32_t>(std::round(faceRect_->width * statsInputSize_.width)),
++				static_cast<int32_t>(std::round(faceRect_->height * statsInputSize_.height)));
++			metadata.set(controls::draft::FaceDetectFaceRectangles, Span<const Rectangle>(&r, 1));
++			metadata.set(controls::draft::FaceDetectFaceScores, Span<const uint8_t>(&reportedFaceScore_, 1));
++		}
++	}
+ }
+ 
+ void QcomCameraData::imageBufferReady(FrameBuffer *buffer)
