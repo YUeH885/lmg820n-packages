@@ -162,9 +162,8 @@ index a67a999..390e5c5 100644
        type: int32_t
        direction: inout
 diff --git a/src/libcamera/pipeline/qcom/qcom.cpp b/src/libcamera/pipeline/qcom/qcom.cpp
-index 3b17cd6..8322f19 100644
---- a/src/libcamera/pipeline/qcom/qcom.cpp
-+++ b/src/libcamera/pipeline/qcom/qcom.cpp
+--- a/src/libcamera/pipeline/qcom/qcom.cpp	2026-10-30 18:32:13.999253411 +0800
++++ b/src/libcamera/pipeline/qcom/qcom.cpp	2026-10-30 18:33:09.432619419 +0800
 @@ -14,6 +14,7 @@
  #include <cstdint>
  #include <cstring>
@@ -181,7 +180,7 @@ index 3b17cd6..8322f19 100644
  #include <utility>
  #include <vector>
  
-@@ -80,6 +82,117 @@ LOG_DEFINE_CATEGORY(QcomPipeline)
+@@ -80,6 +82,269 @@
  
  namespace {
  
@@ -229,6 +228,11 @@ index 3b17cd6..8322f19 100644
 +		setSysfs(whiteTimeoutFd_, std::min<uint32_t>(timeoutUs, 500000));
 +		setSysfs(whiteStrobeFd_, 1);
 +		strobeActive_ = true;
++	}
++
++	void clearStrobe()
++	{
++		strobeActive_ = false;
 +	}
 +
 +	bool isTorchOn() const { return torchOn_; }
@@ -296,10 +300,157 @@ index 3b17cd6..8322f19 100644
 +	int yellowBrightnessFd_;
 +};
 +
++struct SmartFlashTuning {
++	bool smartEnabled;
++	float strength;
++	float floorPercentage;
++	float saturationPreventionStrength;
++	uint32_t minimumOffStatistics;
++	uint32_t brightLevel;
++	uint32_t brightLevelDifference;
++	uint32_t minimumLuma;
++	float minimumLumaAdjustment;
++	float fluxRatio;
++	bool flashTargetEnabled;
++};
++
++struct FlashEstimationResult {
++	float lumaOff;
++	float lumaLow;
++	float lumaHigh;
++	float flashInfluence;
++	float lumaTarget;
++	float targetIndex;
++};
++
++static SmartFlashTuning smartFlashTuningForSensor(const std::string &model)
++{
++	if (model.find("imx363") != std::string::npos) {
++		return {
++			.smartEnabled = false,
++			.strength = 1.3f,
++			.floorPercentage = 0.9f,
++			.saturationPreventionStrength = 0.6f,
++			.minimumOffStatistics = 3,
++			.brightLevel = 200,
++			.brightLevelDifference = 30,
++			.minimumLuma = 15,
++			.minimumLumaAdjustment = 1.0f,
++			.fluxRatio = 9.0f,
++			.flashTargetEnabled = true,
++		};
++	}
++	if (model.find("imx351") != std::string::npos || model.find("s5k3m5") != std::string::npos) {
++		return {
++			.smartEnabled = true,
++			.strength = 1.5f,
++			.floorPercentage = 0.9f,
++			.saturationPreventionStrength = 0.7f,
++			.minimumOffStatistics = 3,
++			.brightLevel = 190,
++			.brightLevelDifference = 30,
++			.minimumLuma = 15,
++			.minimumLumaAdjustment = 0.55f,
++			.fluxRatio = 9.0f,
++			.flashTargetEnabled = false,
++		};
++	}
++	return {
++		.smartEnabled = false,
++		.strength = 1.0f,
++		.floorPercentage = 1.0f,
++		.saturationPreventionStrength = 0.0f,
++		.minimumOffStatistics = 0,
++		.brightLevel = 255,
++		.brightLevelDifference = 0,
++		.minimumLuma = 0,
++		.minimumLumaAdjustment = 0.0f,
++		.fluxRatio = 1.0f,
++		.flashTargetEnabled = false,
++	};
++}
++
++static FlashEstimationResult estimateSmartFlash(
++	const SmartFlashTuning &tuning,
++	float aeLuxLogScale,
++	float minimumIndex,
++	float maximumIndex,
++	float ambientIndex,
++	float preflashIndex,
++	const std::array<float, 256> &ambientZoneLuma,
++	const std::array<float, 256> &preflashZoneLuma,
++	const float (*meteringWeights)[16],
++	float defaultTarget)
++{
++	float deltaIndex = ambientIndex - preflashIndex;
++	float exposureRatio = std::pow(10.0f, deltaIndex / aeLuxLogScale);
++
++	double weightSum = 0.0;
++	double lumaOffSum = 0.0;
++	double lumaLowSum = 0.0;
++
++	for (std::size_t i = 0; i < 256; ++i) {
++		float lumaOff = ambientZoneLuma[i];
++		float lumaLowNorm = preflashZoneLuma[i] * exposureRatio;
++		float deltaLuma = lumaLowNorm - lumaOff;
++
++		float smartWeight = 1.0f;
++		if (tuning.smartEnabled) {
++			if (deltaLuma > 1.0f) {
++				smartWeight = tuning.strength;
++				if (lumaLowNorm > static_cast<float>(tuning.brightLevel))
++					smartWeight *= (1.0f - tuning.saturationPreventionStrength);
++			} else {
++				smartWeight = tuning.floorPercentage;
++			}
++		}
++
++		float baseWeight = meteringWeights ? meteringWeights[i / 16][i % 16] : 1.0f;
++		float w = baseWeight * smartWeight;
++		weightSum += w;
++		lumaOffSum += w * lumaOff;
++		lumaLowSum += w * lumaLowNorm;
++	}
++
++	float lumaOff = weightSum > 0.0 ? static_cast<float>(lumaOffSum / weightSum) : 0.0f;
++	float lumaLow = weightSum > 0.0 ? static_cast<float>(lumaLowSum / weightSum) : 0.0f;
++	float lumaBounce = std::max(0.0f, lumaLow - lumaOff);
++
++	float lumaHigh = lumaOff + tuning.fluxRatio * lumaBounce;
++	float flashInfluence = lumaHigh > 0.0f ? (tuning.fluxRatio * lumaBounce) / lumaHigh : 0.0f;
++
++	float lumaTarget = defaultTarget;
++	if (tuning.flashTargetEnabled) {
++		float flashTarget = 22.0f;
++		if (ambientIndex >= 450.0f)
++			flashTarget = 14.0f;
++		else if (ambientIndex >= 362.0f)
++			flashTarget = 14.0f;
++		else if (ambientIndex >= 290.0f)
++			flashTarget = 18.0f;
++		else if (ambientIndex >= 166.0f)
++			flashTarget = 20.0f;
++		lumaTarget = defaultTarget * (1.0f - flashInfluence) + flashTarget * flashInfluence;
++	}
++
++	float ratio = lumaHigh / std::max(1.0f, lumaTarget);
++	float deltaTargetIndex = aeLuxLogScale * std::log10(std::max(0.01f, ratio));
++	float targetIndex = std::clamp(ambientIndex - deltaTargetIndex, minimumIndex, maximumIndex);
++
++	return {
++		lumaOff,
++		lumaLow,
++		lumaHigh,
++		flashInfluence,
++		lumaTarget,
++		targetIndex
++	};
++}
++
  constexpr Size kNativeSize{ 2016, 1136 };
  constexpr Size kFullSize{ 4032, 3024 };
  constexpr Size kOutputSizes[] = {
-@@ -599,6 +712,9 @@ public:
+@@ -599,6 +864,9 @@
  		bool aeLocked;
  		float exposureValue;
  		int32_t aeState;
@@ -309,7 +460,7 @@ index 3b17cd6..8322f19 100644
  	};
  	std::map<FrameBuffer *, FrameContext> frameContexts_;
  	std::map<uint32_t, FrameState> frameStates_;
-@@ -620,6 +736,24 @@ public:
+@@ -620,6 +888,30 @@
  	AeHistogramTarget histogramTarget_;
  	std::optional<double> aecLuma_;
  
@@ -327,18 +478,25 @@ index 3b17cd6..8322f19 100644
 +	int preflashFrameCounter_ = 0;
 +	float preflashIndex_ = 0.0f;
 +	float mainFlashIndex_ = 0.0f;
++	float ambientIndex_ = 0.0f;
++	float flashInfluence_ = 0.0f;
 +	int32_t flashMode_ = controls::draft::FlashModeOff;
 +	int32_t flashState_ = controls::draft::FlashStateReady;
 +	int32_t precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
++	SmartFlashTuning smartFlash_{};
++	mutable std::array<float, 256> currentZoneLuma_{};
++	std::array<float, 256> ambientZoneLuma_{};
++	std::array<float, 256> preflashZoneLuma_{};
 +
  	/* AWB state. */
  	bool awbEnabled_ = true;
  	double awbGainR_ = 1.0;
-@@ -1071,6 +1206,20 @@ int QcomCameraData::init(MediaEntity *sensorEntity)
+@@ -1071,6 +1363,21 @@
  	ctrls[&controls::AnalogueGain] = ControlInfo(
  		static_cast<float>(gainMin_), static_cast<float>(gainMax_),
  		static_cast<float>(aeGain_));
 +	hasFlash_ = (sensorEntity->name().find("imx520") == std::string::npos);
++	smartFlash_ = smartFlashTuningForSensor(sensorEntity->name());
 +	if (hasFlash_) {
 +		ctrls[&controls::draft::FlashMode] = ControlInfo(
 +			static_cast<int32_t>(controls::draft::FlashModeOff),
@@ -355,7 +513,7 @@ index 3b17cd6..8322f19 100644
  	ctrls[&controls::AwbEnable] = ControlInfo(false, true, true);
  	ctrls[&controls::ColourGains] = ControlInfo(0.25f, 8.0f, 1.0f);
  	if (qtiAwb_)
-@@ -1411,15 +1560,57 @@ int QcomCameraData::queueFrameBuffer(FrameBuffer *buffer)
+@@ -1411,15 +1718,63 @@
  		if (ret)
  			return ret;
  	}
@@ -363,24 +521,30 @@ index 3b17cd6..8322f19 100644
 +	bool firingMainFlash = false;
 +	if (hasFlash_ && flashMode_ == controls::draft::FlashModeSingle) {
 +		firingMainFlash = true;
-+		if (preflashState_ == PreflashState::Settled) {
-+			double corrected = aeExposureForIndex(profile_, mainFlashIndex_);
-+			double allocatedGain, allocatedExposure;
-+			aeAllocateExposure(profile_, corrected, allocatedGain, allocatedExposure);
-+			double exposureMinNs = exposureMin_ * lineDurationNs_;
-+			double exposureMaxNs = exposureMax_ * lineDurationNs_;
-+			allocatedGain = std::clamp(allocatedGain, gainMin_, gainMax_);
-+			allocatedExposure = std::clamp(corrected / allocatedGain,
-+						       exposureMinNs, exposureMaxNs);
-+			allocatedGain = std::clamp(corrected / allocatedExposure,
-+						   gainMin_, gainMax_);
-+			aeExposure_ = allocatedExposure / lineDurationNs_;
-+			aeGain_ = allocatedGain;
-+		}
++		float minIdx = aeExposureIndex(profile_, exposureMin_ * lineDurationNs_ * gainMin_);
++		float maxIdx = aeExposureIndex(profile_, exposureMax_ * lineDurationNs_ * gainMax_);
++		float flashIndex = (preflashState_ == PreflashState::Settled)
++				   ? mainFlashIndex_
++				   : std::clamp(static_cast<float>(luxIndex_.value_or(280.0)) - static_cast<float>(profile_.aeLuxLogScale * std::log10(9.0f)),
++						minIdx, maxIdx);
++		double corrected = aeExposureForIndex(profile_, flashIndex);
++		double allocatedGain, allocatedExposure;
++		aeAllocateExposure(profile_, corrected, allocatedGain, allocatedExposure);
++		double exposureMinNs = exposureMin_ * lineDurationNs_;
++		double exposureMaxNs = exposureMax_ * lineDurationNs_;
++		allocatedGain = std::clamp(allocatedGain, gainMin_, gainMax_);
++		allocatedExposure = std::clamp(corrected / allocatedGain,
++					       exposureMinNs, exposureMaxNs);
++		allocatedGain = std::clamp(corrected / allocatedExposure,
++					   gainMin_, gainMax_);
++		aeExposure_ = allocatedExposure / lineDurationNs_;
++		aeGain_ = allocatedGain;
 +		FlashDevice::instance().setTorch(false);
 +		FlashDevice::instance().triggerFlash(900000, 200000);
 +		flashMode_ = controls::draft::FlashModeOff;
 +		preflashState_ = PreflashState::Idle;
++	} else if (hasFlash_) {
++		FlashDevice::instance().clearStrobe();
 +	}
 +
  	context.sensor = ControlList(sensor_->controls());
@@ -416,15 +580,41 @@ index 3b17cd6..8322f19 100644
  	ret = sensor_->device()->setControls(&context.sensor, context.request.get());
  	if (ret)
  		return ret;
-@@ -1807,7 +1997,35 @@ bool QcomCameraData::updateAe(uint32_t sequence, double luma, float appliedIndex
+@@ -1671,6 +2026,8 @@
+ 				auto luma = aeRegionLuma(profile_, sums, counts);
+ 				if (!luma)
+ 					continue;
++				if (applyWeights)
++					currentZoneLuma_[y * 16 + x] = static_cast<float>(*luma);
+ 				double weight = overlap *
+ 					(applyWeights ? profile_.aeMetering[y][x] : 1.0);
+ 				sum += *luma * weight;
+@@ -1772,9 +2129,11 @@
+ 		return false;
+ 	}
+ 	unsigned int latency = nextRequest - sequence;
++	float aggressiveness = (preflashState_ == PreflashState::Settling)
++			       ? 1.0f : static_cast<float>(profile_.aeAggressiveness);
+ 	AeConvergenceTuning convergence{ static_cast<float>(profile_.aeUnitStep),
+ 		static_cast<float>(profile_.aeToleranceSteps),
+-		static_cast<float>(profile_.aeAggressiveness) };
++		aggressiveness };
+ 	auto result = aeConvergeFast(convergence, currentIndex, appliedIndex, targetIndex,
+ 				     minimumIndex, maximumIndex, latency);
+ 	LOG(QcomPipeline, Debug) << std::setprecision(9)
+@@ -1807,7 +2166,49 @@
  	LOG(QcomPipeline, Debug) << "AE luma " << luma << " target " << target
  				 << " index " << *luxIndex_ << " exposure "
  				 << aeExposure_ << " gain " << aeGain_;
 -	return result.settled;
 +
 +	bool aeSettled = result.settled;
-+	if (hasFlash_ && preflashState_ != PreflashState::Idle) {
-+		if (preflashState_ == PreflashState::EnterSkip) {
++	if (hasFlash_) {
++		if (preflashState_ == PreflashState::Idle && !FlashDevice::instance().isTorchOn()) {
++			ambientZoneLuma_ = currentZoneLuma_;
++			if (luxIndex_)
++				ambientIndex_ = static_cast<float>(*luxIndex_);
++		} else if (preflashState_ == PreflashState::EnterSkip) {
 +			if (--preflashSkipFrames_ <= 0)
 +				preflashState_ = PreflashState::Settling;
 +			aeSettled = false;
@@ -438,11 +628,21 @@ index 3b17cd6..8322f19 100644
 +			if (preflashSettledFrames_ >= 3 || preflashFrameCounter_ >= 12) {
 +				preflashState_ = PreflashState::Settled;
 +				preflashIndex_ = result.index;
-+				float deltaIndex = std::log2(9.0f) * profile_.aeLuxLogScale;
-+				mainFlashIndex_ = std::clamp(preflashIndex_ - deltaIndex, minimumIndex, maximumIndex);
-+				LOG(QcomPipeline, Debug) << "Flash precapture settled: preflash index "
++				preflashZoneLuma_ = currentZoneLuma_;
++				auto flashRes = estimateSmartFlash(smartFlash_, profile_.aeLuxLogScale,
++								   minimumIndex, maximumIndex,
++								   ambientIndex_, preflashIndex_,
++								   ambientZoneLuma_, preflashZoneLuma_,
++								   profile_.aeMetering, static_cast<float>(target));
++				mainFlashIndex_ = flashRes.targetIndex;
++				flashInfluence_ = flashRes.flashInfluence;
++				LOG(QcomPipeline, Debug) << "Flash precapture settled: ambient index "
++							 << ambientIndex_ << " preflash index "
 +							 << preflashIndex_ << " main flash target index "
-+							 << mainFlashIndex_;
++							 << mainFlashIndex_ << " influence " << flashInfluence_
++							 << " lumaOff " << flashRes.lumaOff
++							 << " lumaLow " << flashRes.lumaLow
++							 << " lumaHigh " << flashRes.lumaHigh;
 +			}
 +			aeSettled = (preflashState_ == PreflashState::Settled);
 +		} else if (preflashState_ == PreflashState::Settled) {
@@ -453,7 +653,38 @@ index 3b17cd6..8322f19 100644
  }
  
  void QcomCameraData::updateAwb(bool aeSettled)
-@@ -2131,6 +2349,37 @@ int QcomCameraData::processControls(const ControlList &controls)
+@@ -1854,9 +2255,28 @@
+ 	float lux = *luxIndex_;
+ 	int luxRounded = static_cast<int>(lux + 0.5f);
+ 	unsigned int fps = std::lround(1e9 / frameDurationNs_);
++	unsigned int flashState = 0;
++	unsigned int led = 0;
++	bool flashOn = false;
++	if (hasFlash_) {
++		if (FlashDevice::instance().isTorchOn() || flashMode_ == controls::draft::FlashModeTorch) {
++			flashState = 1;
++			led = 1;
++			flashOn = true;
++		} else if (preflashState_ == PreflashState::Settling || preflashState_ == PreflashState::Settled) {
++			flashState = 2;
++			led = 1;
++			flashOn = true;
++		} else if (FlashDevice::instance().isStrobeActive()) {
++			flashState = 3;
++			led = 1;
++			flashOn = true;
++		}
++	}
++
+ 	const auto &result = lgAwb_->process(lgBg_.rgb,
+-		{ luxRounded, awbMinimumGrayCount_, 0, 0, awbCameraId_, fps, 13, 0,
+-		  aeSettled, false, false, false, false, false, false, awbFlatMetric_, std::nullopt,
++		{ luxRounded, awbMinimumGrayCount_, flashState, led, awbCameraId_, fps, 13, 0,
++		  aeSettled, false, false, false, false, flashOn, false, awbFlatMetric_, std::nullopt,
+ 		  static_cast<uint32_t>(awbFrame_),
+ 		  static_cast<uint32_t>(statsInputSize_.width),
+ 		  static_cast<uint32_t>(statsInputSize_.height),
+@@ -2131,6 +2551,37 @@
  	if (aeEnabled_ && controls.contains(controls::ExposureValue.id()))
  		aeEvStep_ = aeEvStep(*controls.get(controls::ExposureValue));
  
@@ -491,7 +722,7 @@ index 3b17cd6..8322f19 100644
  	if (controls.contains(controls::AwbEnable.id())) {
  		bool enabled = *controls.get(controls::AwbEnable);
  		bool restart = enabled && !awbEnabled_;
-@@ -2304,6 +2553,9 @@ void QcomCameraData::updateMetadata(Request *request, uint32_t sequence)
+@@ -2304,6 +2755,9 @@
  	metadata.set(controls::draft::AeLock, context.aeLocked);
  	metadata.set(controls::ExposureValue, context.exposureValue);
  	metadata.set(controls::AeState, context.aeState);
@@ -501,18 +732,24 @@ index 3b17cd6..8322f19 100644
  	if (afEnabled_) {
  		metadata.set(controls::AfMode, state.afMode);
  		metadata.set(controls::AfState, state.afState);
-@@ -2462,6 +2717,10 @@ int QcomPipelineHandler::start(Camera *camera, const ControlList *controls)
- 	data->lockedIndex_ = 0.0f;
- 	data->lockedEvStep_ = 0;
- 	data->aeSettled_ = false;
-+	data->preflashState_ = QcomCameraData::PreflashState::Idle;
-+	data->flashMode_ = controls::draft::FlashModeOff;
-+	data->precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
-+	FlashDevice::instance().turnOff();
- 	data->frameStates_.clear();
- 	data->frameContexts_.clear();
- 	data->afSceneChange_.reset();
-@@ -2515,6 +2774,14 @@ void QcomPipelineHandler::stopDevice(Camera *camera)
+@@ -2451,6 +2905,16 @@
+ 	ret = data->openAncillaryDevices();
+ 	if (ret < 0)
+ 		return ret;
++	if (data->hasFlash_) {
++		FlashDevice::instance().turnOff();
++		data->flashMode_ = controls::draft::FlashModeOff;
++		data->preflashState_ = QcomCameraData::PreflashState::Idle;
++		data->flashState_ = controls::draft::FlashStateReady;
++		data->precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
++		data->ambientIndex_ = 0.0f;
++		data->flashInfluence_ = 0.0f;
++	}
++
+ 	V4L2Subdevice *ois = data->sensor_->ois();
+ 
+ 	data->lastStatsSequence_ = UINT32_MAX;
+@@ -2515,6 +2979,16 @@
  {
  	QcomCameraData *data = cameraData(camera);
  
@@ -522,6 +759,8 @@ index 3b17cd6..8322f19 100644
 +		data->preflashState_ = QcomCameraData::PreflashState::Idle;
 +		data->flashState_ = controls::draft::FlashStateReady;
 +		data->precaptureTrigger_ = controls::draft::AePrecaptureTriggerIdle;
++		data->ambientIndex_ = 0.0f;
++		data->flashInfluence_ = 0.0f;
 +	}
 +
  	V4L2Subdevice *ois = data->sensor_->ois();
