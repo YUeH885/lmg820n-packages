@@ -1,0 +1,595 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: add native LG AWB face assist and FWB exception
+
+Implement LG AWB face tracking with 5-frame debounce filter, grid coordinate
+scaling and boundary shrinking. In RGB preprocessing, screen face regions
+and remove valid samples from subsequent gray zone classification.
+Calculate target gain from observed skin ratios and sensor D50 reference,
+and apply FWB modes 0, 1 and 2 (90-frame alternation) in pipeline exception
+handling. Bind face detection controls and metadata to rear camera pipeline.
+
+--- a/src/libcamera/pipeline/qcom/lg_awb_face.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_face.h
+@@ -0,0 +1,238 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++#include "lg_awb_math.h"
++#include "lg_awb_target.h"
++#include "lg_awb_types.h"
++
++namespace libcamera::qcom {
++
++struct LgAwbFaceInput {
++	uint32_t x;
++	uint32_t y;
++	uint32_t width;
++	uint32_t height;
++};
++
++struct LgAwbFaceBox {
++	uint32_t left = 1;
++	uint32_t top = 1;
++	uint32_t right = 0;
++	uint32_t bottom = 0;
++
++	bool valid() const { return left <= right && top <= bottom && right < 64 && bottom < 48; }
++};
++
++struct LgAwbFwbConfiguration {
++	int16_t mode;
++	int16_t minimumValidRegionCount;
++	LgAwbRatios skinReference;
++	LgAwbRatios gainCoefficients;
++	int16_t maximumWeightPercent;
++};
++
++struct LgAwbFaceResult {
++	bool valid = false;
++	uint32_t sampleCount = 0;
++	LgAwbRgb rgb{ 1.0f, 1.0f, 1.0f };
++};
++
++class LgAwbFaceTracker
++{
++public:
++	LgAwbFaceTracker() = default;
++
++	void reset()
++	{
++		previousFaceCount_ = 0;
++		faceStabilityCount_ = 0;
++		activeCount_ = 0;
++		boxes_.fill({});
++	}
++
++	uint32_t activeCount() const { return activeCount_; }
++	const std::array<LgAwbFaceBox, 3> &boxes() const { return boxes_; }
++	const LgAwbFaceBox *data() const { return boxes_.data(); }
++
++	void update(const LgAwbFaceInput *faces, size_t count, uint32_t imageWidth, uint32_t imageHeight)
++	{
++		uint32_t inputCount = static_cast<uint32_t>(count);
++		if (inputCount == previousFaceCount_) {
++			if (faceStabilityCount_ < 100)
++				faceStabilityCount_++;
++		} else {
++			faceStabilityCount_ = 0;
++		}
++
++		previousFaceCount_ = inputCount;
++
++		if (faceStabilityCount_ <= 5)
++			return;
++
++		activeCount_ = std::min(inputCount, 3u);
++		if (imageWidth == 0 || imageHeight == 0 || activeCount_ == 0 || !faces) {
++			if (activeCount_ == 0)
++				boxes_.fill({});
++			return;
++		}
++
++		float scaleX = 64.0f / static_cast<float>(imageWidth);
++		float scaleY = 48.0f / static_cast<float>(imageHeight);
++
++		for (uint32_t i = 0; i < activeCount_; i++) {
++			float fx0 = static_cast<float>(faces[i].x) * scaleX + 0.5f;
++			float fy0 = static_cast<float>(faces[i].y) * scaleY + 0.5f;
++			float fx1 = static_cast<float>(faces[i].x + faces[i].width) * scaleX - 0.5f;
++			float fy1 = static_cast<float>(faces[i].y + faces[i].height) * scaleY - 0.5f;
++
++			if (fx1 < fx0 || fy1 < fy0 || fx1 < 0.0f || fy1 < 0.0f) {
++				boxes_[i] = {};
++				continue;
++			}
++
++			uint32_t x0 = static_cast<uint32_t>(std::max(0.0f, fx0));
++			uint32_t y0 = static_cast<uint32_t>(std::max(0.0f, fy0));
++			uint32_t x1 = static_cast<uint32_t>(std::max(0.0f, fx1));
++			uint32_t y1 = static_cast<uint32_t>(std::max(0.0f, fy1));
++
++			if (x1 < x0 || y1 < y0) {
++				boxes_[i] = {};
++				continue;
++			}
++
++			uint32_t dx = (x1 - x0) + 1;
++			uint32_t dy = (y1 - y0) + 1;
++			uint32_t shrinkX = dx >> 2;
++			uint32_t shrinkY = dy >> 2;
++
++			uint32_t left = std::min(x0 + shrinkX, 63u);
++			uint32_t top = std::min(y0 + shrinkY, 47u);
++			uint32_t right = std::min(x1 >= shrinkX ? x1 - shrinkX : 0u, 63u);
++			uint32_t bottom = std::min(y1 >= shrinkY ? y1 - shrinkY : 0u, 47u);
++
++			if (left > right || top > bottom) {
++				boxes_[i] = {};
++				continue;
++			}
++
++			boxes_[i] = { left, top, right, bottom };
++		}
++	}
++
++private:
++	uint32_t previousFaceCount_ = 0;
++	uint32_t faceStabilityCount_ = 0;
++	uint32_t activeCount_ = 0;
++	std::array<LgAwbFaceBox, 3> boxes_{};
++};
++
++template<typename SampleArray>
++inline LgAwbFaceResult lgAwbCheckFaceStat(const std::array<LgAwbRgb, 3072> &rgb,
++					 SampleArray &samples,
++					 const LgAwbFaceBox *boxes,
++					 uint32_t faceCount,
++					 const LgAwbFwbConfiguration &config,
++					 LgAwbRatios d50Reference)
++{
++	LgAwbFaceResult result{};
++	if (faceCount == 0 || !boxes)
++		return result;
++
++	uint32_t validFaceSamples = 0;
++	float sumR = 0.0f;
++	float sumG = 0.0f;
++	float sumB = 0.0f;
++
++	for (uint32_t i = 0; i < faceCount; i++) {
++		const auto &box = boxes[i];
++		if (!box.valid())
++			continue;
++		for (uint32_t y = box.top; y <= box.bottom; y++) {
++			for (uint32_t x = box.left; x <= box.right; x++) {
++				uint32_t idx = y * 64 + x;
++				if (samples[idx].valid == 1) {
++					samples[idx].valid = 0;
++					validFaceSamples++;
++					sumR += rgb[idx][0];
++					sumG += rgb[idx][1];
++					sumB += rgb[idx][2];
++				}
++			}
++		}
++	}
++
++	result.sampleCount = validFaceSamples;
++
++	float observedRg = 0.0f;
++	float observedBg = 0.0f;
++
++	if (validFaceSamples > static_cast<uint32_t>(config.minimumValidRegionCount)) {
++		float countF = static_cast<float>(validFaceSamples);
++		float avgR = sumR / countF;
++		float avgG = sumG / countF;
++		float avgB = sumB / countF;
++		observedRg = avgR / avgG;
++		observedBg = avgB / avgG;
++		result.valid = true;
++	} else {
++		observedRg = config.skinReference.red;
++		observedBg = config.skinReference.blue;
++		result.valid = false;
++	}
++
++	float s1 = (config.skinReference.red / d50Reference.red) / observedRg;
++	float s2 = (config.skinReference.blue / d50Reference.blue) / observedBg;
++
++	result.rgb[0] = lgAwbProduct(config.gainCoefficients.red, s1);
++	result.rgb[1] = 1.0f;
++	result.rgb[2] = lgAwbProduct(config.gainCoefficients.blue, s2);
++
++	return result;
++}
++
++class LgAwbFwb
++{
++public:
++	explicit LgAwbFwb(const LgAwbFwbConfiguration &config)
++		: config_(config)
++	{
++	}
++
++	void reset() { weight_ = 0.0f; }
++	float weight() const { return weight_; }
++
++	void apply(LgAwbGainTarget &target, const LgAwbFaceResult &faceResult, uint32_t frameCount)
++	{
++		weight_ = 0.0f;
++		if (config_.mode == 0)
++			return;
++
++		bool enabled = false;
++		if (config_.mode == 1) {
++			enabled = faceResult.valid;
++		} else if (config_.mode == 2) {
++			enabled = faceResult.valid && ((frameCount / 90) % 2 == 1);
++		}
++
++		if (!enabled)
++			return;
++
++		weight_ = lgAwbProduct(static_cast<float>(config_.maximumWeightPercent), 0.01f);
++		float oneMinusWeight = 1.0f - weight_;
++
++		target.rgb[0] = lgAwbProduct(target.rgb[0], oneMinusWeight) + lgAwbProduct(faceResult.rgb[0], weight_);
++		target.rgb[1] = lgAwbProduct(target.rgb[1], oneMinusWeight) + lgAwbProduct(faceResult.rgb[1], weight_);
++		target.rgb[2] = lgAwbProduct(target.rgb[2], oneMinusWeight) + lgAwbProduct(faceResult.rgb[2], weight_);
++	}
++
++private:
++	LgAwbFwbConfiguration config_;
++	float weight_ = 0.0f;
++};
++
++} /* namespace libcamera::qcom */
+--- a/src/libcamera/pipeline/qcom/lg_awb_preprocess.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_preprocess.h
+@@ -5,6 +5,7 @@
+ #include <cstdint>
+ 
+ #include "lg_awb_colour.h"
++#include "lg_awb_face.h"
+ #include "lg_awb_gray_geometry.h"
+ #include "lg_awb_regions.h"
+ 
+@@ -38,7 +39,10 @@
+ 	}
+ 
+ 	void prepare(const std::array<LgAwbRgb, 3072> &rgb, int lux, LgAwbPreparedFrame &frame,
+-		     bool widen4000KBelow = false)
++		     bool widen4000KBelow = false,
++		     const LgAwbFaceBox *faceBoxes = nullptr, uint32_t faceCount = 0,
++		     const LgAwbFwbConfiguration &fwbConfig = {},
++		     LgAwbFaceResult *faceResult = nullptr)
+ 	{
+ 		colour_.setLux(lux);
+ 		regions_.setLux(lux);
+@@ -65,6 +69,8 @@
+ 				frame.rncLabels[i] = regions_.classify(sample);
+ 			}
+ 		}
++		if (faceCount > 0 && faceBoxes && faceResult)
++			*faceResult = lgAwbCheckFaceStat(rgb, frame.samples, faceBoxes, faceCount, fwbConfig, colour_.nominalRgb()[2]);
+ 		frame.screenCounters[0] += regions_.counters().rejected;
+ 		frame.validFraction = static_cast<float>(3072 - frame.screenCounters[0] -
+ 			frame.screenCounters[1] - frame.screenCounters[2]) / 3072.0f;
+--- a/src/libcamera/pipeline/qcom/lg_awb_gray_core.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_gray_core.h
+@@ -37,9 +37,14 @@
+ 	}
+ 
+ 	const LgAwbGrayResult &process(const std::array<LgAwbRgb, 3072> &rgb,
+-				     const LgAwbGrayFrameControls &controls)
++				     const LgAwbGrayFrameControls &controls,
++				     const LgAwbFaceBox *faceBoxes = nullptr,
++				     uint32_t faceCount = 0,
++				     const LgAwbFwbConfiguration &fwbConfig = {},
++				     LgAwbFaceResult *faceResult = nullptr)
+ 	{
+-		preprocess_.prepare(rgb, controls.lux, frame_, controls.widen4000KBelow);
++		preprocess_.prepare(rgb, controls.lux, frame_, controls.widen4000KBelow,
++				    faceBoxes, faceCount, fwbConfig, faceResult);
+ 		weights_ = lookup_.weights(controls.lux);
+ 		adjustment_.reduce(weights_, controls.lux, controls.flashState, frame_.categoryCounts, factors_);
+ 		boost_ = adjustment_.boost(weights_, controls.lux, controls.outdoor, controls.flashOn, controls.led);
+--- a/src/libcamera/pipeline/qcom/lg_awb_tuning.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_tuning.h
+@@ -8,6 +8,7 @@
+ #include "lg_awb_gain.h"
+ #include "lg_awb_convergence.h"
+ #include "lg_awb_exceptions.h"
++#include "lg_awb_face.h"
+ #include "lg_awb_pipeline.h"
+ #include "lg_awb_history.h"
+ #include "lg_awb_target.h"
+@@ -677,6 +678,11 @@
+ 	return { true, { 130, 150, 320, 350 }, { 3400, 3600, 4250, 4400 }, { 1.0f, 1.0f }, 50 };
+ }
+ 
++inline LgAwbFwbConfiguration imx363LgAwbFwbConfiguration()
++{
++	return { 0, 15, { 0.681531012f, 0.487322986f }, { 1.0f, 1.0f }, 50 };
++}
++
+ inline LgAwbDtbConfiguration imx363LgAwbDtbConfiguration()
+ {
+ 	LgAwbDtbConfiguration config{};
+@@ -947,7 +953,7 @@
+ 	return { imx363LgAwbGrayCoreConfiguration(), imx363LgAwbHistoryConfiguration(),
+ 		 imx363LgAwbGainConfiguration(), imx363LgAwbOheConfiguration(),
+ 		 imx363LgAwbDtbConfiguration(), imx363LgAwbScdConfiguration(),
+-		 imx363LgAwbFoeConfiguration(), { 4, 8, 12, 20 }, 230 };
++		 imx363LgAwbFoeConfiguration(), imx363LgAwbFwbConfiguration(), { 4, 8, 12, 20 }, 230 };
+ }
+ 
+ inline LgAwbColourConfiguration imx351LgAwbColourConfiguration()
+@@ -1607,6 +1613,11 @@
+ 	return { true, { 130, 150, 600, 600 }, { 2900, 3100, 4300, 4500 }, { 1.0f, 1.0f }, 50 };
+ }
+ 
++inline LgAwbFwbConfiguration imx351LgAwbFwbConfiguration()
++{
++	return { 0, 15, { 0.681531012f, 0.487322986f }, { 1.0f, 1.0f }, 50 };
++}
++
+ inline LgAwbDtbConfiguration imx351LgAwbDtbConfiguration()
+ {
+ 	LgAwbDtbConfiguration config{};
+@@ -1873,7 +1884,7 @@
+ 	return { imx351LgAwbGrayCoreConfiguration(), imx351LgAwbHistoryConfiguration(),
+ 		 imx351LgAwbGainConfiguration(), imx351LgAwbOheConfiguration(),
+ 		 imx351LgAwbDtbConfiguration(), imx351LgAwbScdConfiguration(),
+-		 imx351LgAwbFoeConfiguration(), { 4, 8, 12, 20 }, 230 };
++		 imx351LgAwbFoeConfiguration(), imx351LgAwbFwbConfiguration(), { 4, 8, 12, 20 }, 230 };
+ }
+ 
+ inline LgAwbColourConfiguration s5k3m5LgAwbColourConfiguration()
+@@ -2576,6 +2587,11 @@
+ 	return { true, { 130, 150, 600, 600 }, { 2900, 3100, 4300, 4500 }, { 1.0f, 1.0f }, 50 };
+ }
+ 
++inline LgAwbFwbConfiguration s5k3m5LgAwbFwbConfiguration()
++{
++	return { 0, 15, { 0.681531012f, 0.487322986f }, { 1.0f, 1.0f }, 50 };
++}
++
+ inline LgAwbDtbConfiguration s5k3m5LgAwbDtbConfiguration()
+ {
+ 	LgAwbDtbConfiguration config{};
+@@ -2873,7 +2889,7 @@
+ 	return { s5k3m5LgAwbGrayCoreConfiguration(), s5k3m5LgAwbHistoryConfiguration(),
+ 		 s5k3m5LgAwbGainConfiguration(), s5k3m5LgAwbOheConfiguration(),
+ 		 s5k3m5LgAwbDtbConfiguration(), s5k3m5LgAwbScdConfiguration(),
+-		 s5k3m5LgAwbFoeConfiguration(), { 4, 8, 12, 20 }, 360 };
++		 s5k3m5LgAwbFoeConfiguration(), s5k3m5LgAwbFwbConfiguration(), { 4, 8, 12, 20 }, 360 };
+ }
+ 
+ } /* namespace libcamera::qcom */
+--- a/src/libcamera/pipeline/qcom/lg_awb_pipeline.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_pipeline.h
+@@ -8,6 +8,7 @@
+ #include "lg_awb_cadence.h"
+ #include "lg_awb_dnn.h"
+ #include "lg_awb_exceptions.h"
++#include "lg_awb_face.h"
+ #include "lg_awb_gray_core.h"
+ 
+ namespace libcamera::qcom {
+@@ -20,6 +21,7 @@
+ 	LgAwbDtbConfiguration dtb;
+ 	LgAwbScdConfiguration scd;
+ 	LgAwbFoeConfiguration foe;
++	LgAwbFwbConfiguration fwb;
+ 	std::array<int16_t, 4> periods;
+ 	unsigned int minimumGrayCount;
+ };
+@@ -30,6 +32,10 @@
+ 	bool aeSettled, fastRequest, afRequest, dtbBlocked, outdoor, flashOn, forceSkip;
+ 	float flatMetric;
+ 	std::optional<std::array<float, 4>> iqm;
++	uint32_t frameCount = 0;
++	uint32_t imageWidth = 0, imageHeight = 0;
++	const LgAwbFaceInput *faces = nullptr;
++	size_t faceCount = 0;
+ };
+ 
+ struct LgAwbPipelineResult {
+@@ -39,8 +45,10 @@
+ 	LgAwbConvergenceResult filtered{};
+ 	uint32_t grayValid = 0, dtbGrayValid = 0;
+ 	unsigned int dtbSelection = 20;
+-	float latestGrayX = 0, oheWeight = 0, foeWeight = 0;
++	float latestGrayX = 0, oheWeight = 0, foeWeight = 0, fwbWeight = 0;
+ 	LgAwbScdStatus scdStatus = LgAwbScdStatus::InvalidHistoryGain;
++	LgAwbFaceResult faceResult{};
++	uint32_t activeFaces = 0;
+ };
+ 
+ class LgAwbPipeline
+@@ -51,7 +59,7 @@
+ 		      const std::optional<std::array<LgAwbDnnPolicy, 2>> &policies = std::nullopt)
+ 		: cadence_(config.periods), gray_(config.gray, calibration), history_(config.history), gain_(config.gain),
+ 		  convergence_(config.gain.filterFactors), ohe_(config.ohe), dtb_(config.dtb),
+-		  scd_(config.scd), foe_(config.foe)
++		  scd_(config.scd), foe_(config.foe), fwb_(config.fwb), fwbConfig_(config.fwb)
+ 	{
+ 		if (policies)
+ 			dnn_.emplace(*policies, config.gain.limits);
+@@ -67,10 +75,13 @@
+ 		ohe_.reset();
+ 		dtb_.reset();
+ 		foe_.reset();
++		fwb_.reset();
++		faceTracker_.reset();
+ 		if (dnn_)
+ 			dnn_->reset();
+ 		offsets_ = {};
+ 		grayResult_ = {};
++		faceResult_ = {};
+ 		result_ = {};
+ 	}
+ 
+@@ -81,10 +92,14 @@
+ 			controls.flashState, controls.lux, controls.forceSkip });
+ 		LgAwbGrayFrameControls frameControls{ controls.lux, controls.flashState, controls.led,
+ 			controls.minimumGrayCount, controls.outdoor, controls.flashOn, result_.cadence.startup };
++		faceTracker_.update(controls.faces, controls.faceCount, controls.imageWidth, controls.imageHeight);
+ 		if (!result_.cadence.skipped) {
+ 			dtb_.reset();
+ 			offsets_ = gain_.offsets(frameControls.led == 3, frameControls.lux);
+-			grayResult_ = gray_.process(rgb, frameControls);
++			faceResult_ = {};
++			grayResult_ = gray_.process(rgb, frameControls,
++						    faceTracker_.data(), faceTracker_.activeCount(),
++						    fwbConfig_, &faceResult_);
+ 			result_.dtbGrayValid = grayResult_.grayValid;
+ 			if (grayResult_.grayValid)
+ 				result_.latestGrayX = result_.cadence.startup ? 0 : grayResult_.gray.colour.x;
+@@ -104,13 +119,14 @@
+ 		std::optional<float> iqmSecond = controls.iqm ? std::optional((*controls.iqm)[1]) : std::nullopt;
+ 		result_.scdStatus = scd_.apply(result_.target, history_, gray_.frame().references,
+ 			{ grayResult_.gray.colour.x, grayResult_.gray.colour.y },
+-			{ frameControls.lux, frameControls.flashState, 0, controls.usecase,
++			{ frameControls.lux, frameControls.flashState, faceTracker_.activeCount(), controls.usecase,
+ 			  grayResult_.gray.cct, grayResult_.gray.illuminant, controls.aeSettled,
+ 			  controls.flatMetric, iqmSecond }).status;
+ 		foe_.apply(result_.target, gray_.colour(), { frameControls.lux, frameControls.led,
+ 			frameControls.outdoor, frameControls.flashOn, iqmSecond });
+ 		if (dnn_)
+ 			dnn_->apply(result_.target, controls.iqm, frameControls.lux, result_.cadence.startup, frameControls.flashState);
++		fwb_.apply(result_.target, faceResult_, controls.frameCount);
+ 		std::optional<LgAwbGainTiming> timing = dnn_ ? std::optional(dnn_->timing()) : std::nullopt;
+ 		result_.filtered = convergence_.update(result_.target.rgb, result_.target.cct,
+ 			{ static_cast<unsigned int>(result_.target.source), 1, frameControls.flashState,
+@@ -125,12 +141,18 @@
+ 		result_.dtbSelection = dtb_.selection();
+ 		result_.oheWeight = ohe_.weight();
+ 		result_.foeWeight = foe_.weight();
++		result_.fwbWeight = fwb_.weight();
++		result_.faceResult = faceResult_;
++		result_.activeFaces = faceTracker_.activeCount();
+ 		return result_;
+ 	}
+ 
+ 	const LgAwbHistory &history() const { return history_; }
+ 	const LgAwbGrayCore &grayCore() const { return gray_; }
+ 	const LgAwbGainFilterState &filterHistory() const { return convergence_.history(); }
++	const LgAwbFaceTracker &faceTracker() const { return faceTracker_; }
++	const LgAwbFaceResult &faceResult() const { return faceResult_; }
++	const LgAwbFwb &fwb() const { return fwb_; }
+ 
+ private:
+ 	LgAwbCadence cadence_;
+@@ -143,9 +165,13 @@
+ 	LgAwbDtb dtb_;
+ 	LgAwbScd scd_;
+ 	LgAwbFoe foe_;
++	LgAwbFwb fwb_;
++	LgAwbFwbConfiguration fwbConfig_;
++	LgAwbFaceTracker faceTracker_;
+ 	std::optional<LgAwbDnn> dnn_;
+ 	LgAwbGainOffsets offsets_{};
+ 	LgAwbGrayResult grayResult_;
++	LgAwbFaceResult faceResult_{};
+ 	LgAwbPipelineResult result_;
+ };
+ 
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -623,6 +623,7 @@
+ 	std::optional<QtiAwbFaceRectangle> faceRect_;
+ 	int32_t faceDetectMode_ = controls::draft::FaceDetectModeOff;
+ 	uint8_t reportedFaceScore_ = 0;
++	std::vector<LgAwbFaceInput> lgFaces_;
+ 	std::unique_ptr<LgAwbPipeline> lgAwb_;
+ 	std::unique_ptr<LgAwbFlatInput> lgFlat_;
+ 	LgAwbBgStatistics lgBg_;
+@@ -1065,8 +1066,9 @@
+ 		static_cast<float>(aeGain_));
+ 	ctrls[&controls::AwbEnable] = ControlInfo(false, true, true);
+ 	ctrls[&controls::ColourGains] = ControlInfo(0.25f, 8.0f, 1.0f);
+-	if (qtiAwb_) {
++	if (qtiAwb_)
+ 		ctrls[&controls::ColourTemperature] = ControlInfo(1500, 12000, 5000);
++	if (qtiAwb_ || lgAwb_) {
+ 		ctrls[&controls::draft::FaceDetectMode] = ControlInfo(
+ 			{ { ControlValue(controls::draft::FaceDetectModeOff),
+ 			    ControlValue(controls::draft::FaceDetectModeSimple),
+@@ -1308,6 +1310,8 @@
+ 	if (lgAwb_) {
+ 		lgAwb_->reset();
+ 		lgBg_ = {};
++		lgFaces_.clear();
++		reportedFaceScore_ = 0;
+ 		if (awbEnabled_) {
+ 			setIfeWb(awbInitialGains_[0], awbInitialGains_[1], awbInitialGains_[2]);
+ 			colourTemperature_ = awbInitialCct_;
+@@ -1807,7 +1811,15 @@
+ 	unsigned int fps = std::lround(1e9 / frameDurationNs_);
+ 	const auto &result = lgAwb_->process(lgBg_.rgb,
+ 		{ luxRounded, awbMinimumGrayCount_, 0, 0, awbCameraId_, fps, 13, 0,
+-		  aeSettled, false, false, false, false, false, false, awbFlatMetric_, std::nullopt });
++		  aeSettled, false, false, false, false, false, false, awbFlatMetric_, std::nullopt,
++		  static_cast<uint32_t>(awbFrame_),
++		  static_cast<uint32_t>(statsInputSize_.width),
++		  static_cast<uint32_t>(statsInputSize_.height),
++		  lgFaces_.data(), lgFaces_.size() });
++	if (result.activeFaces > 0)
++		reportedFaceScore_ = result.faceResult.valid ? 100 : 50;
++	else
++		reportedFaceScore_ = 0;
+ 	if (result.filtered.cct > 0) {
+ 		colourTemperature_ = result.filtered.cct;
+ 		interpolateCcm(profile_, colourTemperature_, ccmQ7_);
+@@ -2100,6 +2112,25 @@
+ 		faceRect_.reset();
+ 	}
+ 
++	if (lgAwb_) {
++		if (faceDetectMode_ != controls::draft::FaceDetectModeOff &&
++		    controls.contains(controls::draft::FaceDetectFaceRectangles.id())) {
++			auto rects = controls.get(controls::draft::FaceDetectFaceRectangles);
++			lgFaces_.clear();
++			if (rects) {
++				for (const auto &r : *rects) {
++					if (r.width > 0 && r.height > 0)
++						lgFaces_.push_back({ static_cast<uint32_t>(std::max(0, r.x)),
++								     static_cast<uint32_t>(std::max(0, r.y)),
++								     static_cast<uint32_t>(r.width),
++								     static_cast<uint32_t>(r.height) });
++				}
++			}
++		} else if (faceDetectMode_ == controls::draft::FaceDetectModeOff) {
++			lgFaces_.clear();
++		}
++	}
++
+ 	if (afEnabled_ && controls.contains(controls::AfMode.id())) {
+ 		int mode = *controls.get(controls::AfMode);
+ 		if (mode != afMode_) {
+@@ -2222,6 +2253,18 @@
+ 			metadata.set(controls::draft::FaceDetectFaceRectangles, Span<const Rectangle>(&r, 1));
+ 			metadata.set(controls::draft::FaceDetectFaceScores, Span<const uint8_t>(&reportedFaceScore_, 1));
+ 		}
++	} else if (lgAwb_ && faceDetectMode_ != controls::draft::FaceDetectModeOff) {
++		metadata.set(controls::draft::FaceDetectMode, faceDetectMode_);
++		if (!lgFaces_.empty() && reportedFaceScore_ > 0) {
++			std::vector<Rectangle> rects;
++			std::vector<uint8_t> scores;
++			for (const auto &f : lgFaces_) {
++				rects.emplace_back(f.x, f.y, f.width, f.height);
++				scores.push_back(reportedFaceScore_);
++			}
++			metadata.set(controls::draft::FaceDetectFaceRectangles, Span<const Rectangle>(rects));
++			metadata.set(controls::draft::FaceDetectFaceScores, Span<const uint8_t>(scores));
++		}
+ 	}
+ }
+ 
