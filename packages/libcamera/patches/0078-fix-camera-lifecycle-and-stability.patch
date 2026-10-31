@@ -1,0 +1,140 @@
+From: LM-G820N Developer <dev@lmg820n.invalid>
+Subject: [PATCH] qcom: fix camera lifecycle and stability issues
+
+Address essential stability and lifecycle defects in the Qcom pipeline
+handler and LG AWB algorithms:
+1. In lg_awb_colour.h, return neutral ratios { 1.0f, 1.0f } when input.y
+   is below 0.001 or green is near zero, avoiding IEEE 754 0/0 NaN
+   contamination in dark scenes.
+2. In lg_awb_convergence.h, seed history with target gains on initial
+   startup when history is empty, preventing NaN division and initial
+   gain drops.
+3. In qcom.cpp openAncillaryDevices(), downgrade SSC accelerometer
+   failure to a non-fatal warning so external sensor daemon timeouts do
+   not prevent opening the main rear camera.
+4. In qcom.cpp setManualAwb(), explicitly reset awbGainG_ = 1.0 to
+   prevent residual green gain from automatic AWB corrupting manual
+   colour temperature.
+5. In qcom.cpp updateFlashMeasurement(), disengage Torch illumination
+   as soon as precapture measurement settles to avoid leaving high-power
+   flash LEDs on continuously.
+6. In qcom.cpp updateMetadata(), protect ColourGains against green
+   division by zero and restrict frameStates_ lookup strictly to cameras
+   with autofocus enabled (afEnabled_), ensuring non-AF cameras
+   (ultra-wide IMX351 and front IMX520) do not drop all frame metadata.
+
+---
+--- a/src/libcamera/pipeline/qcom/lg_awb_colour.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_colour.h
+@@ -103,8 +103,8 @@
+ 		float g = (product(input.luma, 1.91614199f) + product(X, -0.978767991f)) + product(Z, 0.0334540009f);
+ 		float b = (product(X, 0.0719449967f) + product(input.luma, -0.228991002f)) + product(Z, 1.40524304f);
+ 		r = encode(r); g = encode(g); b = encode(b);
+-		if (input.y < 0.001f)
+-			r = g = b = 0;
++		if (input.y < 0.001f || g <= 1e-6f)
++			return { 1.0f, 1.0f };
+ 		return { r / g, b / g };
+ 	}
+ 
+--- a/src/libcamera/pipeline/qcom/lg_awb_convergence.h
++++ b/src/libcamera/pipeline/qcom/lg_awb_convergence.h
+@@ -48,6 +48,11 @@
+ 	LgAwbConvergenceResult update(LgAwbRgb target, int32_t cct,
+ 				      const LgAwbConvergenceControls &controls, const LgAwbColour &colour)
+ 	{
++		if (controls.startup || history_.rgb[0] < 1e-6f || history_.rgb[1] < 1e-6f || history_.rgb[2] < 1e-6f) {
++			history_.rgb = target;
++			history_.cct = cct;
++			return { target, cct, 1, 1.0f, colour.fromRgb({ target[1] / target[0], target[1] / target[2] }) };
++		}
+ 		float alpha = factors_[0];
+ 		if (controls.path == history_.previousPath) {
+ 			if (history_.stickyPath == 4)
+--- a/src/libcamera/pipeline/qcom/qcom.cpp
++++ b/src/libcamera/pipeline/qcom/qcom.cpp
+@@ -1450,9 +1450,13 @@
+ 	}
+ 	if (accelerometer_) {
+ 		ret = accelerometer_->start();
+-		if (ret < 0)
+-			return ret;
+-		refreshAfModel();
++		if (ret < 0) {
++			LOG(QcomPipeline, Warning)
++				<< "Failed to start SSC accelerometer, disabling gravity compensation";
++			accelerometer_.reset();
++		} else {
++			refreshAfModel();
++		}
+ 	}
+ 	return 0;
+ }
+@@ -1662,6 +1666,7 @@
+ void QcomCameraData::setManualAwb(double gainR, double gainB, std::optional<int32_t> cct)
+ {
+ 	awbGainR_ = std::clamp(gainR, 0.25, 8.0);
++	awbGainG_ = 1.0;
+ 	awbGainB_ = std::clamp(gainB, 0.25, 8.0);
+ 	if (cct)
+ 		colourTemperature_ = *cct;
+@@ -2200,6 +2205,7 @@
+ 
+ 			if (preflashSettledFrames_ >= 3 || preflashFrameCounter_ >= 12) {
+ 				preflashState_ = PreflashState::Settled;
++				FlashDevice::instance().setTorch(false);
+ 				preflashIndex_ = result.index;
+ 				preflashZoneLuma_ = currentZoneLuma_;
+ 				auto flashRes = estimateSmartFlash(smartFlash_, profile_.aeLuxLogScale,
+@@ -2767,9 +2773,10 @@
+ 	}
+ 
+ 	const IfeState &appliedIfe = frameContexts_.at(request->findBuffer(&stream_)).ife;
++	double green = appliedIfe.green > 1e-6 ? appliedIfe.green : 1.0;
+ 	metadata.set(controls::ColourGains,
+-		     { static_cast<float>(appliedIfe.red / appliedIfe.green),
+-		       static_cast<float>(appliedIfe.blue / appliedIfe.green) });
++		     { static_cast<float>(appliedIfe.red / green),
++		       static_cast<float>(appliedIfe.blue / green) });
+ 	metadata.set(controls::DigitalGain, static_cast<float>(appliedIfe.green));
+ 	metadata.set(controls::ColourTemperature,
+ 		     static_cast<int32_t>(std::lround(appliedIfe.cct)));
+@@ -2777,12 +2784,19 @@
+ 		     Span<const float, 9>(appliedIfe.ccm));
+ 	metadata.set(controls::AwbEnable, appliedIfe.awbEnabled);
+ 
+-	auto it = frameStates_.upper_bound(sequence);
+-	if (it == frameStates_.begin()) {
+-		LOG(QcomPipeline, Error) << "Missing state for frame " << sequence;
+-		return;
+-	}
+-	const FrameState &state = std::prev(it)->second;
++	if (afEnabled_) {
++		auto it = frameStates_.upper_bound(sequence);
++		if (it != frameStates_.begin()) {
++			const FrameState &state = std::prev(it)->second;
++			metadata.set(controls::AfMode, state.afMode);
++			metadata.set(controls::AfState, state.afState);
++			metadata.set(controls::AfPauseState, state.afPauseState);
++			metadata.set(controls::LensPosition, state.lensPosition);
++		} else {
++			LOG(QcomPipeline, Debug) << "Missing AF state for frame " << sequence;
++		}
++	}
++
+ 	metadata.set(controls::AeEnable, context.aeEnabled);
+ 	metadata.set(controls::draft::AeLock, context.aeLocked);
+ 	metadata.set(controls::ExposureValue, context.exposureValue);
+@@ -2792,12 +2806,6 @@
+ 	metadata.set(controls::draft::AePrecaptureTrigger, context.precaptureTrigger);
+ 	if (hasOis_)
+ 		metadata.set(controls::draft::OpticalImageStabilizationMode, context.oisMode);
+-	if (afEnabled_) {
+-		metadata.set(controls::AfMode, state.afMode);
+-		metadata.set(controls::AfState, state.afState);
+-		metadata.set(controls::AfPauseState, state.afPauseState);
+-		metadata.set(controls::LensPosition, state.lensPosition);
+-	}
+ 	if (lastStatsSequence_ != UINT32_MAX &&
+ 	    qcom::inputSequence(lastStatsSequence_) == sequence)
+ 		metadata.set(controls::FocusFoM,
